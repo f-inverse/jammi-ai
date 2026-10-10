@@ -8,7 +8,7 @@ this module pins from Python, because both are load-bearing for every consumer
 that hands the catalog directory to somebody else:
 
   1. While the engine holds the file, a SECOND PROCESS opening the same
-     directory is refused with a typed `jammi.errors.BackendError` naming the
+     directory is refused with a typed `jammi.errors.Unavailable` naming the
      single-process contract — never a hang, never a signal.
   2. While the engine holds the file, a FOREIGN SQLite LIBRARY INSTANCE inside
      THIS process (CPython's `sqlite3` alongside the extension's statically
@@ -57,7 +57,7 @@ import pytest
 import jammi
 import jammi_native
 from jammi._assembly import build_fine_tune_request
-from jammi.errors import BackendError
+from jammi.errors import FailedPrecondition
 
 # A base model directory that does not exist. `Catalog::submit_job` runs at
 # SUBMIT time and reads nothing but the catalog, so this commits a real
@@ -195,8 +195,9 @@ def test_close_hands_the_catalog_directory_to_a_successor_process(tmp_path):
     That refusal IS the single-process contract, mechanically enforced: the
     `unix-excl` VFS holds a process-scoped exclusive lock, so the successor
     waits out the 5 s busy timeout and is then refused with a
-    `jammi.errors.BackendError` naming the contract — never a hang, never a
-    signal, never a silently shared file.
+    `jammi.errors.Unavailable` naming the contract — the catalog may be
+    reachable once its holder lets go — never a hang, never a signal, never a
+    silently shared file.
 
     The handle is deliberately still alive when the second successor runs, so
     what hands the directory over is `close()` and nothing else. "Immediately"
@@ -219,7 +220,7 @@ def test_close_hands_the_catalog_directory_to_a_successor_process(tmp_path):
         "a second process must be REFUSED while this engine holds the catalog, "
         f"got returncode {refused.returncode}: {refused.stdout}{refused.stderr}"
     )
-    assert "REFUSED jammi.errors.BackendError" in refused.stdout, (
+    assert "REFUSED jammi.errors.Unavailable" in refused.stdout, (
         "the refusal must be the typed taxonomy error, not a bare exception: "
         f"{refused.stdout}"
     )
@@ -248,8 +249,8 @@ def test_close_hands_the_catalog_directory_to_a_successor_process(tmp_path):
 
 
 def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path):
-    """Every verb on a closed handle raises `jammi.errors.BackendError`, and
-    `close()` is idempotent.
+    """Every verb on a closed handle raises `jammi.errors.FailedPrecondition`,
+    and `close()` is idempotent.
 
     The FFI-boundary guard: once the worker is stopped and the pool closed,
     "keep using the handle" must be a prompt typed failure at the call site,
@@ -264,13 +265,13 @@ def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path
     db.close()  # idempotent: a second close is a no-op, not an error
     db.close()
 
-    with pytest.raises(BackendError, match="closed"):
+    with pytest.raises(FailedPrecondition, match="closed"):
         db.list_sources()
-    with pytest.raises(BackendError, match="closed"):
+    with pytest.raises(FailedPrecondition, match="closed"):
         db.job("no-such-job")
-    with pytest.raises(BackendError, match="closed"):
+    with pytest.raises(FailedPrecondition, match="closed"):
         db.get_server_info()
-    with pytest.raises(BackendError, match="closed"):
+    with pytest.raises(FailedPrecondition, match="closed"):
         db.tenant()
 
     # And the file really is free: a fresh handle on the same directory opens
@@ -349,7 +350,7 @@ def test_public_close_hands_the_catalog_directory_to_a_successor_process(tmp_pat
     The same handoff `test_close_hands_the_catalog_directory_to_a_successor_process`
     proves on the low-level handle, driven end-to-end through the shipped
     client: a second process is refused with the typed
-    `jammi.errors.BackendError` while this session holds the file, and opens
+    `jammi.errors.Unavailable` while this session holds the file, and opens
     immediately once `close()` has returned. Both the holder and the successor
     speak `jammi.connect`, so what is pinned is the surface a user has, not an
     internal one they never see. A wrapper whose `close()` did not forward
@@ -375,7 +376,7 @@ def test_public_close_hands_the_catalog_directory_to_a_successor_process(tmp_pat
         "a second process must be REFUSED while this session holds the catalog, "
         f"got returncode {refused.returncode}: {refused.stdout}{refused.stderr}"
     )
-    assert "REFUSED jammi.errors.BackendError" in refused.stdout, refused.stdout
+    assert "REFUSED jammi.errors.Unavailable" in refused.stdout, refused.stdout
     assert "single-process only" in refused.stdout, refused.stdout
 
     # The release point, reached through the public verb and nothing else.

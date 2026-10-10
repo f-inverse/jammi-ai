@@ -32,7 +32,7 @@ under one on a GPU.
 - `Session.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", encoder="frozen" | target_modules=[...], ...)` → `TrainingJob`
+- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", encoder="frozen" | target_modules=[...], ...)` → `Job`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Audio triplet schema (fine-tune input)

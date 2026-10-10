@@ -893,7 +893,7 @@ impl Host {
                 let record = session
                     .catalog()
                     .pinned_to_tenant(None)
-                    .get_job(&job.job_id)
+                    .get_job(job.job_id())
                     .await?;
                 let job = CompletedJob {
                     session,

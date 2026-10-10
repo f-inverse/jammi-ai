@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
-from jammi.errors import TrainingError
+from jammi.errors import JobFailed
 from jammi_cookbook import fixtures
 
 AUDIO_CORPUS_DIR = fixtures.path("tiny_audio_corpus")
@@ -280,7 +280,7 @@ refused = db.fine_tune(
 )
 try:
     refused.wait()
-except TrainingError as error:
+except JobFailed as error:
     message = str(error)
     print(f"refused: {message}")
     assert "q_proj" in message, f"the refusal must echo the submitted selector: {message}"

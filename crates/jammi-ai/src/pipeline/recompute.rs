@@ -926,9 +926,17 @@ impl InferenceSession {
                 table.table_name
             ),
         })?;
-        let job = self.run_training_spec(spec).await?;
-        job.wait().await?;
-        Ok((job.model_id.clone(), CacheOutcome::Computed))
+        match self.run_training_spec(spec).await?.wait().await? {
+            crate::jobs::JobResult::Model {
+                model_id,
+                cache_outcome,
+                ..
+            } => Ok((model_id, cache_outcome)),
+            crate::jobs::JobResult::Table { .. } => Err(JammiError::Internal(format!(
+                "recompute of '{}': a fine-tune spec ran to a table result",
+                table.table_name
+            ))),
+        }
     }
 
     /// Re-invoke the `assemble_context`→`materialize_context` **pair** — the real

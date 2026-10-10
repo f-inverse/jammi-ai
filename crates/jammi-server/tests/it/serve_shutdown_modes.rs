@@ -18,7 +18,7 @@ use jammi_ai::jobs::compute_test_hooks;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::JobRecord;
 use jammi_db::catalog::model_repo::ModelLocation;
-use jammi_db::catalog::status::JobStatus;
+use jammi_db::catalog::status::{JobKind, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::JammiConfig;
 use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
@@ -42,6 +42,8 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use super::common::grpc::channel;
+use jammi_db::catalog::jobs_repo::WorkerState;
+use jammi_db::catalog::status::JobExecution;
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", fixture("tiny_bert").display())
@@ -258,7 +260,12 @@ async fn submit_fine_tune(ch: Channel, epochs: u32) -> String {
         .job_id
 }
 
-async fn wait_status(catalog: &Catalog, job_id: &str, want: &str, bound: Duration) -> JobRecord {
+async fn wait_status(
+    catalog: &Catalog,
+    job_id: &str,
+    want: JobStatus,
+    bound: Duration,
+) -> JobRecord {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
         let row = catalog.get_job(job_id).await.expect("get_job");
@@ -409,7 +416,7 @@ async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
     wait_status(
         control.session.catalog(),
         &control_job,
-        &JobStatus::Completed.to_string(),
+        JobStatus::Completed,
         Duration::from_secs(300),
     )
     .await;
@@ -434,7 +441,7 @@ async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
     wait_status(
         served.session.catalog(),
         &job_id,
-        &JobStatus::Running.to_string(),
+        JobStatus::Running,
         Duration::from_secs(120),
     )
     .await;
@@ -454,7 +461,7 @@ async fn sigterm_drains_the_in_flight_job_and_exits_drained() {
 
     let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Completed.to_string(), "{row:?}");
+    assert_eq!(row.status, JobStatus::Completed, "{row:?}");
     assert_eq!(row.claimed_by.as_deref(), Some(instance_id.as_str()));
     assert_eq!((row.attempts, row.releases), (1, 0));
     assert!(
@@ -486,7 +493,7 @@ async fn worker_does_not_stop_before_drain_is_signalled() {
     wait_status(
         served.session.catalog(),
         &job_id,
-        &JobStatus::Completed.to_string(),
+        JobStatus::Completed,
         Duration::from_secs(120),
     )
     .await;
@@ -544,7 +551,7 @@ async fn drain_runs_rpc_drain_and_worker_join_concurrently() {
     wait_status(
         served.session.catalog(),
         &job_id,
-        &JobStatus::Running.to_string(),
+        JobStatus::Running,
         Duration::from_secs(120),
     )
     .await;
@@ -557,7 +564,7 @@ async fn drain_runs_rpc_drain_and_worker_join_concurrently() {
     let row = served.session.catalog().get_job(&job_id).await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "the stream ended while the worker was still finishing its job"
     );
     assert!(
@@ -652,7 +659,7 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
 
     let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string(), "{row:?}");
+    assert_eq!(row.status, JobStatus::Running, "{row:?}");
     assert_eq!(row.claimed_by.as_deref(), Some(instance_id.as_str()));
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -670,7 +677,7 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
         1
     );
     let successor = catalog
-        .claim_next("successor", &["fine_tune"], Duration::from_secs(30))
+        .claim_next("successor", &[JobKind::FineTune], Duration::from_secs(30))
         .await
         .unwrap()
         .expect("claimable");
@@ -725,7 +732,7 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
         .await
         .unwrap()
         .into_iter()
-        .find(|j| j.execution == "inline")
+        .find(|j| j.execution == JobExecution::Inline)
         .expect("the inline row exists while parked");
 
     served.drain();
@@ -759,7 +766,7 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
 
     let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&inline.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.status, JobStatus::Running);
     assert!(
         row.lease_expires_at.is_some(),
         "an inline row is never released"
@@ -786,7 +793,7 @@ async fn released_server_never_finalizes_the_aborted_job() {
     wait_status(
         served.session.catalog(),
         &job_id,
-        &JobStatus::Running.to_string(),
+        JobStatus::Running,
         Duration::from_secs(120),
     )
     .await;
@@ -819,7 +826,7 @@ async fn released_server_never_finalizes_the_aborted_job() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let row = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string(), "{row:?}");
+    assert_eq!(row.status, JobStatus::Running, "{row:?}");
     assert_eq!(row.claimed_by.as_deref(), Some(instance_id.as_str()));
     assert!(row.lease_expires_at.is_none());
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -878,7 +885,7 @@ async fn list_workers_reports_state_over_the_wire() {
 
     async fn wire_state(
         addr: std::net::SocketAddr,
-    ) -> Result<Option<String>, tonic::transport::Error> {
+    ) -> Result<Option<WorkerState>, tonic::transport::Error> {
         let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
             .connect()
@@ -891,9 +898,12 @@ async fn list_workers_reports_state_over_the_wire() {
             .workers
             .into_iter()
             .next()
-            .map(|w| w.state))
+            .map(|w| {
+                jammi_wire::worker_state_from_proto(w.state())
+                    .expect("the server states a worker state")
+            }))
     }
-    async fn row_state(session: &InferenceSession) -> Option<String> {
+    async fn row_state(session: &InferenceSession) -> Option<WorkerState> {
         session
             .catalog()
             .list_workers()
@@ -905,12 +915,12 @@ async fn list_workers_reports_state_over_the_wire() {
     }
     /// `Err(transport error)` when the server stopped answering — the caller
     /// then surfaces the serve task's own outcome.
-    async fn wait_state(served: &Served, want: &str) -> Result<(), tonic::transport::Error> {
+    async fn wait_state(served: &Served, want: WorkerState) -> Result<(), tonic::transport::Error> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let wire = wire_state(served.flight_addr).await?;
             let row = row_state(&served.session).await;
-            if wire.as_deref() == Some(want) {
+            if wire == Some(want) {
                 assert_eq!(wire, row, "parity: the wire state equals the row");
                 return Ok(());
             }
@@ -922,7 +932,7 @@ async fn list_workers_reports_state_over_the_wire() {
         }
     }
 
-    if let Err(e) = wait_state(&served, "claiming").await {
+    if let Err(e) = wait_state(&served, WorkerState::Claiming).await {
         let outcome = served.finish(Duration::from_secs(30)).await;
         panic!("server stopped answering ({e}); serve task outcome: {outcome:?}");
     }
@@ -938,7 +948,7 @@ async fn list_workers_reports_state_over_the_wire() {
     wait_status(
         served.session.catalog(),
         &job_id,
-        &JobStatus::Running.to_string(),
+        JobStatus::Running,
         Duration::from_secs(120),
     )
     .await;
@@ -949,7 +959,7 @@ async fn list_workers_reports_state_over_the_wire() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let row = row_state(&served.session).await;
-        if row.as_deref() == Some("draining") {
+        if row == Some(WorkerState::Draining) {
             break;
         }
         assert!(
@@ -1047,8 +1057,10 @@ async fn release_subcommand_sends_sigint_and_the_child_exits_zero_within_two_hea
             .await
             .unwrap()
             .into_inner()
-            .status;
-        if status == jammi_db::catalog::status::JobStatus::Running.to_string() {
+            .status();
+        let status =
+            jammi_wire::job_status_from_proto(status).expect("the server states a job status");
+        if status == JobStatus::Running {
             break;
         }
         assert!(
@@ -1085,7 +1097,7 @@ async fn release_subcommand_sends_sigint_and_the_child_exits_zero_within_two_hea
 
     let catalog = reopen(dir.path()).await;
     let row = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string(), "{row:?}");
+    assert_eq!(row.status, JobStatus::Running, "{row:?}");
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
     assert!(catalog.list_workers().await.unwrap().is_empty());

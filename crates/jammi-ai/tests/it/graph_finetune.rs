@@ -53,6 +53,7 @@ use jammi_db::store::{CacheOutcome, CachePolicy, ReusedArtifact};
 use tempfile::TempDir;
 
 use crate::common;
+use jammi_db::catalog::status::{JobKind, JobStatus};
 
 /// A homophilous two-community graph: `a*` nodes form one clique, `b*` another,
 /// joined by one bridge edge. All edges `Declared` by default.
@@ -405,7 +406,7 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             .await
             .unwrap();
         let _ = job.wait().await;
-        graph_sample_fingerprint_for(&job.job_id)
+        graph_sample_fingerprint_for(job.job_id())
             .expect("materialize_graph_training_set must have sampled and recorded a fingerprint")
     }
 
@@ -519,8 +520,8 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
         result.is_err(),
         "a duplicate node id must drive the job to a typed failure"
     );
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(record.status, "failed");
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
 }
 
 /// The sampler's resident adjacency + node-text bytes are
@@ -628,7 +629,7 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
         .unwrap();
     let _ = job.wait().await;
 
-    let reserved = graph_sample_reservation_bytes_for(&job.job_id)
+    let reserved = graph_sample_reservation_bytes_for(job.job_id())
         .expect("materialize_graph_training_set must have reserved and recorded its bytes");
     assert!(
         reserved >= node_text_bytes,
@@ -724,7 +725,7 @@ async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
     let _ = job.wait().await;
 
     assert_eq!(
-        graph_sample_reservation_released_after_write_for(&job.job_id),
+        graph_sample_reservation_released_after_write_for(job.job_id()),
         Some(true),
         "the reservation must release AFTER the table's write commits, not before"
     );
@@ -992,7 +993,11 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
     // re-claims under a long lease, so worker-b owns the job.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["graph_fine_tune"], Duration::ZERO)
+        .claim_next(
+            worker_a.worker_id(),
+            &[JobKind::GraphFineTune],
+            Duration::ZERO,
+        )
         .await
         .unwrap()
         .expect("worker-a claims the queued job");
@@ -1006,7 +1011,7 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["graph_fine_tune"],
+            &[JobKind::GraphFineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -1017,16 +1022,21 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
     // materialises its OWN GraphTrainingSet table (no shared, name-collided
     // artifact) before either trains.
     worker_a.run_claimed_job(&session, stale_claim).await;
-    let after_loser = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_loser = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_ne!(
-        after_loser.status, "completed",
+        after_loser.status,
+        JobStatus::Completed,
         "the loser's finalize CAS fails; the job is not completed by it"
     );
 
     worker_b.run_claimed_job(&session, owned).await;
     job.wait().await.unwrap();
-    let done = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(done.status, "completed", "the winner finalizes the job");
+    let done = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(
+        done.status,
+        JobStatus::Completed,
+        "the winner finalizes the job"
+    );
 
     // Both attempts' TrainingSet tables exist, `ready`, and are DISTINCT —
     // the loser's is an orphan (never referenced by any model row), never a
@@ -1354,15 +1364,15 @@ async fn run_graph_spec(
         .catalog()
         .claim_next(
             worker.worker_id(),
-            &["graph_fine_tune"],
+            &[JobKind::GraphFineTune],
             std::time::Duration::from_secs(3600),
         )
         .await
         .unwrap()
         .expect("the queued job is claimable");
     worker.run_claimed_job(session, claimed).await;
-    let after = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(after.status, "completed", "{after:?}");
+    let after = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(after.status, JobStatus::Completed, "{after:?}");
     let result = serde_json::from_str(
         after
             .result
@@ -1370,7 +1380,7 @@ async fn run_graph_spec(
             .expect("a completed job has a result"),
     )
     .expect("a training kind's result is a JobResult");
-    (job.model_id.clone(), result)
+    (job.output_model_id().unwrap().to_string(), result)
 }
 
 /// A repeated `graph_fine_tune` under `cache = Use` over unmoved sources
@@ -1579,20 +1589,24 @@ async fn fine_tune_graph_end_to_end_completes() {
         .fine_tune_graph(&sources, &model, sample, Some(train))
         .await
         .unwrap();
-    assert!(job.model_id().starts_with("jammi:fine-tuned:"));
+    assert!(job
+        .output_model_id()
+        .unwrap()
+        .starts_with("jammi:fine-tuned:"));
 
     job.wait().await.unwrap();
 
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        record.status, "completed",
+        record.status,
+        JobStatus::Completed,
         "graph fine-tune job should complete, got {}",
         record.status
     );
 
     let ft = session
         .catalog()
-        .get_model(job.model_id())
+        .get_model(job.output_model_id().unwrap())
         .await
         .unwrap()
         .expect("graph fine-tune registered the model");
@@ -1724,6 +1738,6 @@ async fn fine_tune_graph_isolated_graph_fails() {
         result.is_err(),
         "an isolated graph (no edges) must drive the job to a typed failure"
     );
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(record.status, "failed");
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
 }

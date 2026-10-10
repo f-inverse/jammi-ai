@@ -2,8 +2,8 @@
 title: "Fine-tune acceleration: what your job's kernels actually did"
 ---
 
-**Verbs:** `fine_tune(..., backbone_dtype=...)` · `TrainingJob.acceleration_report()` ·
-`TrainingJob.metrics()` · **Background:** of the two reduced-precision floats, `bf16`
+**Verbs:** `fine_tune(..., backbone_dtype=...)` · `Job.acceleration_report()` ·
+`Job.metrics()` · **Background:** of the two reduced-precision floats, `bf16`
 keeps `f32`'s exponent range and trains without loss scaling [@kalamkar2019bfloat16],
 where `f16` is the type mixed-precision training first needed loss scaling for
 [@micikevicius2018mixedprecision]; FlashAttention computes a whole attention block in
@@ -57,7 +57,7 @@ job = fine_tune("bf16")
 print(f"just submitted: {job.acceleration_report()}")
 try:
     job.wait()
-except jammi.errors.TrainingError as refusal:
+except jammi.errors.JobFailed as refusal:
     print(f"refused: {refusal}")
     claim("bf16 is refused with the reason and the alternatives named",
           all(t in str(refusal) for t in ("bf16", "requires a CUDA device", "f32")))

@@ -81,6 +81,7 @@ use candle_nn::VarMap;
 use jammi_ai::fine_tune::collective::BlockingCall;
 use jammi_ai::fine_tune::data::{TextChunk, TrainingDataLoader};
 use jammi_ai::fine_tune::source::TrainingSource;
+use jammi_ai::fine_tune::spec::fine_tuned_model_id;
 use jammi_ai::fine_tune::spec::{
     admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
 };
@@ -89,7 +90,6 @@ use jammi_ai::fine_tune::trainer::{
     tokenize_and_bucket, AppliedLearningRate, KernelDispatchCount, KernelDispatches, TrainingLoop,
     TrainingLoopBuilder,
 };
-use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::{artifact_files_digest, published_artifact_digest};
 use jammi_ai::fine_tune::{
     EarlyStoppingMetric, EmbeddingLoss, EncoderTraining, FineTuneConfig, FineTuneMethod,
@@ -117,6 +117,7 @@ use crate::leg::{
 };
 use crate::report::TrainRunPayload;
 use crate::vram::{device_memory_probe, VramWindow};
+use jammi_db::catalog::status::JobKind;
 
 fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
     e.to_string().into()
@@ -1684,7 +1685,10 @@ impl std::str::FromStr for Rung {
 /// every rung reports from.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RunMetrics {
-    pub final_loss: f64,
+    pub train_loss_curve: Vec<LossPoint>,
+    /// Present only on a run that monitored the validation loss.
+    #[serde(default)]
+    pub val_loss_curve: Option<Vec<LossPoint>>,
     pub total_steps: usize,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: chrono::DateTime<chrono::Utc>,
@@ -1699,6 +1703,13 @@ pub struct RunMetrics {
     pub timeline: Option<Timeline>,
 }
 
+/// A loss curve's row, one per epoch in epoch order; the bench reads its
+/// loss.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LossPoint {
+    pub loss: f64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct KernelsDisabled {
     pub requested: Vec<String>,
@@ -1709,6 +1720,24 @@ impl RunMetrics {
     pub fn parse(json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         serde_json::from_str(json)
             .map_err(|e| format!("finetune-run: the run's metrics do not parse: {e}").into())
+    }
+
+    /// The monitored loss at the run's last epoch — the statistic the torch
+    /// twin records as its final loss.
+    pub fn final_monitored_loss(
+        &self,
+        metric: EarlyStoppingMetric,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        let curve = match metric {
+            EarlyStoppingMetric::TrainLoss => Some(&self.train_loss_curve),
+            EarlyStoppingMetric::ValLoss => self.val_loss_curve.as_ref(),
+        };
+        curve
+            .and_then(|curve| curve.last())
+            .map(|point| point.loss)
+            .ok_or_else(|| {
+                format!("finetune-run: the run's metrics carry no {metric:?} curve point").into()
+            })
     }
 
     /// The trainer's own run span: its first statement to its final adapter
@@ -1931,7 +1960,7 @@ impl RunContext {
         tokio::runtime::Handle::current()
             .block_on(catalog.claim_next(
                 RESIDENT_WORKER_ID,
-                &["fine_tune"],
+                &[JobKind::FineTune],
                 std::time::Duration::from_secs(3600),
             ))?
             .ok_or("finetune-run: the just-created training job was not claimable")?;
@@ -2131,9 +2160,17 @@ fn train_streamed(
             cache: CachePolicy::Bypass,
         },
     }))?;
-    handle.block_on(job.wait())?;
+    let model_id = match handle.block_on(job.wait())? {
+        jammi_ai::jobs::JobResult::Model { model_id, .. } => model_id,
+        jammi_ai::jobs::JobResult::Table { table, .. } => {
+            return Err(format!(
+                "finetune-run: the fine-tune job ran to table '{table}', not a model"
+            )
+            .into())
+        }
+    };
     handle.block_on(worker.stop_and_join())?;
-    let published = handle.block_on(published_run(&session, &job.job_id, &job.model_id))?;
+    let published = handle.block_on(published_run(&session, job.job_id(), &model_id))?;
     let ran_on = RanOn {
         role: "worker".to_string(),
         ..published.ran_on
@@ -2538,7 +2575,9 @@ pub fn run(
         rung: params.rung.as_str().to_string(),
         final_epoch: params.epochs - 1,
         held_out_count: held_out.count,
-        final_loss_diagnostic: trained.metrics.final_loss,
+        final_loss_diagnostic: trained
+            .metrics
+            .final_monitored_loss(params.early_stopping_metric)?,
         train_run_wall_s: trained.metrics.train_run_wall_s(),
         media_front_end_wall_s: trained.metrics.media_front_end_wall_s,
         epoch_walls: epoch_walls.clone(),

@@ -5,7 +5,7 @@ title: "The unified client surface — one connect, one Session, two honest tran
 **Verbs:** `pip install jammi-ai[embedded]` · `jammi.connect(target)` -> a
 transport-agnostic `Session` (`file://` -> an in-process `EmbeddedBackend`, direct FFI;
 `grpc://` -> a `RemoteDatabase`) · `supports(Capability.X)` · the `JammiError` taxonomy
-(`InvalidArgument` / `NotSupportedOnBackend` / `TrainingError` / `BackendError`) ·
+(`InvalidArgument` / `NotSupportedOnBackend` / `JobFailed` / `BackendError`) ·
 `credentials=` on the front door. · **Background:** the Liskov-substitutable transport
 [@liskov1994behavioral] — an embedded engine and a remote channel are two implementations of
 one behavioural contract, so a program written against the contract runs against either; and
@@ -231,9 +231,9 @@ a bad argument *is* a `ValueError` (`InvalidArgument`), a transport or runtime f
 what kind of error each class is.
 
 ```{python}
-from jammi.errors import BackendError, InvalidArgument, JammiError, TrainingError
+from jammi.errors import BackendError, InvalidArgument, JammiError, JobCancelled, JobFailed
 
-for cls in (JammiError, InvalidArgument, NotSupportedOnBackend, TrainingError, BackendError):
+for cls in (JammiError, InvalidArgument, NotSupportedOnBackend, JobFailed, JobCancelled, BackendError):
     bases = ", ".join(b.__name__ for b in cls.__bases__)
     print(f"{cls.__name__:<24} <- {bases}")
 

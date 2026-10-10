@@ -113,7 +113,7 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
 
     // Walk back through the saved adapter and confirm the adapted-encoder
     // discriminator + the persisted target modules / rank.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg_path = adapter_dir.join("adapter_config.json");
     assert!(
         cfg_path.exists(),
@@ -172,7 +172,7 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
         .unwrap();
     job.wait().await.unwrap();
 
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let saved: jammi_ai::fine_tune::target::SavedAdapter = serde_json::from_str(
         &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
     )
@@ -228,7 +228,10 @@ async fn encoder_adapters_changes_embeddings_versus_base() {
     job.wait().await.unwrap();
 
     let ft_vec = session
-        .encode_text_query(job.model_id(), "encoder adapters end to end smoke")
+        .encode_text_query(
+            job.output_model_id().unwrap(),
+            "encoder adapters end to end smoke",
+        )
         .await
         .unwrap();
 

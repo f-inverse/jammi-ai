@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
+use jammi_db::catalog::jobs_repo::{JobProgress, ProgressReporter};
+use jammi_db::catalog::status::JobPhase;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
@@ -302,7 +304,7 @@ struct EpochBoundary<'a> {
 /// `artifact_path` in the same compare-and-set that flips the job to
 /// `completed`. The directory is a tempdir the result owns, so it is cleaned up
 /// when the worker drops the result after publishing. The run metrics it
-/// computed (final loss, step count, timestamps) are returned here so the
+/// computed (best loss, step count, timestamps) are returned here so the
 /// worker records them in that same compare-and-set.
 #[derive(Debug)]
 pub struct TrainingResult {
@@ -311,8 +313,6 @@ pub struct TrainingResult {
     /// worker reads the adapter files from here to publish them; the tempdir is
     /// removed on drop.
     pub artifact_dir: tempfile::TempDir,
-    /// Best validation loss achieved.
-    pub final_loss: f64,
     /// Total optimizer steps taken.
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
@@ -389,6 +389,28 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
         LrSchedule::LinearDecay => base_lr * (1.0 - progress),
     };
     lr.max(0.0)
+}
+
+/// Read a scalar loss back to the host. `to_scalar::<f32>` refuses any other
+/// dtype, so a reduced-precision loss is upcast first (a no-op on `f32`).
+fn host_loss(loss: &Tensor, what: &str) -> Result<f64> {
+    loss.to_dtype(DType::F32)
+        .and_then(|loss| loss.to_scalar::<f32>())
+        .map(f64::from)
+        .map_err(|e| JammiError::FineTune(format!("{what} loss scalar: {e}")))
+}
+
+/// The mean of a validation pass's per-batch losses. A pass that scored no
+/// batch has no loss: a fabricated measurement is indistinguishable from a
+/// real one downstream — it would select the published checkpoint, stop the
+/// run early, and be reported as the run's best loss — so it is refused.
+fn mean_val_loss(total: f64, batches: usize) -> Result<f64> {
+    match batches {
+        0 => Err(JammiError::FineTune(
+            "internal: a validation pass scored no batch".into(),
+        )),
+        n => Ok(total / n as f64),
+    }
 }
 
 /// The learning rate a run's optimizer steps are APPLIED at.
@@ -485,6 +507,11 @@ impl LastStepHorizon {
             horizon,
             overshoot_armed: true,
         }
+    }
+
+    /// The run's optimizer-step count.
+    fn total(&self) -> usize {
+        self.horizon
     }
 
     /// Whether optimizer step `step` (1-based) must force the non-finite
@@ -847,6 +874,9 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
+    /// Where the loop reports the optimizer steps it has taken: the job's
+    /// row, for the rank that holds the job. `None` reports nothing.
+    progress: Option<ProgressReporter>,
     /// The job's tenant-pinned catalog: every checkpoint this loop stages is
     /// a `model_artifacts` row written through it BEFORE its bytes, owned by
     /// its bound tenant — which is also the first prefix segment the bytes
@@ -932,6 +962,7 @@ pub struct TrainingLoopBuilder {
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
+    progress: Option<ProgressReporter>,
     resume: Option<RestoredCheckpoint>,
     /// See [`Self::epoch_limit`].
     epoch_limit: Option<usize>,
@@ -967,6 +998,7 @@ impl TrainingLoopBuilder {
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
+            progress: None,
             resume: None,
             epoch_limit: None,
             applied_learning_rate: AppliedLearningRate::default(),
@@ -1001,6 +1033,13 @@ impl TrainingLoopBuilder {
     /// trainer-internal test).
     pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Report the optimizer steps the loop takes onto the job's row — set by
+    /// the worker for the rank that holds the job.
+    pub fn progress(mut self, reporter: ProgressReporter) -> Self {
+        self.progress = Some(reporter);
         self
     }
 
@@ -1155,6 +1194,7 @@ impl TrainingLoopBuilder {
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
+            progress: self.progress,
             catalog,
             resume: self.resume,
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
@@ -1690,6 +1730,7 @@ impl TrainingLoop {
             }
             None => Resumed::default(),
         };
+        self.report_steps(global_step, total_optimizer_steps)?;
         // The history's curves grow one row per epoch run, pushed from exactly
         // what `tracing::info!("Epoch complete", ...)` below emits for the
         // GPU-capability suite's own `loss_capture` tracing layer to read back
@@ -1867,6 +1908,7 @@ impl TrainingLoop {
                         epoch_loss += loss_val;
                         batch_count += 1;
                         global_step += 1;
+                        self.report_steps(global_step, last_step_horizon.total())?;
                         let stepped_at = Instant::now();
                         step_walls.push((stepped_at - last_step_at).as_secs_f64());
                         last_step_at = stepped_at;
@@ -2056,6 +2098,7 @@ impl TrainingLoop {
                     is_last_step,
                 )?;
                 global_step += 1;
+                self.report_steps(global_step, last_step_horizon.total())?;
                 // The epoch's last step: its wall closes the series, and the
                 // next epoch's step span starts the mark afresh.
                 step_walls.push(last_step_at.elapsed().as_secs_f64());
@@ -2262,7 +2305,7 @@ impl TrainingLoop {
 
         // A run whose history holds no epoch — none trained here, none
         // carried in from a resume — has no result to finalize.
-        let Some((_, final_loss)) = history.best else {
+        let Some((best_epoch, best_loss)) = history.best else {
             return Err(JammiError::FineTune(format!(
                 "the run trained no epoch: epochs {start_epoch}..{end_epoch}, and no history \
                  was resumed"
@@ -2315,8 +2358,14 @@ impl TrainingLoop {
                     .collect(),
             )
         };
+        // `best_epoch`/`best_loss` name the epoch whose weights were restored
+        // above — the published adapter — and its value of the monitored
+        // loss (`early_stopping_metric`). A validation loss is scored over
+        // small held-out batches with fewer in-batch negatives than a
+        // training batch, so it is not on the train curve's scale.
         let mut metrics = serde_json::json!({
-            "final_loss": final_loss,
+            "best_epoch": best_epoch,
+            "best_loss": best_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
             "started_at": started_at,
@@ -2344,7 +2393,6 @@ impl TrainingLoop {
 
         Ok(TrainingResult {
             artifact_dir: artifact_tmp,
-            final_loss,
             total_steps: global_step,
             metrics_json,
             media_front_end_wall: self.media_front_end_wall.get(),
@@ -2546,6 +2594,20 @@ impl TrainingLoop {
     /// re-encode keeps peak activation memory at one chunk regardless of the
     /// pool size; the gradient equals the single-pass one (pinned by the
     /// gradient-equivalence test in the `gradcache` module).
+    /// Report `steps` optimizer steps taken of `total` onto the job's row,
+    /// when this loop reports for the job.
+    fn report_steps(&mut self, steps: usize, total: usize) -> Result<()> {
+        let Some(reporter) = self.progress.as_mut() else {
+            return Ok(());
+        };
+        let progress = JobProgress {
+            phase: JobPhase::Training,
+            done: Some(steps as u64),
+            total: Some(total as u64),
+        };
+        tokio::runtime::Handle::current().block_on(reporter.report(&self.catalog, progress))
+    }
+
     fn run_gradcache_epoch(
         &mut self,
         train_loader: &TrainingDataLoader,
@@ -2627,16 +2689,7 @@ impl TrainingLoop {
                 None => None,
             };
             let loss = mnrl_loss(&a_rep, &p_rep, neg_rep.as_ref(), scale, true)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("GradCache loss dtype: {e}")))?
-            };
-            let loss_val = loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("GradCache loss scalar: {e}")))?
-                as f64;
+            let loss_val = host_loss(&loss, "GradCache")?;
             Ok((grads, loss_val))
         })();
 
@@ -3612,6 +3665,7 @@ impl TrainingLoop {
             *epoch.grads_pending = false;
 
             *epoch.global_step += 1;
+            self.report_steps(*epoch.global_step, ctx.last_step_horizon.total())?;
             let stepped_at = Instant::now();
             epoch
                 .step_walls
@@ -4089,33 +4143,16 @@ impl TrainingLoop {
     }
 
     /// Run forward pass over validation set without gradient updates.
+    ///
+    /// An empty loader is unreachable — the ValLoss path is refused at the
+    /// split, and the TrainLoss path never calls this — and scores no batch,
+    /// which [`mean_val_loss`] refuses.
     fn evaluate(&self, val_loader: &TrainingDataLoader) -> Result<f64> {
-        if val_loader.is_empty() {
-            // Unreachable: the ValLoss path is refused at the split, and the
-            // TrainLoss path never calls this. Kept as an error rather than a
-            // `0.0` because a fabricated measurement is indistinguishable from a
-            // real one downstream — it selected checkpoints, stopped runs early,
-            // and was reported as the run's final loss.
-            return Err(JammiError::FineTune(
-                "internal: evaluate() called with an empty validation loader".into(),
-            ));
-        }
-
         let mut total_loss = 0.0;
         let mut count = 0;
 
         let accumulate = |batch, total: &mut f64, count: &mut usize| -> Result<()> {
-            let loss = self.compute_loss(&batch)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-            };
-            *total += loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                as f64;
+            *total += host_loss(&self.compute_loss(&batch)?, "Val")?;
             *count += 1;
             Ok(())
         };
@@ -4132,11 +4169,7 @@ impl TrainingLoop {
             }
         }
 
-        Ok(if count > 0 {
-            total_loss / count as f64
-        } else {
-            0.0
-        })
+        mean_val_loss(total_loss, count)
     }
 
     /// Open a fresh [`super::stream::TrainingSetStream`] over `streamed`
@@ -4278,17 +4311,7 @@ impl TrainingLoop {
             chunks_seen += 1;
             let chunk = owned.into_chunk();
             let batch_out = self.encode_chunk(&chunk)?;
-            let loss = self.compute_loss(&batch_out)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-            };
-            total_loss += loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                as f64;
+            total_loss += host_loss(&self.compute_loss(&batch_out)?, "Val")?;
             count += 1;
         }
         let expected_chunks = val_count.div_ceil(batch);
@@ -4299,11 +4322,7 @@ impl TrainingLoop {
             )));
         }
 
-        Ok(if count > 0 {
-            total_loss / count as f64
-        } else {
-            0.0
-        })
+        mean_val_loss(total_loss, count)
     }
 
     /// The public per-pair held-out evaluation seam. Scores the current
@@ -7105,7 +7124,7 @@ mod test_fixtures {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: tag,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some(&format!("{model_id}::1")),
@@ -7118,7 +7137,7 @@ mod test_fixtures {
         catalog
             .claim_next(
                 &format!("{tag}-worker"),
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -8867,13 +8886,13 @@ mod gang_determinism_oracle {
     /// mutation would then pass, which is why the kill goes through
     /// `cancel_after_step` at the full horizon.
     /// The run-level record a result carries: the train-loss curve, the
-    /// epochs the walls close, and the final loss.
-    fn run_record(result: &TrainingResult) -> (serde_json::Value, Vec<usize>, f64) {
+    /// epochs the walls close, and the best epoch and its loss.
+    fn run_record(result: &TrainingResult) -> (serde_json::Value, Vec<usize>, serde_json::Value) {
         let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json).unwrap();
         (
             metrics["train_loss_curve"].clone(),
             result.epoch_walls.iter().map(|w| w.epoch).collect(),
-            result.final_loss,
+            serde_json::json!([metrics["best_epoch"], metrics["best_loss"]]),
         )
     }
 
@@ -8914,10 +8933,10 @@ mod gang_determinism_oracle {
             .result
             .unwrap();
 
-        let (curve, walls, final_loss) = run_record(&resumed);
-        assert_eq!((curve, final_loss), {
-            let (curve, _, final_loss) = run_record(&uninterrupted);
-            (curve, final_loss)
+        let (curve, walls, best) = run_record(&resumed);
+        assert_eq!((curve, best), {
+            let (curve, _, best) = run_record(&uninterrupted);
+            (curve, best)
         });
         assert_eq!(walls, vec![0, 1, 2]);
     }
@@ -9852,7 +9871,7 @@ mod standardization_contract {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oracle-job",
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("oracle-model::1"),
@@ -9865,7 +9884,7 @@ mod standardization_contract {
         catalog
             .claim_next(
                 "oracle-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -11700,7 +11719,7 @@ mod determinism_through_forward {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "det-job",
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("det-model::1"),
@@ -11713,7 +11732,7 @@ mod determinism_through_forward {
         catalog
             .claim_next(
                 "det-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -11988,7 +12007,7 @@ mod resume_invariant {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("resume-model::1"),
@@ -12001,7 +12020,7 @@ mod resume_invariant {
         catalog
             .claim_next(
                 "resume-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -12655,7 +12674,7 @@ mod resume_invariant {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("r5-model::1"),
@@ -12668,7 +12687,7 @@ mod resume_invariant {
         catalog
             .claim_next(
                 "r5-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await

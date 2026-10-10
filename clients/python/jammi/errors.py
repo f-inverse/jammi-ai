@@ -149,12 +149,20 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
 
 
 class TrainingError(JammiError, RuntimeError):
-    """A job reached a ``failed`` terminal state.
+    """A training computation failed while the caller waited on it in
+    process — the trainer refused or broke on its inputs. A queued job that
+    fails raises :class:`JobFailed` from its ``wait()`` instead. Refines
+    :class:`RuntimeError`.
+    """
 
-    Carries the executor's failure message — read off ``JobStatus.error`` on
-    the remote transport, surfaced from the engine's `Job.wait` on the
-    embedded one — so a job fails for the same cause with the same message
-    regardless of where it ran. Refines :class:`RuntimeError`.
+
+class JobFailed(JammiError, RuntimeError):
+    """A job reached the ``failed`` terminal state.
+
+    Raised by a job's ``wait()``, carrying the error its executor recorded —
+    read off ``JobStatus.error`` on the remote transport, off the catalog row
+    on the embedded one — so a job fails for the same cause with the same
+    message wherever it ran. Refines :class:`RuntimeError`.
     """
 
 
@@ -163,9 +171,9 @@ class JobCancelled(JammiError, RuntimeError):
 
     Raised by a job's ``wait()`` when its cancel was requested: a job no worker
     had claimed is cancelled at once, a running one at its executor's next
-    checkpoint. Distinct from :class:`TrainingError` so a caller can tell the
-    end it asked for from a fault. Refines :class:`RuntimeError`, as
-    :class:`TrainingError` does.
+    checkpoint. Distinct from :class:`JobFailed` so a caller can tell the end
+    it asked for from a fault. Refines :class:`RuntimeError`, as
+    :class:`JobFailed` does.
     """
 
 

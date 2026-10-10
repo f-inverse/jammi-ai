@@ -27,6 +27,8 @@ use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use futures::StreamExt;
 use tracing::Instrument;
 
+use crate::catalog::jobs_repo::JobProgress;
+use crate::catalog::status::JobPhase;
 use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
@@ -195,14 +197,31 @@ impl SinkRow<'_> {
         }
     }
 
-    /// Record that `batch` batches have landed: the table row's checkpoint,
-    /// every `interval` batches (`0` never); nothing for a version row.
-    async fn after_batch(&self, batch: usize, interval: usize) -> Result<()> {
+    /// Record that `batch` batches have landed: the building job's
+    /// `progress` (its reporter decides when that reaches the row), and the
+    /// table row's checkpoint every `interval` batches (`0` never); nothing
+    /// for a version row.
+    async fn after_batch(
+        &mut self,
+        batch: usize,
+        interval: usize,
+        progress: JobProgress,
+    ) -> Result<()> {
+        self.report_progress(progress).await?;
         match self {
             Self::Table(t) if interval > 0 && batch.is_multiple_of(interval) => {
                 t.set_checkpoint(batch).await
             }
             Self::Table(_) | Self::Version(_) => Ok(()),
+        }
+    }
+
+    /// Report `progress` onto the job that builds a table row; a version
+    /// row reports nothing.
+    async fn report_progress(&mut self, progress: JobProgress) -> Result<()> {
+        match self {
+            Self::Table(t) => t.report_progress(progress).await,
+            Self::Version(_) => Ok(()),
         }
     }
 
@@ -362,7 +381,7 @@ async fn write(
     store: &ResultStore,
     context: Arc<TaskContext>,
 ) -> Result<SinkSummary> {
-    match write_under(&row, kind, input, store, context).await {
+    match write_under(&mut row, kind, input, store, context).await {
         Ok(summary) => Ok(summary),
         Err(e) => {
             if let Err(failed) = row.abort().await {
@@ -379,7 +398,7 @@ async fn write(
 }
 
 async fn write_under(
-    row: &SinkRow<'_>,
+    row: &mut SinkRow<'_>,
     kind: &SinkKind,
     input: Arc<dyn ExecutionPlan>,
     store: &ResultStore,
@@ -419,6 +438,12 @@ async fn write_under(
         input_rows: 0,
         phases: SinkPhases::default(),
     };
+    // A training set is a training job assembling its input; every other
+    // table is a compute job's output.
+    let phase = match kind {
+        SinkKind::TrainingSet { .. } => JobPhase::Assembling,
+        SinkKind::Embeddings { .. } | SinkKind::Rows => JobPhase::Computing,
+    };
     let mut rows = execute_stream(Arc::clone(&input), context)?;
     if let SinkKind::TrainingSet { columns, .. } = kind {
         rows = crate::store::assert_batches_are_ordinal_sorted(rows, columns);
@@ -434,11 +459,25 @@ async fn write_under(
             }
             batch_num += 1;
             sink.write_batch(&batch).await?;
-            row.after_batch(batch_num, checkpoint_interval).await?;
+            let progress = JobProgress {
+                phase,
+                done: Some(sink.input_rows),
+                total: None,
+            };
+            row.after_batch(batch_num, checkpoint_interval, progress)
+                .await?;
         }
         Ok(())
     }
     .instrument(tracing::debug_span!("sink.rows"))
+    .await?;
+    // The stream is exhausted, so its total is known: the last count always
+    // reaches the row.
+    row.report_progress(JobProgress {
+        phase,
+        done: Some(sink.input_rows),
+        total: Some(sink.input_rows),
+    })
     .await?;
     let (input_rows, rows, built, mut phases) = sink
         .finalize()

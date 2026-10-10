@@ -67,6 +67,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "046_job_ranks",
     "047_drop_compute_cluster_state",
     "048_eval_runs_ground_truth",
+    "049_job_progress_counts",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -882,7 +883,8 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                        '036_instances_result_root_identity', \
                        '037_jobs_assembly_failures_next_after', \
                        '038_compute_cluster_state', '039_canonical_stamps', \
-                       '046_job_ranks', '047_drop_compute_cluster_state')",
+                       '046_job_ranks', '047_drop_compute_cluster_state', \
+                       '049_job_progress_counts')",
                     &[],
                 )
                 .await?;
@@ -944,11 +946,12 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
     let reopened = Catalog::open(dir.path()).await.unwrap();
     let job = reopened.get_job("legacy-1").await.unwrap();
     assert_eq!(
-        job.execution, "queued",
+        job.execution,
+        JobExecution::Queued,
         "every copied row is execution='queued'"
     );
-    assert_eq!(job.status, "queued");
-    assert_eq!(job.kind, "fine_tune");
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.kind, JobKind::FineTune);
     assert_eq!(job.spec, "{\"lr\":1}");
     assert_eq!(job.model_ref.as_deref(), Some("base::1"));
     assert_eq!(job.output_model_id.as_deref(), Some("tuned::1"));
@@ -1171,6 +1174,7 @@ async fn concurrent_migrate_on_fresh_sqlite_is_safe() {
     b.close().await;
 }
 
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 /// Env var that arms the migration runner's ledger-read rendezvous; the
 /// runner's hook reads the same name (`test_hook::MIGRATION_LEDGER_BARRIER_ENV`).
 #[cfg(all(feature = "live-postgres-tests", feature = "test-hooks"))]
@@ -3214,7 +3218,10 @@ fn jobs_table_rebuild_hits(source: &str) -> Vec<(usize, String)> {
     for (idx, line) in source.lines().enumerate() {
         let has_drop_jobs = contains_word_pair(line, "DROP TABLE", "jobs");
         let has_rename_to_jobs = contains_word_pair(line, "RENAME TO", "jobs");
-        let has_alter_jobs_rename = line.contains("ALTER TABLE jobs") && line.contains("RENAME");
+        // A table rename only: `RENAME COLUMN` rewrites the column in place
+        // on both backends, and drops no row.
+        let has_alter_jobs_rename =
+            contains_word_pair(line, "ALTER TABLE", "jobs") && line.contains("RENAME TO");
         if has_drop_jobs || has_rename_to_jobs || has_alter_jobs_rename {
             hits.push((idx + 1, line.trim().to_string()));
         }
@@ -3253,6 +3260,22 @@ mod jobs_table_rebuild_hits_self_tests {
         assert_eq!(
             jobs_table_rebuild_hits("ALTER TABLE jobs_new RENAME TO jobs;\n"),
             vec![(1, "ALTER TABLE jobs_new RENAME TO jobs;".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_column_rename_on_jobs_is_not_a_hit() {
+        assert!(jobs_table_rebuild_hits(
+            "ALTER TABLE jobs RENAME COLUMN progress_rows_done TO progress_done;\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn renaming_jobs_away_is_a_hit() {
+        assert_eq!(
+            jobs_table_rebuild_hits("ALTER TABLE jobs RENAME TO jobs_old;\n"),
+            vec![(1, "ALTER TABLE jobs RENAME TO jobs_old;".to_string())]
         );
     }
 

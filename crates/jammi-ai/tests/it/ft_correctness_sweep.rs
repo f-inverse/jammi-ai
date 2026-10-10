@@ -17,6 +17,7 @@ use jammi_ai::fine_tune::{
     FineTuneConfig, LrSchedule,
 };
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::status::JobKind;
 
 // ── Shared catalog/job boilerplate so a precomputed TrainingLoop can run. ────
 //
@@ -43,7 +44,7 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: tag,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&format!("{model_id}::1")),
@@ -56,7 +57,7 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
     catalog
         .claim_next(
             &format!("{tag}-worker"),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(60),
         )
         .await

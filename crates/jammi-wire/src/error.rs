@@ -34,7 +34,7 @@
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `MissingManifest`, `NoQueryEncoder`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
-//! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
+//! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `JobFailed`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`)
 //! reconstructs exactly,
@@ -176,6 +176,10 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             }
             JammiError::JobCancelled { job_id } => Variant::JobCancelled(pb::JobCancelledError {
                 job_id: job_id.clone(),
+            }),
+            JammiError::JobFailed { job_id, reason } => Variant::JobFailed(pb::JobFailedError {
+                job_id: job_id.clone(),
+                reason: reason.clone(),
             }),
             JammiError::Lexical(message) => Variant::Lexical(pb::StringError {
                 message: message.clone(),
@@ -392,6 +396,10 @@ fn jammi_error_from_detail(
             JammiError::JobAttemptSuperseded { job_id: e.job_id }
         }
         Some(Variant::JobCancelled(e)) => JammiError::JobCancelled { job_id: e.job_id },
+        Some(Variant::JobFailed(e)) => JammiError::JobFailed {
+            job_id: e.job_id,
+            reason: e.reason,
+        },
         Some(Variant::Lexical(e)) => JammiError::Lexical(e.message),
         Some(Variant::IncompatibleFormat(e)) => JammiError::IncompatibleFormat {
             artifact: e.artifact,
@@ -1212,6 +1220,7 @@ mod tests {
             | JammiError::ParentMoved { .. }
             | JammiError::JobAttemptSuperseded { .. }
             | JammiError::JobCancelled { .. }
+            | JammiError::JobFailed { .. }
             | JammiError::SourceBusy { .. }
             | JammiError::InvalidKey { .. }
             | JammiError::VersionUnavailable { .. }
@@ -1312,6 +1321,10 @@ mod tests {
             },
             JammiError::JobCancelled {
                 job_id: "job-fine-tune-1".into(),
+            },
+            JammiError::JobFailed {
+                job_id: "job-fine-tune-1".into(),
+                reason: "backbone_dtype bf16 requires a CUDA device".into(),
             },
             JammiError::Lexical("bm25 sidecar build: tantivy index open failed".into()),
             JammiError::IncompatibleFormat {

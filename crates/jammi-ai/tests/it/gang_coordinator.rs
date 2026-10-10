@@ -49,6 +49,7 @@ pub(crate) use crate::gang_fixtures::{
     gang_config, gang_config_with_dropout, reference_rank0_adapter_bytes, tiny_bert_model,
     two_rank_spec, write_pairs_csv,
 };
+use jammi_db::catalog::status::JobKind;
 
 /// The graph fixture (`graph_finetune.rs`'s end-to-end shape): six nodes in
 /// two triangles joined by one bridge, edges directed both ways.
@@ -236,13 +237,13 @@ pub(crate) async fn submit_and_claim(
         .catalog()
         .claim_next(
             worker.worker_id(),
-            &["fine_tune", "graph_fine_tune"],
+            &[JobKind::FineTune, JobKind::GraphFineTune],
             Duration::from_secs(3),
         )
         .await
         .unwrap()
         .expect("the queued job is claimable");
-    assert_eq!(record.job_id, job.job_id);
+    assert_eq!(record.job_id, job.job_id());
     record
 }
 

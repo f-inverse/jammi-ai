@@ -120,7 +120,7 @@ use jammi_db::storage::StorageUrl;
 use jammi_db::store::ResultStore;
 use jammi_db::tenant_scope::TenantBinding;
 use jammi_db::TenantId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
@@ -625,6 +625,18 @@ async fn reverify(
     }
 }
 
+/// Resolve once the host's phase leaves `Running`, or once its sender drops
+/// — the session is gone, and this host is going away either way. No
+/// `watch::Ref` outlives its condition check, so the hold loop that selects
+/// on this stays `Send` for `tokio::spawn`.
+async fn drained(phase: &mut watch::Receiver<WorkerPhase>) {
+    while *phase.borrow_and_update() == WorkerPhase::Running {
+        if phase.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// `Admitted`, stating whether this member offers to join an NCCL transport
 /// (`jammi_ai::fine_tune::worker::member_offers_nccl`).
 fn admitted_event(nccl: bool) -> RankEvent {
@@ -848,15 +860,7 @@ impl HeldSession {
                         })),
                     };
                 }
-                // The `watch::Ref` `wait_for` yields is consumed inside this
-                // arm's own future (never held in the `select!`'s output
-                // across another arm's await), so the hold loop stays
-                // `Send` for `tokio::spawn`. The sender dropping (the
-                // session is gone) reads as a drain too: this host is going
-                // away either way.
-                () = async {
-                    let _ = phase.wait_for(|p| *p != WorkerPhase::Running).await;
-                } => break SessionEnd::Aborted(AbortReason::Drain),
+                () = drained(&mut phase) => break SessionEnd::Aborted(AbortReason::Drain),
                 _ = tick.tick() => {
                     if let Err(end) =
                         reverify(&self.session, &self.assign, self.identity.as_ref(), self.lease)
@@ -885,7 +889,12 @@ impl HeldSession {
         };
         // A receiver already gone (the client dropped the response stream)
         // has nobody to tell; the hold is freed regardless, below.
-        let _ = self.events.send(item).await;
+        if self.events.send(item).await.is_err() {
+            tracing::debug!(
+                job_id = %self.assign.job_id,
+                "gang hold: the client dropped the response stream before the session's end"
+            );
+        }
         drop(self.events);
         // The round protocol's ends go with the session: the inbox severed
         // first (no further delivery either way — the forwarder held the

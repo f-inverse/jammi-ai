@@ -16,13 +16,13 @@ use crate::common::queue_session;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{AssemblyOutcome, SubmitJobParams, TrainingSetAssembly};
 use jammi_db::catalog::lease::{lease_remaining_seconds_expr, pg_canonical_stamp};
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 use test_case::test_case;
 
-const KIND: &str = "fine_tune";
-const KINDS: &[&str] = &[KIND];
+const KIND: JobKind = JobKind::FineTune;
+const KINDS: &[JobKind] = &[KIND];
 
 fn job_params(job_id: &str) -> SubmitJobParams<'_> {
     SubmitJobParams {

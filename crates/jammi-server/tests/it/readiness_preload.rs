@@ -13,6 +13,8 @@ use jammi_ai::model::cache::preload_test_hooks;
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::jobs_repo::WorkerState;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{JammiConfig, PreloadEntry};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -93,7 +95,7 @@ async fn get(url: String) -> (u16, serde_json::Value) {
 /// `warming` is therefore a ROW fact (the row is what another process
 /// reads) — a peer replica sharing the catalog sees this one as `warming`
 /// over ITS wire; this process cannot report its own.
-async fn wire_worker_state(addr: std::net::SocketAddr) -> Option<String> {
+async fn wire_worker_state(addr: std::net::SocketAddr) -> Option<WorkerState> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
@@ -107,10 +109,13 @@ async fn wire_worker_state(addr: std::net::SocketAddr) -> Option<String> {
         .workers
         .into_iter()
         .next()
-        .map(|w| w.state)
+        .map(|w| {
+            jammi_wire::worker_state_from_proto(w.state())
+                .expect("the server states a worker state")
+        })
 }
 
-async fn worker_state(session: &InferenceSession) -> Option<String> {
+async fn worker_state(session: &InferenceSession) -> Option<WorkerState> {
     session
         .catalog()
         .list_workers()
@@ -121,11 +126,11 @@ async fn worker_state(session: &InferenceSession) -> Option<String> {
         .map(|w| w.state)
 }
 
-async fn wait_worker_state(session: &InferenceSession, want: &str) {
+async fn wait_worker_state(session: &InferenceSession, want: WorkerState) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let state = worker_state(session).await;
-        if state.as_deref() == Some(want) {
+        if state == Some(want) {
             return;
         }
         assert!(
@@ -189,7 +194,7 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
     // The `warming` state is asserted on the ROW: this process is
     // not accepting gRPC yet (see `wire_worker_state`), and the row is what
     // a peer's `ListWorkers` reads.
-    wait_worker_state(&served.session, "warming").await;
+    wait_worker_state(&served.session, WorkerState::Warming).await;
 
     served
         .session
@@ -212,12 +217,12 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         handle.status().await.unwrap(),
-        "queued",
+        JobStatus::Queued,
         "no job is claimed until the process is warm"
     );
     assert_eq!(
-        worker_state(&served.session).await.as_deref(),
-        Some("warming")
+        worker_state(&served.session).await,
+        Some(WorkerState::Warming)
     );
 
     park.release();
@@ -233,10 +238,10 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    wait_worker_state(&served.session, "claiming").await;
+    wait_worker_state(&served.session, WorkerState::Claiming).await;
     assert_eq!(
-        wire_worker_state(served.flight_addr).await.as_deref(),
-        Some("claiming"),
+        wire_worker_state(served.flight_addr).await,
+        Some(WorkerState::Claiming),
         "ListWorkers must report the same `claiming` the row carries"
     );
     tokio::time::timeout(Duration::from_secs(120), handle.wait())
@@ -346,7 +351,7 @@ async fn signal_during_preload_exits_without_serving() {
         ))
         .await;
         park.wait_parked().await;
-        wait_worker_state(&served.session, "warming").await;
+        wait_worker_state(&served.session, WorkerState::Warming).await;
         if release {
             let _ = served.release_tx.send(true);
         } else {
@@ -406,7 +411,7 @@ async fn release_signal_during_preload_actually_releases() {
     ))
     .await;
     load_park.wait_parked().await;
-    wait_worker_state(&served.session, "warming").await;
+    wait_worker_state(&served.session, WorkerState::Warming).await;
     let instance_id = served.session.instance_id().to_string();
     let release_fired = jammi_ai::fine_tune::worker::loop_test_hooks::arm_rendezvous(
         &instance_id,

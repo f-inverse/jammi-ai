@@ -54,6 +54,7 @@ import pyarrow as pa
 
 from . import _conformal
 from ._capability import Capability
+from ._jobs import JobKind, JobProgress, JobStatus, WorkerState, progress_from_spelling
 from .errors import NotSupportedOnBackend
 from ._sessions import register as _register_session
 from ._sessions import unregister as _unregister_session
@@ -116,6 +117,66 @@ class _TenantScope:
 
     def __exit__(self, *exc: object) -> bool:
         return self._native_scope.__exit__(*exc)
+
+
+class EmbeddedJob:
+    """Handle to a job on the in-process engine (training or compute).
+
+    The embedded peer of :class:`jammi.RemoteJob`, with the same handle shape:
+    ``job_id`` / ``kind`` / ``output_model_id``, a ``status()`` poll, a
+    ``progress()`` read, ``cancel()``, ``wait()``, ``metrics()`` and
+    ``acceleration_report()``. It reads the engine's own handle and returns
+    the typed job vocabulary both transports share.
+    """
+
+    def __init__(self, native: Any) -> None:
+        self._native = native
+
+    @property
+    def job_id(self) -> str:
+        """The unique id the submit assigned this job."""
+        return self._native.job_id
+
+    @property
+    def kind(self) -> JobKind:
+        """The kind this job submitted under."""
+        return JobKind(self._native.kind)
+
+    @property
+    def output_model_id(self) -> Optional[str]:
+        """The model a training kind registers, stamped at submission;
+        ``None`` for a compute kind."""
+        return self._native.output_model_id
+
+    def status(self) -> JobStatus:
+        """The job's current status."""
+        return JobStatus(self._native.status())
+
+    def progress(self) -> Optional[JobProgress]:
+        """This job's latest recorded progress, or ``None`` before the executor
+        records any."""
+        return progress_from_spelling(self._native.progress())
+
+    def cancel(self) -> bool:
+        """Request cancellation. `True` if the request landed on a still
+        non-terminal row; `False` if the job was already terminal or absent."""
+        return self._native.cancel()
+
+    def wait(self) -> Dict[str, Any]:
+        """Block until a terminal state; raise on a failed or cancelled job.
+        Returns the tagged terminal result dict."""
+        return self._native.wait()
+
+    def metrics(self) -> Dict[str, Any]:
+        """Run metrics recorded for this job, as a dict. `{}` until recorded."""
+        return self._native.metrics()
+
+    def acceleration_report(self) -> Optional[Dict[str, Any]]:
+        """GPU-acceleration determination for this job, as a dict, or `None`."""
+        return self._native.acceleration_report()
+
+    def __repr__(self) -> str:
+        return f"EmbeddedJob(job_id={self.job_id!r}, kind={self.kind})"
 
 
 class EmbeddedBackend:
@@ -558,7 +619,7 @@ class EmbeddedBackend:
         raises here. There is no separate existence check to drift from the
         catalog read itself.
         """
-        return self._native.job(job_id)
+        return EmbeddedJob(self._native.job(job_id))
 
     def list_jobs(self) -> List[Dict[str, Any]]:
         """Jobs visible to the current tenant, most recent first.
@@ -566,14 +627,17 @@ class EmbeddedBackend:
         Each entry carries the wire's `JobSummary` field set — ``job_id``,
         ``kind``, ``status``, ``base_model_id``, ``output_model_id``,
         ``created_at``, ``error``, ``claimed_by``, ``ranks`` — with
-        ``output_model_id`` stamped at submission (always empty for a compute
-        kind), ``error`` empty unless it failed, ``claimed_by`` the instance
-        holding (or last holding) the claim and ``ranks`` the instance that
-        ran each rank of the latest training attempt. A listing of :meth:`job` answers
-        plus the submit-time identity; read :meth:`job(job_id).progress()
-        <Job.progress>` for the mid-run progress surface.
+        ``output_model_id`` the model the job produced (present once it
+        completed), ``error`` present once it failed, ``claimed_by`` the
+        instance holding (or last holding) the claim and ``ranks`` the
+        instance that ran each rank of the latest training attempt. Read
+        :meth:`job(job_id).progress() <EmbeddedJob.progress>` for the mid-run
+        progress surface.
         """
-        return self._native.list_jobs()
+        return [
+            {**entry, "kind": JobKind(entry["kind"]), "status": JobStatus(entry["status"])}
+            for entry in self._native.list_jobs()
+        ]
 
     def cancel_job(self, job_id: str) -> bool:
         """Request cancellation of a job by id. `True` when the request landed
@@ -586,7 +650,14 @@ class EmbeddedBackend:
         (`[worker] enabled = true`), most recently seen first: each entry
         carries ``instance_id``, ``label``, ``host``, ``kinds``,
         ``state``, ``started_at``, ``last_seen_at``."""
-        return self._native.list_workers()
+        return [
+            {
+                **entry,
+                "kinds": [JobKind(kind) for kind in entry["kinds"]],
+                "state": WorkerState(entry["state"]),
+            }
+            for entry in self._native.list_workers()
+        ]
 
     def prune_jobs(self) -> int:
         """Eagerly delete this session's own terminal job rows older than the
@@ -695,8 +766,10 @@ class EmbeddedBackend:
             world_size=world_size,
             cache=cache,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def fine_tune_graph(
@@ -815,8 +888,10 @@ class EmbeddedBackend:
             world_size=world_size,
             cache=cache,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def train_context_predictor(
@@ -880,8 +955,10 @@ class EmbeddedBackend:
             idempotency_key=idempotency_key,
             embedding_table=embedding_table,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def infer(

@@ -11,7 +11,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
 use jammi_db::storage::StorageUrl;
@@ -709,7 +709,7 @@ pub async fn finalize_fine_tuned_model(
     catalog
         .submit_job(SubmitJobParams {
             job_id: &job_id,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -720,7 +720,11 @@ pub async fn finalize_fine_tuned_model(
         .await
         .unwrap();
     let attempt = catalog
-        .claim_next(WORKER, &["fine_tune"], std::time::Duration::from_secs(3600))
+        .claim_next(
+            WORKER,
+            &[JobKind::FineTune],
+            std::time::Duration::from_secs(3600),
+        )
         .await
         .unwrap()
         .expect("the queued job is claimable")

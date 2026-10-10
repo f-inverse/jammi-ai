@@ -53,6 +53,7 @@ mod channel;
 mod embedding;
 mod error;
 mod eval_wire;
+mod job;
 mod mutable_table;
 mod training;
 mod trigger;
@@ -85,6 +86,12 @@ pub use error::{
 pub use eval_wire::{
     calibration_shape_from_proto, calibration_shape_to_proto, cohorts_from_proto, cohorts_to_proto,
     eval_task_to_proto, EvalTaskFromWire,
+};
+pub use job::{
+    device_kind_from_proto, device_kind_to_proto, job_kind_from_proto, job_kind_to_proto,
+    job_kinds_from_proto, job_kinds_to_proto, job_phase_from_proto, job_phase_to_proto,
+    job_progress_from_proto, job_progress_to_proto, job_status_from_proto, job_status_to_proto,
+    worker_state_from_proto, worker_state_to_proto,
 };
 pub use mutable_table::{
     definition_from_proto, definition_list_from_proto, definition_to_proto, parse_table_id,

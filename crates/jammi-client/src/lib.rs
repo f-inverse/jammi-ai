@@ -33,6 +33,7 @@ use tonic::transport::Endpoint;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
@@ -487,14 +488,15 @@ impl DataClient {
         Ok(FineTuneJobId(resp.job_id))
     }
 
-    /// Current status string for a fine-tune job, looked up by id.
-    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        Ok(self.job_status_response(&id.0).await?.status)
+    /// The current status of a fine-tune job, looked up by id.
+    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<JobStatus> {
+        let resp = self.job_status_response(&id.0).await?;
+        jammi_wire::job_status_from_proto(resp.status()).map_err(|s| error_from_status(&s))
     }
 
     /// Run metrics recorded for a fine-tune job, as the raw JSON blob text
     /// nested inside the wire's terminal `JobStatus.model.metrics_json`
-    /// — the same blob the embedded `TrainingJob`'s
+    /// — the same blob the embedded job handle's
     /// catalog-backed metrics read returns. `None` for a job that has not
     /// yet recorded any metrics (still queued or running before its first
     /// stamp); this crate carries no `serde_json` dependency, so the caller
@@ -540,8 +542,8 @@ impl DataClient {
             .into_inner())
     }
 
-    /// Read a job's current status by id: status, kind, and the resolved
-    /// output model id (training kinds only; empty for a compute kind).
+    /// Read a job's current status by id: status, kind, and the output model
+    /// id (training kinds only; absent for a compute kind).
     pub async fn job_status(&self, job_id: &str) -> Result<JobStatusResponse> {
         self.job_status_response(job_id).await
     }
@@ -1289,8 +1291,8 @@ mod world_size_tests {
             *self.submitted.lock().unwrap() = Some(request.into_inner());
             Ok(Response::new(SubmitJobResponse {
                 job_id: "job-1".to_string(),
-                kind: "fine_tune".to_string(),
-                output_model_id: String::new(),
+                kind: jammi_wire::proto::job::JobKind::FineTune as i32,
+                output_model_id: Some("jammi:fine-tuned:job-1".to_string()),
             }))
         }
 
@@ -1660,11 +1662,11 @@ mod model_result_cache_outcome_tests {
             _request: Request<JobStatusRequest>,
         ) -> Result<Response<JobStatusResponse>, Status> {
             Ok(Response::new(JobStatusResponse {
-                status: "completed".to_string(),
-                kind: "fine_tune".to_string(),
+                status: jammi_wire::proto::job::JobStatus::Completed as i32,
+                kind: jammi_wire::proto::job::JobKind::FineTune as i32,
                 progress: None,
-                error: String::new(),
-                output_model_id: "jammi:fine-tuned:second".to_string(),
+                error: None,
+                output_model_id: Some("jammi:fine-tuned:second".to_string()),
                 result: Some(WireResult::Model(ModelResult {
                     model_id: "jammi:fine-tuned:second".to_string(),
                     artifact_path: "file:///artifacts/first".to_string(),

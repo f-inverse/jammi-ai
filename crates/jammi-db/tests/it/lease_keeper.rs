@@ -11,7 +11,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::lease_keeper::{LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
 use tempfile::tempdir;
@@ -77,7 +77,7 @@ async fn holds_renew_from_a_thread_while_the_callers_runtime_is_blocked() {
     catalog
         .submit_job(SubmitJobParams {
             job_id: "kept-alive",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("keeper-base::1"),
@@ -88,7 +88,7 @@ async fn holds_renew_from_a_thread_while_the_callers_runtime_is_blocked() {
         .await
         .unwrap();
     let claimed = catalog
-        .claim_next("instance-a", &["fine_tune"], Duration::from_secs(3))
+        .claim_next("instance-a", &[JobKind::FineTune], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("job claimed");
@@ -158,7 +158,7 @@ async fn lost_flag_sets_after_a_peer_reclaims_the_held_job() {
     catalog
         .submit_job(SubmitJobParams {
             job_id: "stolen",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("keeper-base::1"),
@@ -169,7 +169,7 @@ async fn lost_flag_sets_after_a_peer_reclaims_the_held_job() {
         .await
         .unwrap();
     let claimed = catalog
-        .claim_next("instance-a", &["fine_tune"], Duration::from_secs(3))
+        .claim_next("instance-a", &[JobKind::FineTune], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("job claimed");
@@ -220,7 +220,7 @@ async fn dropping_a_hold_sets_the_lost_flag_its_holders_read() {
     catalog
         .submit_job(SubmitJobParams {
             job_id: "abandoned",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("keeper-base::1"),
@@ -231,7 +231,7 @@ async fn dropping_a_hold_sets_the_lost_flag_its_holders_read() {
         .await
         .unwrap();
     let claimed = catalog
-        .claim_next("instance-a", &["fine_tune"], Duration::from_secs(3))
+        .claim_next("instance-a", &[JobKind::FineTune], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("job claimed");
@@ -335,7 +335,7 @@ async fn every_hold_reports_lost_when_the_keeper_thread_dies() {
     catalog
         .submit_job(SubmitJobParams {
             job_id: "orphaned-by-death",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("keeper-base::1"),
@@ -346,7 +346,7 @@ async fn every_hold_reports_lost_when_the_keeper_thread_dies() {
         .await
         .unwrap();
     let claimed = catalog
-        .claim_next("instance-a", &["fine_tune"], Duration::from_secs(3))
+        .claim_next("instance-a", &[JobKind::FineTune], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("job claimed");
@@ -557,7 +557,7 @@ async fn a_hold_registered_after_release_never_re_arms_the_lease(
     catalog
         .submit_job(SubmitJobParams {
             job_id: &job_id,
-            kind: "embedding",
+            kind: JobKind::Embedding,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,
@@ -569,7 +569,7 @@ async fn a_hold_registered_after_release_never_re_arms_the_lease(
         .unwrap();
     let instance = format!("inst-{}", jammi_test_utils::unique_suffix());
     let claimed = catalog
-        .claim_next(&instance, &["embedding"], Duration::from_secs(3))
+        .claim_next(&instance, &[JobKind::Embedding], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("job claimed");
@@ -621,7 +621,7 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
     let catalog = seeded_catalog(dir.path()).await;
     let job = |id: &'static str, execution: JobExecution| SubmitJobParams {
         job_id: id,
-        kind: "fine_tune",
+        kind: JobKind::FineTune,
         execution,
         spec: "{}",
         model_ref: Some("keeper-base::1"),
@@ -639,7 +639,7 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
         .unwrap();
     let lease = Duration::from_secs(3);
     let queued = catalog
-        .claim_next("me", &["fine_tune"], lease)
+        .claim_next("me", &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("queued claimed");
@@ -784,7 +784,7 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
     let catalog = seeded_catalog(dir.path()).await;
     let job = |id: &'static str, execution: JobExecution| SubmitJobParams {
         job_id: id,
-        kind: "fine_tune",
+        kind: JobKind::FineTune,
         execution,
         spec: "{}",
         model_ref: Some("keeper-base::1"),
@@ -798,7 +798,7 @@ async fn release_job_holds_reports_failed_from_a_real_backend_fault() {
         .unwrap();
     let lease = Duration::from_secs(3);
     let queued = catalog
-        .claim_next("me", &["fine_tune"], lease)
+        .claim_next("me", &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("queued claimed");
@@ -906,7 +906,7 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     catalog
         .submit_job(SubmitJobParams {
             job_id: &job_id,
-            kind: "embedding",
+            kind: JobKind::Embedding,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,
@@ -919,7 +919,7 @@ async fn release_and_stop_statement_order_releases_exactly_once_on_a_real_backen
     let instance = format!("inst-{}", jammi_test_utils::unique_suffix());
     let intervals = fast_intervals();
     let claimed = catalog
-        .claim_next(&instance, &["embedding"], intervals.lease())
+        .claim_next(&instance, &[JobKind::Embedding], intervals.lease())
         .await
         .unwrap()
         .expect("job claimed");

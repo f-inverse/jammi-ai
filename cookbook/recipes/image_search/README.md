@@ -26,7 +26,7 @@ program to try one.
 - `Session.encode_query(*, model, query, modality="image")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `Job`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Image triplet schema (fine-tune input)

@@ -1,21 +1,12 @@
-//! `JobService` gRPC implementation.
+//! `JobService` gRPC implementation: the durable job queue on the wire.
 //!
-//! `JobService` replaces `TrainingService`: `SubmitJob` folds
-//! `StartTraining`, `JobStatus` folds `TrainingStatus`, `ListJobs` folds
-//! `ListTrainingJobs`, and the service adds `WaitJob` (a resumable
-//! server-streaming wait) and `CancelJob`/`ListWorkers`, generalising the
-//! training-only queue into the kind-agnostic durable job abstraction every
-//! compute verb submits through internally (`jammi_ai::jobs`,
-//! `InferenceSession::run_now`). This handler carries only the three
-//! training-kind `SubmitJob` variants directly (the oneof); every other
-//! compute verb is synchronous on the wire TODAY — it keeps its own
-//! dedicated request AND response message on its own service (e.g.
-//! `PipelineService::BuildNeighborGraph`) rather than going through
-//! `SubmitJobResponse`, so this service's `JobStatus`/`WaitJob` never has a
-//! compute-kind row to answer for over the wire (the synchronous
-//! response is still byte-identical to what a `jobs` row of the same kind
-//! would resolve to, since both paths run through the same
-//! `execute_compute` dispatcher).
+//! `SubmitJob` submits a training job (the three training kinds of its
+//! oneof); `JobStatus` and the resumable server-streaming `WaitJob` read any
+//! job by id; `ListJobs`, `CancelJob`, `ListWorkers` and `PruneJobs` complete
+//! the set. Every compute verb is synchronous on its own service (e.g.
+//! `PipelineService::BuildNeighborGraph`) and answers with its own response,
+//! byte-identical to what a `jobs` row of the same kind resolves to — both
+//! run through the one `execute_compute` dispatcher (`jammi_ai::jobs`).
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the async tenant-binding layer)
@@ -32,8 +23,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use jammi_ai::fine_tune::spec::TrainingSpec;
-use jammi_ai::fine_tune::training_job::{resolve_model_id, TrainingJob};
-use jammi_ai::jobs::JobResult as EngineJobResult;
+use jammi_ai::jobs::{JobHandle, JobResult as EngineJobResult};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::training_spec_from_proto;
 use jammi_db::catalog::jobs_repo::JobRecord;
@@ -54,13 +44,6 @@ const WAIT_JOB_POLL: Duration = Duration::from_millis(100);
 /// [`WAIT_JOB_POLL`] tick.
 const WAIT_JOB_BUFFER: usize = 8;
 
-/// The three engine training kinds `SubmitJob` accepts — the only kinds
-/// `resolve_model_id` and `run_training_spec` know how to handle. Shared by
-/// every place this handler must tell a training row from a compute row.
-fn is_training_kind(kind: &str) -> bool {
-    matches!(kind, "fine_tune" | "graph_fine_tune" | "context_predictor")
-}
-
 /// Server-side handler for the `JobService` gRPC surface. Holds the shared
 /// engine session it submits jobs against and reads job records back from.
 pub struct JobServer {
@@ -73,7 +56,7 @@ impl JobServer {
     }
 
     /// Submit a decoded engine [`TrainingSpec`] on the request's session,
-    /// returning the durable [`TrainingJob`] handle — the caller's own on a
+    /// returning the durable [`JobHandle`] — the caller's own on a
     /// fresh submission, or the pre-existing job's handle when
     /// `idempotency_key` is non-empty and collides with a still-known prior
     /// submission (migration 030's durable per-tenant dedupe; see
@@ -85,40 +68,9 @@ impl JobServer {
         &self,
         spec: TrainingSpec,
         idempotency_key: &str,
-    ) -> Result<TrainingJob, JammiError> {
+    ) -> Result<JobHandle, JammiError> {
         let key = (!idempotency_key.is_empty()).then_some(idempotency_key);
         self.session.run_training_spec_deduped(spec, key).await
-    }
-
-    /// Read a job row by id under the request's tenant scope, applying
-    /// row-scoped on-read reclaim before returning it. An absent
-    /// or cross-tenant id is the only failure `Catalog::get_job` raises
-    /// (`JammiError::Catalog`) — mapped to `NOT_FOUND` (never
-    /// `PERMISSION_DENIED`, matching every other tenant-scoped read in this
-    /// codebase) while still attaching the faithful structured error detail
-    /// (`jammi_wire::attach_error_detail`, the same mechanism
-    /// [`map_engine_error`] uses) so a remote caller reconstructs the exact
-    /// `JammiError::Catalog` variant the embedded surface would raise for
-    /// the same lookup — a `Status::not_found` built from a bare string
-    /// would instead decode as the message-only `JammiError::Remote` fallback.
-    async fn read_job(&self, tenant: Option<TenantId>, job_id: &str) -> Result<JobRecord, Status> {
-        let record = scoped(&self.session, tenant, || {
-            self.session.catalog().get_job(job_id)
-        })
-        .await
-        .map_err(|e| {
-            let message = e.to_string();
-            jammi_wire::attach_error_detail(tonic::Code::NotFound, message, &e)
-        })?;
-        match scoped(&self.session, tenant, || {
-            self.session.reclaim_job_on_read(&record)
-        })
-        .await
-        {
-            Ok(Some(reclaimed)) => Ok(reclaimed),
-            Ok(None) => Ok(record),
-            Err(e) => Err(map_engine_error(e)),
-        }
     }
 }
 
@@ -149,7 +101,6 @@ impl JobService for JobServer {
         }
 
         let spec = training_spec_from_proto(req)?;
-        let kind = spec.kind().to_string();
 
         // Durable per-tenant dedupe (migration 030) lives inside the engine
         // seam this delegates to — `submit` reads back the winning row's own
@@ -163,9 +114,9 @@ impl JobService for JobServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(pb::SubmitJobResponse {
-            job_id: job.job_id,
-            kind,
-            output_model_id: job.model_id,
+            job_id: job.job_id().to_string(),
+            kind: jammi_wire::job_kind_to_proto(job.kind()) as i32,
+            output_model_id: job.output_model_id().map(str::to_string),
         }))
     }
 
@@ -178,11 +129,8 @@ impl JobService for JobServer {
         let req = request.into_inner();
         require_nonempty(&req.job_id, "job_id")?;
 
-        let record = self.read_job(tenant, &req.job_id).await?;
-        Ok(Response::new(job_status_response_from_record(
-            &req.job_id,
-            &record,
-        )?))
+        let record = read_job(&self.session, tenant, &req.job_id).await?;
+        Ok(Response::new(job_status_response_from_record(&record)?))
     }
 
     type WaitJobStream = Pin<Box<dyn Stream<Item = Result<pb::JobEvent, Status>> + Send + 'static>>;
@@ -198,74 +146,39 @@ impl JobService for JobServer {
 
         // Validate the id resolves before opening the stream, so a bad id
         // fails the unary-shaped call rather than the first stream frame.
-        let first = self.read_job(tenant, &req.job_id).await?;
+        let first = read_job(&self.session, tenant, &req.job_id).await?;
 
         let (tx, rx) = mpsc::channel::<Result<pb::JobEvent, Status>>(WAIT_JOB_BUFFER);
         let session = Arc::clone(&self.session);
         let job_id = req.job_id.clone();
         tokio::spawn(async move {
-            let mut record = first;
+            let mut next = Ok(first);
             loop {
-                // Derived from `JobStatus::is_terminal` (the ONE terminality
-                // predicate) via a round-trip parse,
-                // rather than a per-status literal compare — a future
-                // terminal status joining the vocabulary ends the stream
-                // with a one-line edit, not a hunt for every literal
-                // compare.
-                if record
-                    .status
-                    .parse::<jammi_db::catalog::status::JobStatus>()
-                    .map(|s| s.is_terminal())
-                    .unwrap_or(false)
-                {
-                    let event = job_status_response_from_record(&job_id, &record).map(|done| {
-                        pb::JobEvent {
+                let (frame, last) = match next {
+                    Ok(record) if record.status.is_terminal() => (
+                        job_status_response_from_record(&record).map(|done| pb::JobEvent {
                             event: Some(pb::job_event::Event::Done(Box::new(done))),
-                        }
-                    });
-                    let _ = tx.send(event).await;
-                    return;
-                }
-
-                let progress = pb::JobProgress {
-                    rows_done: record.progress_rows_done.map(|v| v as u64),
-                    rows_total: record.progress_rows_total.map(|v| v as u64),
-                    phase: record.progress_phase.clone().unwrap_or_default(),
+                        }),
+                        true,
+                    ),
+                    Ok(record) => (
+                        Ok(pb::JobEvent {
+                            event: Some(pb::job_event::Event::Progress(
+                                jammi_wire::job_progress_to_proto(record.progress),
+                            )),
+                        }),
+                        false,
+                    ),
+                    Err(status) => (Err(status), true),
                 };
-                if tx
-                    .send(Ok(pb::JobEvent {
-                        event: Some(pb::job_event::Event::Progress(progress)),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // The receiver dropped — a client disconnect. The job
-                    // itself is untouched; a reconnect resumes the wait.
+                // A send fails only when the receiver dropped — a client
+                // disconnect. The job itself is untouched; a reconnect
+                // resumes the wait.
+                if tx.send(frame).await.is_err() || last {
                     return;
                 }
-
                 tokio::time::sleep(WAIT_JOB_POLL).await;
-
-                record = match scoped(&session, tenant, || session.catalog().get_job(&job_id)).await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let message = e.to_string();
-                        let status =
-                            jammi_wire::attach_error_detail(tonic::Code::NotFound, message, &e);
-                        let _ = tx.send(Err(status)).await;
-                        return;
-                    }
-                };
-                record =
-                    match scoped(&session, tenant, || session.reclaim_job_on_read(&record)).await {
-                        Ok(Some(reclaimed)) => reclaimed,
-                        Ok(None) => record,
-                        Err(e) => {
-                            let _ = tx.send(Err(map_engine_error(e))).await;
-                            return;
-                        }
-                    };
+                next = read_job(&session, tenant, &job_id).await;
             }
         });
 
@@ -325,17 +238,17 @@ impl JobService for JobServer {
                 .into_iter()
                 .map(|w| pb::WorkerSummary {
                     instance_id: w.instance_id,
-                    label: w.label.unwrap_or_default(),
-                    host: w.host.unwrap_or_default(),
-                    kinds: w.kinds,
+                    label: w.label,
+                    host: w.host,
+                    kinds: jammi_wire::job_kinds_to_proto(&w.kinds),
                     started_at: w.started_at,
                     last_seen_at: w.last_seen_at,
-                    state: w.state,
+                    state: jammi_wire::worker_state_to_proto(w.state) as i32,
                     devices: w
                         .devices
                         .into_iter()
                         .map(|d| pb::DeviceFact {
-                            kind: d.kind,
+                            kind: jammi_wire::device_kind_to_proto(d.kind) as i32,
                             ordinal: d.ordinal,
                         })
                         .collect(),
@@ -367,82 +280,88 @@ impl JobService for JobServer {
     }
 }
 
-/// Build a [`pb::JobStatusResponse`] from a job row: status, kind, progress,
-/// failure message, the resolved output model id (training kinds only), the
-/// tagged terminal result (once completed), and the relayed acceleration
-/// report blob.
-fn job_status_response_from_record(
+/// Read a job row by id under the request's tenant scope, applying
+/// row-scoped on-read reclaim before returning it. An absent
+/// or cross-tenant id is the only failure `Catalog::get_job` raises
+/// (`JammiError::Catalog`) — mapped to `NOT_FOUND` (never
+/// `PERMISSION_DENIED`, matching every other tenant-scoped read in this
+/// codebase) while still attaching the faithful structured error detail
+/// (`jammi_wire::attach_error_detail`, the same mechanism
+/// [`map_engine_error`] uses) so a remote caller reconstructs the exact
+/// `JammiError::Catalog` variant the embedded surface would raise for
+/// the same lookup — a `Status::not_found` built from a bare string
+/// would instead decode as the message-only `JammiError::Remote` fallback.
+async fn read_job(
+    session: &Arc<InferenceSession>,
+    tenant: Option<TenantId>,
     job_id: &str,
-    record: &JobRecord,
-) -> Result<pb::JobStatusResponse, Status> {
-    let output_model_id = if is_training_kind(&record.kind) {
-        resolve_model_id(job_id, record).map_err(map_engine_error)?
-    } else {
-        String::new()
-    };
+) -> Result<JobRecord, Status> {
+    let record = scoped(session, tenant, || session.catalog().get_job(job_id))
+        .await
+        .map_err(|e| {
+            let message = e.to_string();
+            jammi_wire::attach_error_detail(tonic::Code::NotFound, message, &e)
+        })?;
+    match scoped(session, tenant, || session.reclaim_job_on_read(&record)).await {
+        Ok(Some(reclaimed)) => Ok(reclaimed),
+        Ok(None) => Ok(record),
+        Err(e) => Err(map_engine_error(e)),
+    }
+}
 
-    let result = match record.result.as_deref() {
-        Some(raw)
-            if record.status == jammi_db::catalog::status::JobStatus::Completed.to_string() =>
-        {
-            let parsed: EngineJobResult = serde_json::from_str(raw).map_err(|e| {
-                Status::internal(format!(
-                    "job '{job_id}' recorded an unparseable result: {e}"
-                ))
-            })?;
-            Some(match parsed {
-                EngineJobResult::Model {
-                    model_id,
-                    artifact_path,
-                    metrics,
-                    cache_outcome,
-                } => pb::job_status_response::Result::Model(pb::ModelResult {
-                    model_id,
-                    artifact_path,
-                    metrics_json: metrics,
-                    cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
-                }),
-                EngineJobResult::Table {
-                    table,
-                    cache_outcome,
-                } => pb::job_status_response::Result::Table(pb::TableResult {
-                    table,
-                    cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
-                }),
-            })
-        }
-        _ => None,
-    };
+/// Build a [`pb::JobStatusResponse`] from a job row: status, kind, progress,
+/// failure message, the output model id the submit stamped (training kinds
+/// only), the tagged terminal result (once completed), and the relayed
+/// acceleration report blob.
+fn job_status_response_from_record(record: &JobRecord) -> Result<pb::JobStatusResponse, Status> {
+    let result = EngineJobResult::recorded(record)
+        .map_err(map_engine_error)?
+        .map(|parsed| match parsed {
+            EngineJobResult::Model {
+                model_id,
+                artifact_path,
+                metrics,
+                cache_outcome,
+            } => pb::job_status_response::Result::Model(pb::ModelResult {
+                model_id,
+                artifact_path,
+                metrics_json: metrics,
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
+            }),
+            EngineJobResult::Table {
+                table,
+                cache_outcome,
+            } => pb::job_status_response::Result::Table(pb::TableResult {
+                table,
+                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&cache_outcome)),
+            }),
+        });
 
     Ok(pb::JobStatusResponse {
-        status: record.status.clone(),
-        kind: record.kind.clone(),
-        progress: Some(pb::JobProgress {
-            rows_done: record.progress_rows_done.map(|v| v as u64),
-            rows_total: record.progress_rows_total.map(|v| v as u64),
-            phase: record.progress_phase.clone().unwrap_or_default(),
-        }),
-        error: record.error.clone().unwrap_or_default(),
-        output_model_id,
+        status: jammi_wire::job_status_to_proto(record.status) as i32,
+        kind: jammi_wire::job_kind_to_proto(record.kind) as i32,
+        progress: Some(jammi_wire::job_progress_to_proto(record.progress)),
+        error: record.error.clone(),
+        output_model_id: record.output_model_id.clone(),
         result,
         acceleration_report_json: record.acceleration_report.clone(),
     })
 }
 
-/// Build a [`pb::JobSummary`] from a job row — the same lifecycle projection
-/// [`job_status_response_from_record`] reads, but relaying `output_model_id`
-/// verbatim rather than resolving it: submission stamps the column for every
-/// training kind, and a compute kind never has one.
+/// Build a [`pb::JobSummary`] from a job row — the lifecycle projection a
+/// listing reads. Its `output_model_id` is the model the job produced
+/// ([`JobRecord::produced_model_id`]), absent until a training kind completes.
 fn job_summary_from_record(record: JobRecord) -> pb::JobSummary {
+    let output_model_id = record.produced_model_id().map(str::to_string);
     pb::JobSummary {
         job_id: record.job_id,
-        kind: record.kind,
-        status: record.status,
-        base_model_id: record.model_ref.unwrap_or_default(),
-        output_model_id: record.output_model_id.unwrap_or_default(),
+        kind: jammi_wire::job_kind_to_proto(record.kind) as i32,
+        status: jammi_wire::job_status_to_proto(record.status) as i32,
+        base_model_id: record.model_ref,
+        output_model_id,
         created_at: record.created_at,
-        error: record.error.unwrap_or_default(),
-        claimed_by: record.claimed_by.unwrap_or_default(),
+        error: record.error,
+        claimed_by: record.claimed_by,
         ranks: record.ranks,
     }
 }

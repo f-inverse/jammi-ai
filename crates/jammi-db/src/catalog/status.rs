@@ -199,6 +199,181 @@ impl FromStr for JobStatus {
     }
 }
 
+/// What a job runs (`jobs.kind`). A training kind registers a model under
+/// the job's output model id; a compute kind writes a result table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, VariantArray)]
+pub enum JobKind {
+    /// A text, image or audio fine-tune.
+    FineTune,
+    /// A fine-tune supervised by a graph's edges.
+    GraphFineTune,
+    /// An amortized context predictor.
+    ContextPredictor,
+    /// A k-nearest-neighbour graph over an embedding table.
+    NeighborGraph,
+    /// Embedding propagation over a graph.
+    Propagate,
+    /// Structural node embeddings of a graph.
+    GraphStructure,
+    /// A point-in-time join.
+    AsofJoin,
+    /// A lexical (BM25) index.
+    LexicalIndex,
+    /// Embedding generation over a source.
+    Embedding,
+    /// Model inference over a source.
+    Infer,
+}
+
+impl JobKind {
+    /// Every kind, in declaration order — the vocabulary a worker's `kinds`
+    /// selection is drawn from.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+
+    /// Whether this kind trains a model rather than computing a result table.
+    pub fn trains_a_model(self) -> bool {
+        matches!(
+            self,
+            Self::FineTune | Self::GraphFineTune | Self::ContextPredictor
+        )
+    }
+}
+
+impl fmt::Display for JobKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::FineTune => "fine_tune",
+            Self::GraphFineTune => "graph_fine_tune",
+            Self::ContextPredictor => "context_predictor",
+            Self::NeighborGraph => "neighbor_graph",
+            Self::Propagate => "propagate",
+            Self::GraphStructure => "graph_structure",
+            Self::AsofJoin => "asof_join",
+            Self::LexicalIndex => "lexical_index",
+            Self::Embedding => "embedding",
+            Self::Infer => "infer",
+        })
+    }
+}
+
+impl FromStr for JobKind {
+    type Err = JammiError;
+    /// The inverse of [`Display`](fmt::Display) over [`Self::ALL`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.to_string() == s)
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "kind".into(),
+                reason: format!(
+                    "unknown job kind '{s}'; the kinds are {}",
+                    Self::ALL
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })
+    }
+}
+
+/// What a running job is doing (`jobs.progress_phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
+pub enum JobPhase {
+    /// Assembling its inputs (a training set); progress counts the rows read.
+    Assembling,
+    /// Training a model; progress counts the optimizer steps taken.
+    Training,
+    /// Computing a result table; progress counts the rows read.
+    Computing,
+    /// Publishing the model or the table.
+    Publishing,
+}
+
+impl JobPhase {
+    /// Every phase, in the order a job passes through them.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+}
+
+impl fmt::Display for JobPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Assembling => "assembling",
+            Self::Training => "training",
+            Self::Computing => "computing",
+            Self::Publishing => "publishing",
+        })
+    }
+}
+
+impl FromStr for JobPhase {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|phase| phase.to_string() == s)
+            .ok_or_else(|| JammiError::Catalog(format!("Unknown job phase: '{s}'")))
+    }
+}
+
+/// The job kinds one worker claims, stored as the comma-joined spelling of
+/// each (`workers.kinds`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobKinds(Vec<JobKind>);
+
+impl JobKinds {
+    /// The set of `kinds`, in the order given.
+    pub fn new(kinds: Vec<JobKind>) -> Self {
+        Self(kinds)
+    }
+
+    /// Every kind.
+    pub fn all() -> Self {
+        Self(JobKind::ALL.to_vec())
+    }
+
+    /// Whether the set holds `kind`.
+    pub fn contains(&self, kind: JobKind) -> bool {
+        self.0.contains(&kind)
+    }
+
+    /// The kinds, in the order given.
+    pub fn as_slice(&self) -> &[JobKind] {
+        &self.0
+    }
+
+    /// Whether the set is empty: a claim loop that runs but claims nothing.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Display for JobKinds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let joined = self
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        f.pad(&joined)
+    }
+}
+
+impl FromStr for JobKinds {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(JobKind::from_str)
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
 /// Status of an eval run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalRunStatus {
@@ -317,6 +492,36 @@ mod tests {
         assert_eq!(JobStatus::Failed.to_string(), "failed");
         assert_eq!(JobStatus::Cancelled.to_string(), "cancelled");
         assert!(JobStatus::from_str("canceled").is_err());
+    }
+
+    #[test]
+    fn job_kind_round_trips_and_names_what_it_trains() {
+        for kind in JobKind::ALL {
+            assert_eq!(JobKind::from_str(&kind.to_string()).unwrap(), *kind);
+        }
+        let training: Vec<_> = JobKind::ALL.iter().filter(|k| k.trains_a_model()).collect();
+        assert_eq!(
+            training,
+            [
+                &JobKind::FineTune,
+                &JobKind::GraphFineTune,
+                &JobKind::ContextPredictor
+            ]
+        );
+        assert!(JobKind::from_str("finetune").is_err());
+    }
+
+    #[test]
+    fn job_kinds_round_trip_through_their_column_spelling() {
+        let kinds = JobKinds::new(vec![JobKind::FineTune, JobKind::Embedding]);
+        assert_eq!(kinds.to_string(), "fine_tune,embedding");
+        assert_eq!(JobKinds::from_str("fine_tune,embedding").unwrap(), kinds);
+        assert!(JobKinds::from_str("").unwrap().is_empty());
+        assert_eq!(
+            JobKinds::from_str(&JobKinds::all().to_string()).unwrap(),
+            JobKinds::all()
+        );
+        assert!(JobKinds::from_str("fine_tune,bogus").is_err());
     }
 
     #[test]

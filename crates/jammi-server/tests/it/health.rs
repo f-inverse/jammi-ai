@@ -339,7 +339,7 @@ mod gauges {
         let served = serve(config(
             dir.path(),
             1,
-            WorkerKinds::Only(vec!["embedding".into()]),
+            WorkerKinds::Only(vec![jammi_db::catalog::status::JobKind::Embedding]),
         ))
         .await;
         add_training(&served.session).await;

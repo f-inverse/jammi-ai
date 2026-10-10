@@ -25,14 +25,14 @@ use std::time::Duration;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::jobs_repo::{SubmitJobParams, TrainingSetFillOutcome, WorldSizeFact};
 use jammi_db::catalog::lease::LeaseFact;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 
 use crate::common::queue_session;
 
-const KIND: &str = "fine_tune";
-const KINDS: &[&str] = &[KIND];
+const KIND: JobKind = JobKind::FineTune;
+const KINDS: &[JobKind] = &[KIND];
 
 fn job_params(job_id: &str) -> SubmitJobParams<'_> {
     SubmitJobParams {
@@ -681,7 +681,8 @@ async fn fill_training_set_identity_moved_claim_aborts_without_a_terminal_write(
     );
     assert_eq!(row.training_set_location, None);
     assert_eq!(
-        row.status, "running",
+        row.status,
+        JobStatus::Running,
         "an ABORT must not touch status either — it is a normal event, not a failure"
     );
 }

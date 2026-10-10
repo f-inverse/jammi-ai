@@ -4,7 +4,7 @@
 //! rungs do, with where the run ran proven from the catalog and the fleet's
 //! logs.
 
-use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
+use jammi_ai::fine_tune::spec::fine_tuned_model_id;
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;

@@ -21,6 +21,7 @@ use jammi_db::catalog::instance::{
 use jammi_db::catalog::jobs_repo::WorkerState;
 use jammi_db::catalog::lease::instance_prune_window;
 use jammi_db::catalog::lease_keeper::LeaseTarget;
+use jammi_db::catalog::status::{JobKind, JobKinds};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::LeaseConfig;
 use jammi_db::error::JammiError;
@@ -152,7 +153,7 @@ async fn seed_member(
     instance_id: &str,
     peer_addr: &str,
     root: &str,
-    kinds: &str,
+    kinds: &JobKinds,
     state: WorkerState,
 ) {
     let reg = InstanceRegistration::new(
@@ -175,7 +176,7 @@ fn shared_root() -> MemberRoot {
     MemberRoot::new(root())
 }
 
-fn listing<'a>(kind: &'a str, self_instance: &'a str, root: &'a MemberRoot) -> GangListing<'a> {
+fn listing<'a>(kind: JobKind, self_instance: &'a str, root: &'a MemberRoot) -> GangListing<'a> {
     GangListing {
         kind,
         self_instance,
@@ -205,12 +206,12 @@ async fn list_excludes_the_caller_itself(kind: BackendKind) {
         &self_id,
         "10.0.0.1:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", &self_id, &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, &self_id, &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -233,14 +234,14 @@ async fn list_excludes_a_stale_member(kind: BackendKind) {
         &id,
         "10.0.0.1:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     // instance_liveness_margin(30s) == 60s; push well past it.
     force_stale_instance(&catalog, &id, Duration::from_secs(600)).await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -263,12 +264,12 @@ async fn list_excludes_a_draining_worker(kind: BackendKind) {
         &id,
         "10.0.0.1:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Draining,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -291,12 +292,12 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
         &id,
         "10.0.0.1:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Warming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -305,8 +306,8 @@ async fn list_excludes_a_warming_worker(kind: BackendKind) {
     );
 }
 
-/// A `kinds` token that CONTAINS the requested kind as a substring (never a
-/// whole token) must not match: `graph_fine_tune` vs `fine_tune`.
+/// A kind whose spelling contains the requested one must not match:
+/// `graph_fine_tune` vs `fine_tune`.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -321,12 +322,12 @@ async fn list_excludes_a_kind_that_is_only_a_substring_token(kind: BackendKind) 
         &id,
         "10.0.0.1:9000",
         root(),
-        "graph_fine_tune",
+        &JobKinds::new(vec![JobKind::GraphFineTune]),
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -354,7 +355,7 @@ async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: Backe
         &id_case,
         "10.0.0.1:9000",
         "s3://BUCKET/prefix",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -364,7 +365,7 @@ async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: Backe
         &id_slash,
         "10.0.0.2:9000",
         "s3://bucket/prefix/",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -374,12 +375,12 @@ async fn list_folds_a_trailing_slash_but_neither_bucket_nor_key_case(kind: Backe
         &id_key,
         "10.0.0.3:9000",
         "s3://bucket/Prefix",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &me))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &me))
         .await
         .unwrap();
     assert!(
@@ -413,7 +414,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: Backend
         &gcs_id,
         "10.0.0.3:9000",
         "gcs://bucket/prefix",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -423,7 +424,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: Backend
         &gs_id,
         "10.0.0.4:9000",
         "gs://bucket/prefix",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -433,7 +434,7 @@ async fn gcs_and_gs_spelled_members_are_gang_members_of_each_other(kind: Backend
     ] {
         let me = MemberRoot::new(caller_root);
         let members = catalog
-            .list_gang_members(listing("fine_tune", "someone-else", &me))
+            .list_gang_members(listing(JobKind::FineTune, "someone-else", &me))
             .await
             .unwrap();
         assert!(
@@ -497,7 +498,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
         &file_id,
         "10.0.0.5:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -507,12 +508,12 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
         &s3_id,
         "10.0.0.6:9000",
         "s3://bucket/prefix",
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let as_file = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -525,7 +526,7 @@ async fn file_and_s3_rooted_members_are_not_gang_members_of_each_other(kind: Bac
     );
     let s3 = MemberRoot::new("s3://bucket/prefix");
     let as_s3 = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &s3))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &s3))
         .await
         .unwrap();
     assert!(as_s3.iter().any(|m| m.instance_id == s3_id), "{as_s3:?}");
@@ -545,11 +546,16 @@ async fn list_excludes_a_null_peer_addr(kind: BackendKind) {
     let reg = InstanceRegistration::new(&id, None, None, None, None);
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&id, "fine_tune", WorkerState::Claiming, &[])
+        .upsert_worker(
+            &id,
+            &JobKinds::new(vec![JobKind::FineTune]),
+            WorkerState::Claiming,
+            &[],
+        )
         .await
         .unwrap();
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -580,7 +586,12 @@ async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind
     );
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&id, "fine_tune", WorkerState::Claiming, &[])
+        .upsert_worker(
+            &id,
+            &JobKinds::new(vec![JobKind::FineTune]),
+            WorkerState::Claiming,
+            &[],
+        )
         .await
         .unwrap();
     let full_id = format!("addr-full-{}", jammi_test_utils::unique_suffix());
@@ -589,12 +600,12 @@ async fn list_excludes_a_member_with_peer_addr_set_and_no_root(kind: BackendKind
         &full_id,
         "10.0.0.7:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -636,7 +647,7 @@ async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKi
         &real_id,
         "10.0.0.8:9000",
         &real_root,
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -646,14 +657,14 @@ async fn a_symlinked_local_root_and_its_target_are_the_same_gang(kind: BackendKi
         &link_id,
         "10.0.0.9:9000",
         &link_root,
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     for (caller_root, other) in [(&real_root, &link_id), (&link_root, &real_id)] {
         let me = MemberRoot::new(caller_root);
         let members = catalog
-            .list_gang_members(listing("fine_tune", "someone-else", &me))
+            .list_gang_members(listing(JobKind::FineTune, "someone-else", &me))
             .await
             .unwrap();
         assert!(
@@ -681,12 +692,12 @@ async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) 
         &id,
         "10.0.0.10:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let before = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -708,7 +719,7 @@ async fn a_row_with_a_root_but_no_identity_is_never_a_member(kind: BackendKind) 
         .await
         .unwrap();
     let after = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -738,7 +749,7 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
     // `workers` row is a live process that never runs the claim loop, not a
     // fleet member (the INNER join).
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert!(
@@ -751,8 +762,8 @@ async fn list_excludes_an_instance_with_no_workers_row(kind: BackendKind) {
 // The positive case, byte-order, and tenant independence.
 // ---------------------------------------------------------------------------
 
-/// A fresh, `claiming`, multi-kind worker whose kinds contain the requested
-/// token IS returned, with the right `peer_addr`.
+/// A fresh, `claiming`, multi-kind worker whose kinds include the requested
+/// one IS returned, with the right `peer_addr`.
 #[test_case::test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -767,12 +778,12 @@ async fn list_includes_a_fresh_multi_kind_claiming_worker(kind: BackendKind) {
         &id,
         "10.0.0.5:9000",
         root(),
-        "embedding, fine_tune ,other",
+        &JobKinds::new(vec![JobKind::Embedding, JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -805,7 +816,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
             id,
             "10.0.0.1:9000",
             root(),
-            "fine_tune",
+            &JobKinds::new(vec![JobKind::FineTune]),
             WorkerState::Claiming,
         )
         .await;
@@ -848,7 +859,7 @@ async fn list_is_sorted_by_instance_id_bytes_despite_descending_insertion_order(
     );
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     let ours: Vec<&str> = members
@@ -880,18 +891,18 @@ async fn list_gang_members_is_identical_under_a_scoped_tenant_and_under_none(kin
         &id,
         "10.0.0.7:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     let unscoped = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     let scoped_catalog =
         catalog.pinned_to_tenant(Some(TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap()));
     let scoped = scoped_catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     assert_eq!(
@@ -920,7 +931,7 @@ async fn peer_addr_of_resolves_a_busy_or_other_kind_fresh_member(kind: BackendKi
         &id,
         "10.0.0.3:9000",
         root(),
-        "embedding",
+        &JobKinds::new(vec![JobKind::Embedding]),
         WorkerState::Draining,
     )
     .await;
@@ -945,7 +956,7 @@ async fn peer_addr_of_is_none_for_a_stale_instance(kind: BackendKind) {
         &id,
         "10.0.0.4:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -1004,7 +1015,7 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
         &id,
         "10.0.0.9:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
@@ -1039,13 +1050,13 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
         &id,
         "10.0.0.10:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
     let result = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await;
     let err =
         result.expect_err("a corrupted peer_addr candidate must be a typed error, never dropped");
@@ -1087,13 +1098,18 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
         Some(MemberRoot::new(root())),
     ));
     reg.set_worker(Some(WorkerFacts {
-        kinds: "fine_tune".into(),
+        kinds: JobKinds::new(vec![JobKind::FineTune]),
         state: WorkerState::Claiming,
         devices: vec![],
     }));
     catalog.upsert_instance(&reg).await.unwrap();
     catalog
-        .upsert_worker(&instance_id, "fine_tune", WorkerState::Claiming, &[])
+        .upsert_worker(
+            &instance_id,
+            &JobKinds::new(vec![JobKind::FineTune]),
+            WorkerState::Claiming,
+            &[],
+        )
         .await
         .unwrap();
 
@@ -1113,7 +1129,7 @@ async fn keeper_reregisters_the_whole_membership_tuple_after_a_forced_delete(kin
     tokio::time::sleep(intervals.heartbeat() + Duration::from_millis(500)).await;
 
     let members = catalog
-        .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
+        .list_gang_members(listing(JobKind::FineTune, "someone-else", &shared_root()))
         .await
         .unwrap();
     let member = members
@@ -1158,7 +1174,7 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         &id,
         "10.0.0.1:9000",
         root(),
-        "fine_tune",
+        &JobKinds::new(vec![JobKind::FineTune]),
         WorkerState::Claiming,
     )
     .await;

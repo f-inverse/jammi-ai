@@ -2216,3 +2216,11 @@ DROP TABLE compute_jobs;
 pub(super) const MIGRATION_048_EVAL_RUNS_GROUND_TRUTH: &str = r#"
 ALTER TABLE eval_runs RENAME COLUMN golden_source TO ground_truth;
 "#;
+
+/// A job's progress counts in the unit its phase names — rows while it
+/// assembles or computes, optimizer steps while it trains — so its two counts
+/// are `progress_done` of `progress_total`.
+pub(super) const MIGRATION_049_JOB_PROGRESS_COUNTS: &str = r#"
+ALTER TABLE jobs RENAME COLUMN progress_rows_done TO progress_done;
+ALTER TABLE jobs RENAME COLUMN progress_rows_total TO progress_total;
+"#;

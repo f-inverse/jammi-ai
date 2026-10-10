@@ -27,9 +27,11 @@
 
 use std::time::Duration;
 
+use jammi_db::catalog::status::{JobKind, JobStatus};
 use jammi_server::grpc::proto::inference::ModelTask;
 use jammi_server::grpc::proto::job::job_service_client::JobServiceClient;
 use jammi_server::grpc::proto::job::submit_job_request::Spec;
+use jammi_server::grpc::proto::job::{JobKind as WireJobKind, JobStatus as WireJobStatus};
 use jammi_server::grpc::proto::job::{
     JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
 };
@@ -45,6 +47,16 @@ use tonic::transport::Channel;
 use super::common::grpc::start_engine_server_with_worker_enabled;
 use super::common::grpc::start_engine_server_with_worker_enabled_and_fast_lease;
 use super::common::grpc::start_engine_server_worker_quiesced;
+
+/// The engine status a wire response states.
+fn wire_status(status: WireJobStatus) -> JobStatus {
+    jammi_wire::job_status_from_proto(status).expect("the server states a job status")
+}
+
+/// The engine kind a wire response states.
+fn wire_kind(kind: WireJobKind) -> JobKind {
+    jammi_wire::job_kind_from_proto(kind).expect("the server states a job kind")
+}
 use super::common::grpc::{
     channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A, TENANT_B,
 };
@@ -149,12 +161,7 @@ where
         // so a future terminal status joining the vocabulary still ends
         // this poll with a one-line edit, not a hunt for every enumerated
         // pair.
-        let terminal = resp
-            .status
-            .parse::<jammi_db::catalog::status::JobStatus>()
-            .map(|s| s.is_terminal())
-            .unwrap_or(false);
-        if terminal {
+        if wire_status(resp.status()).is_terminal() {
             return resp;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -180,23 +187,25 @@ async fn start_training_runs_to_completion_over_the_wire() {
         .into_inner();
     assert!(!start.job_id.is_empty(), "StartTraining returns a job id");
     assert!(
-        !start.output_model_id.is_empty(),
-        "StartTraining returns the deterministic output model id"
+        start.output_model_id.is_some(),
+        "SubmitJob returns the deterministic output model id"
     );
 
     let resp = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.status, "completed",
-        "the minimal LoRA fine-tune should complete, got '{}' (error: {})",
-        resp.status, resp.error
+        wire_status(resp.status()),
+        JobStatus::Completed,
+        "the minimal LoRA fine-tune should complete, got '{}' (error: {:?})",
+        resp.status,
+        resp.error
     );
     // On completion the status response carries the output model id (the catalog
     // `output_model_id`), and no error.
     assert!(
-        !resp.output_model_id.is_empty(),
+        resp.output_model_id.is_some(),
         "a completed job's status carries the output model id"
     );
-    assert!(resp.error.is_empty(), "a completed job carries no error");
+    assert!(resp.error.is_none(), "a completed job carries no error");
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
@@ -241,9 +250,11 @@ async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
             .into_inner();
         let resp = poll_until_terminal(&mut client, &start.job_id).await;
         assert_eq!(
-            resp.status, "completed",
-            "got '{}' (error: {})",
-            resp.status, resp.error
+            wire_status(resp.status()),
+            JobStatus::Completed,
+            "got '{}' (error: {:?})",
+            resp.status,
+            resp.error
         );
         let Some(WireResult::Model(model)) = resp.result else {
             panic!("a training kind's terminal result is a model result: {resp:?}");
@@ -318,7 +329,8 @@ async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
 
     let resp = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.status, "completed",
+        wire_status(resp.status()),
+        JobStatus::Completed,
         "tenant-scoped training should complete, got '{}'",
         resp.status
     );
@@ -390,14 +402,15 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
         .iter()
         .find(|j| j.job_id == unscoped_job.job_id)
         .expect("the unscoped listing carries the unscoped job");
-    assert_eq!(row.kind, "fine_tune");
-    assert_eq!(row.status, "completed");
+    assert_eq!(wire_kind(row.kind()), JobKind::FineTune);
+    assert_eq!(wire_status(row.status()), JobStatus::Completed);
     // `base_model_id` is the catalog's registered model id — the resolved
     // fixture path plus a version suffix — not the submit-time `local:` string.
     assert!(
         row.base_model_id
-            .starts_with(&fixture("tiny_bert").display().to_string()),
-        "base_model_id is the catalog id of the submitted base model, got '{}'",
+            .as_deref()
+            .is_some_and(|id| id.starts_with(&fixture("tiny_bert").display().to_string())),
+        "base_model_id is the catalog id of the submitted base model, got {:?}",
         row.base_model_id
     );
     assert_eq!(
@@ -405,7 +418,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
         "a completed row carries the output model id StartTraining returned"
     );
     assert!(!row.created_at.is_empty(), "created_at is recorded");
-    assert!(row.error.is_empty(), "a completed row carries no error");
+    assert!(row.error.is_none(), "a completed row carries no error");
     assert!(
         listed.iter().all(|j| j.job_id != scoped_job.job_id),
         "an unscoped listing must never carry a tenant's job"
@@ -645,19 +658,23 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
         .into_inner();
     assert!(!start.job_id.is_empty(), "StartTraining returns a job id");
     assert_eq!(
-        start.output_model_id, "ctx-predictor-wire",
+        start.output_model_id.as_deref(),
+        Some("ctx-predictor-wire"),
         "the predictor's deterministic model id is returned"
     );
 
     let resp = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.status, "completed",
+        wire_status(resp.status()),
+        JobStatus::Completed,
         "a tenant-scoped context_predictor job must reach `completed` (the worker's \
-         reconstruction reads must observe tenant A's embedding table), got '{}' (error: {})",
-        resp.status, resp.error
+         reconstruction reads must observe tenant A's embedding table), got '{}' (error: {:?})",
+        resp.status,
+        resp.error
     );
     assert_eq!(
-        resp.output_model_id, "ctx-predictor-wire",
+        resp.output_model_id.as_deref(),
+        Some("ctx-predictor-wire"),
         "a completed predictor job carries its registered model id"
     );
 
@@ -799,9 +816,11 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
 
     let resp = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.status, "completed",
-        "a tenant-scoped graph_fine_tune job must reach `completed`, got '{}' (error: {})",
-        resp.status, resp.error
+        wire_status(resp.status()),
+        JobStatus::Completed,
+        "a tenant-scoped graph_fine_tune job must reach `completed`, got '{}' (error: {:?})",
+        resp.status,
+        resp.error
     );
 
     let _ = server.shutdown.send(());
@@ -889,13 +908,26 @@ async fn seed_training_job_row(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
     base_model_id: &str,
-    status: &str,
+    status: JobStatus,
     claimed_by: Option<&str>,
     attempts: i64,
     acceleration_report: Option<&str>,
 ) {
     use jammi_db::catalog::backend::{SqlNullType, SqlValue, TxOptions};
 
+    let output_model_id = jammi_ai::fine_tune::spec::fine_tuned_model_id(job_id);
+    // A completed row carries its result: the finalize writes both in one
+    // compare-and-set.
+    let result = (status == JobStatus::Completed).then(|| {
+        serde_json::json!({
+            "kind": "model",
+            "model_id": output_model_id,
+            "artifact_path": "file:///seed/unused",
+            "metrics": null,
+            "cache_outcome": {"outcome": "computed"},
+        })
+        .to_string()
+    });
     let job_id = job_id.to_string();
     let base_model_id = base_model_id.to_string();
     let status = status.to_string();
@@ -916,15 +948,17 @@ async fn seed_training_job_row(
                 tx.execute(
                     "INSERT INTO jobs \
                      (job_id, kind, tenant_id, status, execution, spec, model_ref, \
-                      acceleration_report, claimed_by, attempts, lease_expires_at, \
-                      created_at, updated_at) \
+                      output_model_id, result, acceleration_report, claimed_by, attempts, \
+                      lease_expires_at, created_at, updated_at) \
                      VALUES ($1, 'fine_tune', $2, $3, 'queued', '{}', $4, \
-                             $5, $6, $7, $8, $9, $9)",
+                             $5, $6, $7, $8, $9, $10, $11, $11)",
                     &[
                         SqlValue::TextOwned(job_id),
                         SqlValue::Null(SqlNullType::Text),
                         SqlValue::TextOwned(status),
                         SqlValue::TextOwned(base_model_id),
+                        SqlValue::TextOwned(output_model_id),
+                        SqlValue::from(result),
                         SqlValue::from(acceleration_report),
                         SqlValue::from(claimed_by),
                         SqlValue::Int(attempts),
@@ -1017,7 +1051,8 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     // vacuously against a job that was already claimed: a claimed row's status
     // is `running`/terminal, never `queued`.
     assert_eq!(
-        resp.status, "queued",
+        wire_status(resp.status()),
+        JobStatus::Queued,
         "the quiesced fixture must leave the submitted job unclaimed — a \
          non-`queued` status here means a claimant ran and the read below is \
          no longer a pre-claim read"
@@ -1040,10 +1075,12 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
     let worker = server.spawn_worker();
     let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        terminal.status, "completed",
+        wire_status(terminal.status()),
+        JobStatus::Completed,
         "the released worker must run the submitted job to completion, got '{}' \
-         (error: {})",
-        terminal.status, terminal.error
+         (error: {:?})",
+        terminal.status,
+        terminal.error
     );
 
     // Quiesced read point #2 — the job is terminal AND the worker is stopped and
@@ -1117,10 +1154,12 @@ async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
     // stable under a running worker).
     let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        terminal.status, "completed",
+        wire_status(terminal.status()),
+        JobStatus::Completed,
         "the eager worker must run the submitted job to completion, got '{}' \
-         (error: {})",
-        terminal.status, terminal.error
+         (error: {:?})",
+        terminal.status,
+        terminal.error
     );
     assert_ne!(
         terminal.acceleration_report_json.as_deref(),
@@ -1181,7 +1220,7 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
         catalog,
         "acc-determined",
         "acc-test-base::1",
-        "running",
+        JobStatus::Running,
         Some("acc-test-worker"),
         1,
         Some(r#"{"state":"pending"}"#),
@@ -1203,7 +1242,7 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
         catalog,
         "acc-legacy",
         "acc-test-base::1",
-        "completed",
+        JobStatus::Completed,
         None,
         0,
         None,
@@ -1281,7 +1320,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
         catalog,
         "acc-vis-legacy",
         "acc-vis-base::1",
-        "completed",
+        JobStatus::Completed,
         None,
         0,
         None,
@@ -1293,7 +1332,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
         catalog,
         "acc-vis-pending",
         "acc-vis-base::1",
-        "running",
+        JobStatus::Running,
         Some("acc-vis-worker-1"),
         1,
         Some(r#"{"state":"pending"}"#),
@@ -1303,7 +1342,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
         catalog,
         "acc-vis-determined",
         "acc-vis-base::1",
-        "running",
+        JobStatus::Running,
         Some("acc-vis-worker-2"),
         1,
         Some(r#"{"state":"pending"}"#),
@@ -1448,12 +1487,14 @@ async fn worker_disabled_leaves_the_job_queued_and_pending_stable() {
     for poll in 0..POLLS {
         let (wire, embedded) = wire_and_embedded(&mut client, &server, &start.job_id).await;
         assert_eq!(
-            wire.status, "queued",
+            wire_status(wire.status()),
+            JobStatus::Queued,
             "poll {poll}: with [worker] enabled = false NOTHING in this process may \
              claim the job — it must still read `queued`"
         );
         assert_eq!(
-            embedded.status, "queued",
+            embedded.status,
+            JobStatus::Queued,
             "poll {poll}: the embedded catalog read must agree the job is still \
              queued"
         );
@@ -1533,7 +1574,7 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
             .await
             .expect("training_status")
             .into_inner();
-        if wire.status != jammi_db::catalog::status::JobStatus::Queued.to_string() {
+        if wire_status(wire.status()) != JobStatus::Queued {
             left_queued = Some(wire);
             break;
         }
@@ -1546,7 +1587,8 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
          [worker] enabled = false oracle vacuous",
     );
     assert_ne!(
-        observed.status, "queued",
+        wire_status(observed.status()),
+        JobStatus::Queued,
         "the claimed job has left the queue"
     );
 
@@ -1555,9 +1597,11 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
     // the wire read cannot have moved on to something else.
     let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        terminal.status, "completed",
-        "the claimed job runs to completion, got '{}' (error: {})",
-        terminal.status, terminal.error
+        wire_status(terminal.status()),
+        JobStatus::Completed,
+        "the claimed job runs to completion, got {:?} (error: {:?})",
+        terminal.status(),
+        terminal.error
     );
     let embedded = server
         .engine
@@ -1566,7 +1610,8 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
         .await
         .expect("get_job");
     assert_eq!(
-        terminal.status, embedded.status,
+        wire_status(terminal.status()),
+        embedded.status,
         "parity: at the terminal state the remote status and the embedded catalog \
          status must agree for the same job"
     );
@@ -1619,7 +1664,7 @@ async fn list_workers_carries_the_claiming_workers_devices() {
     assert_eq!(
         worker.devices,
         vec![jammi_server::grpc::proto::job::DeviceFact {
-            kind: "cpu".into(),
+            kind: jammi_server::grpc::proto::job::DeviceKind::Cpu as i32,
             ordinal: 0,
         }],
         "a `[gpu] device = -1` (CPU) worker registers exactly one device fact, \
@@ -1641,7 +1686,7 @@ async fn list_workers_carries_the_claiming_workers_devices() {
     assert_eq!(
         embedded[0].devices,
         vec![jammi_db::catalog::instance::DeviceFact {
-            kind: "cpu".into(),
+            kind: jammi_datafusion::ComputeDeviceKind::Cpu,
             ordinal: 0,
         }],
         "parity: the wire-read device list and the embedded catalog's device list \
@@ -1683,7 +1728,8 @@ async fn worker_disabled_shutdown_does_not_await_a_worker_that_never_started() {
         .into_inner();
     let (wire, _) = wire_and_embedded(&mut client, &server, &start.job_id).await;
     assert_eq!(
-        wire.status, "queued",
+        wire_status(wire.status()),
+        JobStatus::Queued,
         "the job is outstanding at shutdown — that is the state this teardown \
          must handle"
     );
@@ -1704,55 +1750,40 @@ async fn worker_disabled_shutdown_does_not_await_a_worker_that_never_started() {
 // ---------------------------------------------------------------------------
 // `TrainingStatus.model_id` ⇄ the embedded attach handle (parity).
 //
-// Attaching to a job by id, the EMBEDDED handle reports the deterministic
-// output model id re-derived from the persisted row (the engine's naming
-// rule); a remote handle that relayed a column stamped only at completion
-// would read `""` before then. Both surfaces resolve through the ONE engine
-// function, so the pre-completion states — the divergence-prone ones, not
-// the terminal happy path — carry a byte-identical id on both transports.
-//
-// The embedded-arm oracle in each test is
-// `jammi_ai::fine_tune::training_job::resolve_model_id` applied to the embedded
-// catalog read of the SAME row: exactly the call (and the value) the embedded
-// attach handle reports. It is triangulated against the id `StartTraining`
-// itself returned — the value the in-process submit handle carries — so the
-// assertion cannot pass by both sides sharing one wrong answer.
+// The submit stamps a training job's output model id on its row, and both
+// surfaces relay that column: the wire's `JobStatus` and the embedded handle
+// attached by id. The pre-completion and terminal-unsuccessful states — the
+// divergence-prone ones, not the terminal happy path — carry a byte-identical
+// id on both transports, triangulated against the id `SubmitJob` itself
+// returned so the assertion cannot pass by both sides sharing one wrong answer.
 // ---------------------------------------------------------------------------
 
-/// The id an ATTACHED embedded handle would report for this job: the engine's
-/// own resolution over the embedded catalog read of the same row.
-async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> String {
-    let record = server
+/// The id an embedded handle attached by id reports for this job.
+async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> Option<String> {
+    server
         .engine
-        .catalog()
-        .get_job(job_id)
+        .job(job_id)
         .await
-        .expect("get_job");
-    jammi_ai::fine_tune::training_job::resolve_model_id(job_id, &record)
-        .expect("the embedded arm resolves this job's model id")
+        .expect("attach by id")
+        .output_model_id()
+        .map(str::to_string)
 }
 
-/// Parity: a `fine_tune` job that has NOT completed reports the same `model_id`
-/// over the wire that the embedded attach handle derives — byte-for-byte, at
-/// the pre-completion state, which is precisely where a column relay would
-/// diverge (`""` remotely vs the derived id in process).
+/// Parity: a `fine_tune` job that has NOT completed reports the same model id
+/// over the wire as the embedded handle attached by id — byte-for-byte, at the
+/// pre-completion state.
 ///
 /// The read point is quiesced by construction (the fixture's worker is stopped
 /// AND joined before it returns), so `queued` here is a state nothing can move
 /// underneath the two reads — the same discipline the acceleration-marker
 /// parity tests use.
 ///
-/// Non-vacuity is asserted three ways: the wire status really is `queued` (a
-/// pre-completion read, not a terminal one), the catalog column really is
-/// unstamped (`output_model_id IS NULL` — so the wire value is DERIVED, not
-/// relayed), and the value equals the non-empty id `StartTraining` returned.
-///
-/// The terminal leg is then re-asserted after the worker is released: at
-/// `completed` the wire id must still equal both the catalog's now-stamped
-/// column and the submit-time id, so closing the pre-completion gap does not
-/// disturb the state that already agreed.
+/// Non-vacuity: the wire status really is `queued` (a pre-completion read, not
+/// a terminal one), and the value equals the id `SubmitJob` returned. The
+/// terminal leg is re-asserted after the worker is released: at `completed`
+/// the wire id still equals the submit-time id and the attached handle's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn training_status_model_id_matches_the_embedded_derived_id_before_completion() {
+async fn job_status_model_id_matches_the_attached_handle_before_completion() {
     let server = start_engine_server_worker_quiesced().await;
     add_training_source(
         channel(server.addr).await,
@@ -1766,34 +1797,32 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
         .await
         .expect("start_training")
         .into_inner();
-    assert!(
-        !start.output_model_id.is_empty(),
-        "StartTraining returns the deterministic output model id — the value the \
-         embedded submit handle carries"
+    assert_eq!(
+        start.output_model_id,
+        Some(jammi_ai::fine_tune::spec::fine_tuned_model_id(
+            &start.job_id
+        )),
+        "SubmitJob returns the deterministic output model id the submit stamped"
     );
 
     // Quiesced read point: post-submission, pre-claim.
     let (wire, embedded) = wire_and_embedded(&mut client, &server, &start.job_id).await;
     assert_eq!(
-        wire.status, "queued",
+        wire_status(wire.status()),
+        JobStatus::Queued,
         "the quiesced fixture must leave the job unclaimed — a non-`queued` \
          status means this is not a pre-completion read"
     );
     assert_eq!(
-        embedded.output_model_id.as_deref(),
-        Some(start.output_model_id.as_str()),
-        "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
-         (`SubmitJobParams::output_model_id`), not at finish — so the row \
-         already carries the deterministic id `StartTraining` returned, even \
-         pre-completion. `resolve_model_id` reads it back directly rather than \
-         re-deriving it, so this is not a plain column relay: the wire value below \
-         must still byte-equal the embedded attach handle's independently-derived id"
+        embedded.output_model_id, start.output_model_id,
+        "the submit stamps output_model_id on the row, so a queued job already \
+         names the model it will register"
     );
     assert_eq!(
         wire.output_model_id,
         embedded_attach_model_id(&server, &start.job_id).await,
-        "parity: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
-         handle derives for the same job at the same pre-completion state"
+        "parity: JobStatus.output_model_id must BYTE-EQUAL the attached handle's \
+         at the same pre-completion state"
     );
     assert_eq!(
         wire.output_model_id, start.output_model_id,
@@ -1806,9 +1835,11 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     let worker = server.spawn_worker();
     let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        terminal.status, "completed",
-        "the released worker must run the job to completion, got '{}' (error: {})",
-        terminal.status, terminal.error
+        wire_status(terminal.status()),
+        JobStatus::Completed,
+        "the released worker must run the job to completion, got '{}' (error: {:?})",
+        terminal.status,
+        terminal.error
     );
     worker
         .stop_and_join()
@@ -1817,14 +1848,12 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
 
     let (after, embedded_after) = wire_and_embedded(&mut client, &server, &start.job_id).await;
     assert_eq!(
-        embedded_after.output_model_id.as_deref(),
-        Some(after.output_model_id.as_str()),
+        embedded_after.output_model_id, after.output_model_id,
         "at completion the wire id is the catalog's stamped output_model_id"
     );
     assert_eq!(
         after.output_model_id, start.output_model_id,
-        "a completed job's wire id is still the submit-time id — the terminal \
-         parity is unchanged by the pre-completion fix"
+        "a completed job's wire id is still the submit-time id"
     );
     assert_eq!(
         after.output_model_id,
@@ -1836,20 +1865,17 @@ async fn training_status_model_id_matches_the_embedded_derived_id_before_complet
     let _ = server.handle.await;
 }
 
-/// Parity across the REST of the lifecycle: a `running` row and a `failed` row —
-/// neither of which ever stamps `output_model_id` — report the embedded attach
-/// handle's derived id over the wire, not the empty string.
-///
-/// A `failed` job is the sharp case: it is TERMINAL yet has no stamped column,
-/// so a "populated once terminal" rule would still leave
-/// it empty on the wire while the embedded handle names the model the job would
-/// have produced.
+/// Parity across the rest of the lifecycle: a `running` row and a `failed` row
+/// report the submit-stamped model id over the wire, the same one the attached
+/// handle reports. A `failed` job is the sharp case: terminal, yet it never
+/// produced its model — it still names the model it was submitted to register,
+/// while a listing (which names only a produced model) names none.
 ///
 /// The rows are seeded directly (never passing through `queued`), so they are
 /// race-free against the fixture's own running worker, which claims exclusively
 /// `WHERE status = 'queued'`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
+async fn job_status_relays_the_stamped_model_id_for_running_and_failed_rows() {
     let server = start_engine_server().await;
     let catalog = server.engine.catalog();
     register_acceleration_test_model(catalog, "model-id-base").await;
@@ -1858,7 +1884,7 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
         catalog,
         "model-id-running",
         "model-id-base::1",
-        "running",
+        JobStatus::Running,
         Some("model-id-worker"),
         1,
         Some(r#"{"state":"pending"}"#),
@@ -1868,7 +1894,7 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
         catalog,
         "model-id-failed",
         "model-id-base::1",
-        "failed",
+        JobStatus::Failed,
         None,
         1,
         None,
@@ -1878,8 +1904,8 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
     let mut client = JobServiceClient::new(channel(server.addr).await);
 
     for (job_id, status) in [
-        ("model-id-running", "running"),
-        ("model-id-failed", "failed"),
+        ("model-id-running", JobStatus::Running),
+        ("model-id-failed", JobStatus::Failed),
     ] {
         let resp = client
             .job_status(JobStatusRequest {
@@ -1888,26 +1914,21 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
             .await
             .expect("training_status")
             .into_inner();
-        let embedded = catalog.get_job(job_id).await.expect("get_job");
         assert_eq!(
-            resp.status, status,
+            wire_status(resp.status()),
+            status,
             "the seeded row must be read back in the state it was seeded in"
-        );
-        assert_eq!(
-            embedded.output_model_id, None,
-            "'{job_id}' has no stamped output_model_id — the wire value below is \
-             a derivation, not a relay"
         );
         assert_eq!(
             resp.output_model_id,
             embedded_attach_model_id(&server, job_id).await,
-            "parity: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
-             embedded attach handle's derived id"
+            "parity: a '{status}' job's JobStatus.output_model_id must BYTE-EQUAL \
+             the attached handle's"
         );
-        assert!(
-            !resp.output_model_id.is_empty(),
-            "a '{status}' job names the model it produces (or would have \
-             produced); the empty string was the divergence"
+        assert_eq!(
+            resp.output_model_id,
+            Some(jammi_ai::fine_tune::spec::fine_tuned_model_id(job_id)),
+            "a '{status}' job names the model it was submitted to register"
         );
     }
 
@@ -1915,17 +1936,16 @@ async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
     let _ = server.handle.await;
 }
 
-/// Parity for the OTHER derivation arm: a `context_predictor` job's model id is
-/// caller-chosen (it rides inside the persisted `training_spec`), NOT derivable
-/// from the job id, so the pre-completion wire read must decode the persisted
-/// spec exactly as the embedded attach does. A handler that assumed the
-/// fine-tune format would pass the fine-tune tests above and be wrong here.
+/// Parity for a caller-chosen model id: a `context_predictor` job's id rides
+/// inside its spec, NOT derivable from the job id, so a surface that assumed
+/// the fine-tune format would pass the fine-tune tests above and be wrong
+/// here. The submit stamps the caller's id, and both surfaces relay it.
 ///
 /// Tenant-scoped throughout — the predictor's source and embedding table are
 /// stamped `tenant_id = A`, so both the submit and the embedded record read run
 /// inside A's scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn training_status_model_id_decodes_the_predictor_spec_before_completion() {
+async fn job_status_model_id_is_the_predictors_caller_chosen_id_before_completion() {
     use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
     use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
@@ -1951,7 +1971,8 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
         .expect("start_training(context_predictor) under tenant scope")
         .into_inner();
     assert_eq!(
-        start.output_model_id, "ctx-predictor-wire",
+        start.output_model_id.as_deref(),
+        Some("ctx-predictor-wire"),
         "the predictor's model id is the caller-chosen id inside its spec"
     );
 
@@ -1963,42 +1984,28 @@ async fn training_status_model_id_decodes_the_predictor_spec_before_completion()
         .expect("training_status")
         .into_inner();
     assert_eq!(
-        resp.status, "queued",
+        wire_status(resp.status()),
+        JobStatus::Queued,
         "the quiesced fixture must leave the predictor job unclaimed — this is a \
          pre-completion read"
     );
 
-    // The embedded arm's own answer, resolved inside tenant A's scope (the job
-    // row is stamped to A).
-    let (embedded_record, embedded_model_id) = server
+    // The embedded handle, attached inside tenant A's scope (the job row is
+    // stamped to A).
+    let embedded_model_id = server
         .engine
         .with_tenant_scoped(tenant_a(), |_scope| async {
-            let record = server
-                .engine
-                .catalog()
-                .get_job(&start.job_id)
-                .await
-                .expect("get_job under tenant A");
-            let model_id =
-                jammi_ai::fine_tune::training_job::resolve_model_id(&start.job_id, &record)
-                    .expect("the embedded arm resolves the predictor job's model id");
-            (record, model_id)
+            embedded_attach_model_id(&server, &start.job_id).await
         })
         .await;
     assert_eq!(
-        embedded_record.output_model_id.as_deref(),
-        Some("ctx-predictor-wire"),
-        "the generalised `jobs` schema stamps output_model_id at SUBMIT time \
-         — the predictor's caller-chosen id is already on the row \
-         pre-completion, not just re-derivable from the persisted spec"
-    );
-    assert_eq!(
         resp.output_model_id, embedded_model_id,
-        "parity: the predictor job's wire model_id must BYTE-EQUAL the id the \
-         embedded attach handle resolves for the same job"
+        "parity: the predictor job's wire model id must BYTE-EQUAL the attached \
+         handle's"
     );
     assert_eq!(
-        resp.output_model_id, "ctx-predictor-wire",
+        resp.output_model_id.as_deref(),
+        Some("ctx-predictor-wire"),
         "and that id is the caller-chosen one, never a jammi:fine-tuned: id \
          derived from the job id"
     );
@@ -2107,7 +2114,7 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
         match frame.event {
             Some(Event::Done(done)) => {
                 done_frames += 1;
-                terminal_status = Some(done.status);
+                terminal_status = Some(wire_status(done.status()));
             }
             Some(Event::Progress(_)) => {}
             None => panic!("WaitJob frame carries neither progress nor done"),
@@ -2117,7 +2124,7 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
         done_frames, 1,
         "WaitJob must end with exactly one terminal Done frame"
     );
-    assert_eq!(terminal_status.as_deref(), Some("completed"));
+    assert_eq!(terminal_status, Some(JobStatus::Completed));
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
@@ -2206,15 +2213,18 @@ async fn training_job_cancel_reports_cancelled_with_the_cancel_message_over_the_
     }
     let terminal = terminal.expect("wait_job must reach a terminal Done frame");
     assert_eq!(
-        terminal.status, "cancelled",
-        "a cancelled training job must land `cancelled`, got '{}' (error: {})",
-        terminal.status, terminal.error
+        wire_status(terminal.status()),
+        JobStatus::Cancelled,
+        "a cancelled training job must land `cancelled`, got '{}' (error: {:?})",
+        terminal.status,
+        terminal.error
     );
     assert!(
         terminal
             .error
-            .contains("cancelled at the executor's request checkpoint"),
-        "the row's error must be JammiError::JobCancelled's faithful text, got: {}",
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled at the executor's request checkpoint")),
+        "the row's error must be JammiError::JobCancelled's faithful text, got: {:?}",
         terminal.error
     );
 
@@ -2288,7 +2298,7 @@ async fn job_status_across_tenants_is_not_found_not_permission_denied() {
         .await
         .expect("tenant A reads its own job status")
         .into_inner();
-    assert!(!own.status.is_empty());
+    assert_ne!(own.status(), WireJobStatus::Unspecified);
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

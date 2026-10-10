@@ -52,6 +52,7 @@ db.add_source("training", path="/data/training_pairs.csv", format="csv")
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
+use jammi_ai::jobs::JobResult;
 use jammi_ai::model::ModelTask;
 
 let job = session.fine_tune(
@@ -63,9 +64,10 @@ let job = session.fine_tune(
     None,  // default config
 ).await?;
 
-println!("Job: {}", job.job_id);
-job.wait().await?;
-println!("Model: {}", job.model_id());
+println!("Job: {}", job.job_id());
+if let JobResult::Model { model_id, .. } = job.wait().await? {
+    println!("Model: {model_id}");
+}
 # Ok(()) }
 ```
 
@@ -77,11 +79,11 @@ job = db.fine_tune(
     base_model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["text_a", "text_b", "score"],
     method="lora",
-    task="embedding",
+    task="text_embedding",
 )
 
 job.wait()
-print(f"Model: {job.model_id}")
+print(f"Model: {job.output_model_id}")
 ```
 
 `base_model` accepts any model reference form, including a local checkpoint
@@ -152,21 +154,22 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::fine_tune::training_job::TrainingJob;
+# use jammi_ai::jobs::{JobHandle, JobResult};
 # use jammi_db::store::CachePolicy;
-# async fn ex(session: &InferenceSession, job: &TrainingJob) -> jammi_db::error::Result<()> {
-let model_id = job.model_id();
-
-let embedding = session.encode_text_query(model_id, "quantum computing").await?;
-println!("query embedding has {} dims", embedding.len());
-session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass, None).await?;
+# async fn ex(session: &InferenceSession, job: &JobHandle) -> jammi_db::error::Result<()> {
+if let JobResult::Model { model_id, .. } = job.wait().await? {
+    let embedding = session.encode_text_query(&model_id, "quantum computing").await?;
+    println!("query embedding has {} dims", embedding.len());
+    session.generate_text_embeddings("patents", &model_id, &["abstract".into()], "id", CachePolicy::Bypass, None).await?;
+}
 # Ok(()) }
 ```
 
 ### Python
 
 ```python
-model_id = job.model_id
+job.wait()
+model_id = job.output_model_id
 
 query_vec = db.encode_query(model=model_id, query="quantum computing")
 db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], key="id", modality="text")
@@ -174,36 +177,45 @@ db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], k
 
 ## Run metrics
 
-`job.metrics()` (Python) returns the run summary recorded on the job — a
-dict with `final_loss` (the best value seen, on whichever metric
-`early_stopping_metric` monitored), `early_stopping_metric` (`"train_loss"`
-or `"val_loss"`), `total_steps`, and `started_at`/`completed_at`
-timestamps. It returns `{}` for a job that has not recorded anything yet
-(still queued, or running before its first stamp), and carries
-`error_message` instead when the job failed.
+`job.metrics()` (Python) returns the run summary recorded on the job:
+
+- `early_stopping_metric` — the loss the run monitored, `"val_loss"` or
+  `"train_loss"`.
+- `best_epoch` and `best_loss` — the epoch with the lowest monitored loss and
+  that loss. Early stopping restores this epoch's adapters, so the published
+  model is this epoch.
+- `train_loss_curve`, and `val_loss_curve` on a run that monitored the
+  validation loss — one `{"epoch", "loss"}` row per epoch.
+- `total_steps`, and `started_at`/`completed_at` timestamps.
+
+It returns `{}` for a job that has not recorded anything yet. A validation
+loss is scored over small held-out batches with fewer in-batch negatives than
+a training batch, so the two curves are on different scales: compare a curve
+with itself, never with the other.
 
 ```python
 job.wait()
 metrics = job.metrics()
-print(f"final loss: {metrics['final_loss']} ({metrics['early_stopping_metric']})")
+print(f"kept epoch {metrics['best_epoch']}: "
+      f"{metrics['early_stopping_metric']} {metrics['best_loss']:.4f}")
 ```
-
-This is a run summary, not a per-epoch curve: the trainer computes and logs
-`avg_train_loss`/`avg_val_loss` at every epoch boundary but does not retain
-them past that boundary, so no per-epoch trajectory is available through
-this surface today.
 
 ## How it works
 
 ```text
-text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> output
+text -> encoder (frozen weights + LoRA A/B, trained) -> pooled embedding -> [head, trained] -> output
 ```
 
-1. The base encoder model (BERT, ModernBERT, etc.) is loaded and frozen
-2. A LoRA projection layer (identity + low-rank A/B matrices) is added after pooling
-3. For each batch: text is encoded, projected through LoRA, and loss is computed
-4. Only the A/B matrices receive gradients
-5. The adapter is saved as `adapter.safetensors` in the artifact directory
+1. The base encoder (BERT, ModernBERT, etc.) loads with its weights frozen
+2. LoRA A/B matrices are added beside the selected linear layers (`target_modules`)
+3. A classification or regression task adds a head over the pooled embedding
+4. For each batch the text is encoded through the adapted layers and the loss computed
+5. Only the A/B matrices and the head receive gradients
+6. The adapters, and the head, are saved as `adapter.safetensors` in the artifact directory
+
+A frozen encoder (`encoder="frozen"`) skips step 2 and trains a LoRA projection
+head over the frozen encoder's pooled output — see
+[Where the adapters train](#where-the-adapters-train).
 
 ### The training set a run reads
 
@@ -279,7 +291,7 @@ job = db.fine_tune(
     base_model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["text_a", "text_b", "score"],
     method="lora",
-    task="embedding",
+    task="text_embedding",
 )
 result = job.wait()
 print(result["cache_outcome"])  # {"outcome": "computed"}, or a reused model artifact under cache="use"
@@ -292,9 +304,9 @@ The embedded surface's cache dial lives on `jammi_wire::request::FineTuneRequest
 (submitted through `InferenceSession::submit_fine_tune`), not on the loose
 `InferenceSession::fine_tune`/`fine_tune_graph` methods shown above, which always
 train (`cache: CachePolicy::Bypass`, unconditionally). The remote
-`jammi_client::DataClient::submit_fine_tune` carries the same field. Neither Rust
-surface returns `cache_outcome` from `TrainingJob::wait()` — only `model_id()` is
-exposed there.
+`jammi_client::DataClient::submit_fine_tune` carries the same field. The outcome
+is on the terminal result: `JobHandle::wait()`'s `JobResult::Model { cache_outcome,
+.. }` in process, and the `model` result of `JobStatusResponse` over the wire.
 
 `cache` is persisted inside the spec's `common` block for both LoRA kinds; a
 stray top-level `cache` key in a `jobs.spec` row (the row is engine-written

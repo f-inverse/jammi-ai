@@ -15,6 +15,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
 
 use crate::common;
+use jammi_db::catalog::status::{JobKind, JobPhase, JobStatus};
 
 // ─── LoRA layer: one setup, all mechanics ──────────────────────────────────
 //
@@ -322,7 +323,7 @@ async fn a_scoped_tenant_embeds_with_its_own_fine_tuned_model() {
                 )
                 .await?;
             job.wait().await?;
-            Ok::<_, jammi_db::error::JammiError>(job.model_id().to_string())
+            Ok::<_, jammi_db::error::JammiError>(job.output_model_id().unwrap().to_string())
         })
         .await
         .expect("alice trains her own model");
@@ -385,25 +386,34 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         .unwrap();
 
     // job_id is set
-    assert!(!job.job_id.is_empty());
+    assert!(!job.job_id().is_empty());
 
     // model_id follows the jammi:fine-tuned:{id} pattern
     assert!(
-        job.model_id().starts_with("jammi:fine-tuned:"),
+        job.output_model_id()
+            .unwrap()
+            .starts_with("jammi:fine-tuned:"),
         "model_id should have jammi:fine-tuned: prefix, got '{}'",
-        job.model_id()
+        job.output_model_id().unwrap()
     );
 
     // Wait for completion
     job.wait().await.unwrap();
 
     // Job status transitions queued → running → completed
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(record.status, "completed");
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(record.status, JobStatus::Completed);
     assert!(!record.created_at.is_empty(), "created_at should be set");
     assert!(
         record.result.is_some(),
         "a completed job records its result"
+    );
+    // The last thing the run reported, after training, was publishing.
+    assert_eq!(
+        record.progress.map(|p| p.phase),
+        Some(JobPhase::Publishing),
+        "a finished fine-tune's last progress is its publish: {:?}",
+        record.progress
     );
 
     // Fine-tuned model registered in catalog, referencing its artifact
@@ -530,7 +540,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     job.wait().await.unwrap();
 
     let warm_embedding = session
-        .encode_text_query(job.model_id(), "quantum computing")
+        .encode_text_query(job.output_model_id().unwrap(), "quantum computing")
         .await
         .expect("the fine-tuned BERT model resolves and serves warm");
     let warm_diff: f32 = base_embedding
@@ -555,7 +565,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     // the identity the environment records, at the adapter's own persisted
     // backbone precision — without materializing it; the cold serve below
     // then materializes exactly that description.
-    let fine_tuned = ModelSource::parse(job.model_id());
+    let fine_tuned = ModelSource::parse(job.output_model_id().unwrap());
     let described = cold_session
         .model_cache()
         .describe(&fine_tuned, ModelTask::TextEmbedding)
@@ -570,7 +580,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
         "describing the fine-tuned model materialized it"
     );
     let cold_embedding = cold_session
-        .encode_text_query(job.model_id(), "quantum computing")
+        .encode_text_query(job.output_model_id().unwrap(), "quantum computing")
         .await
         .expect("the fine-tuned BERT model resolves and serves cold");
     let served = cold_session
@@ -610,13 +620,13 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "bert fine-tuned",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::text_serve(model.clone(), PROBE),
-        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+        serve_tuned: &common::text_serve(job.output_model_id().unwrap().to_string(), PROBE),
     })
     .await;
 }
@@ -692,7 +702,7 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
         )
         .await
         .unwrap();
-    let output_name = job.model_id().to_string();
+    let output_name = job.output_model_id().unwrap().to_string();
     job.wait().await.unwrap();
 
     // Zero catalog rows for any epoch — not even epoch_0.
@@ -717,7 +727,7 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
     assert!(
         session
             .catalog()
-            .job_scoped_artifacts(&job.job_id)
+            .job_scoped_artifacts(job.job_id())
             .await
             .unwrap()
             .is_empty(),
@@ -725,12 +735,12 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
     );
     let attempt = session
         .catalog()
-        .get_job(&job.job_id)
+        .get_job(job.job_id())
         .await
         .unwrap()
         .attempts;
     for epoch in 0..3 {
-        let mut stack = vec![local_checkpoint_dir(&session, &job.job_id, attempt, epoch)];
+        let mut stack = vec![local_checkpoint_dir(&session, job.job_id(), attempt, epoch)];
         while let Some(path) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
@@ -800,7 +810,7 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
         )
         .await
         .unwrap();
-    let output_name = job.model_id().to_string();
+    let output_name = job.output_model_id().unwrap().to_string();
     job.wait().await.unwrap();
 
     // Every epoch (0, 1, 2) got its own DISTINCT-NAME catalog row, never an
@@ -901,7 +911,7 @@ async fn epoch_checkpoints_retention_prunes_oldest() {
         )
         .await
         .unwrap();
-    let output_name = job.model_id().to_string();
+    let output_name = job.output_model_id().unwrap().to_string();
     job.wait().await.unwrap();
 
     // epoch_1 and epoch_2 are registered and loadable.
@@ -1265,9 +1275,11 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
         .await
         .unwrap();
     assert!(
-        job.model_id().starts_with("jammi:fine-tuned:"),
+        job.output_model_id()
+            .unwrap()
+            .starts_with("jammi:fine-tuned:"),
         "model_id should carry the fine-tuned prefix, got '{}'",
-        job.model_id()
+        job.output_model_id().unwrap()
     );
     job.wait().await.unwrap();
 
@@ -1288,7 +1300,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
     let ft_rec = session
         .generate_audio_embeddings(
             "audio_corpus",
-            job.model_id(),
+            job.output_model_id().unwrap(),
             "audio",
             "clip_id",
             jammi_db::store::CachePolicy::Bypass,
@@ -1338,7 +1350,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
         .unwrap();
     let base_embedding = session.encode_audio_query(&model, &clip).await.unwrap();
     let ft_embedding = session
-        .encode_audio_query(job.model_id(), &clip)
+        .encode_audio_query(job.output_model_id().unwrap(), &clip)
         .await
         .unwrap();
     let diff: f32 = base_embedding
@@ -1381,7 +1393,7 @@ async fn fine_tune_job_catalog_crud() {
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: "job-1",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some("base-model::1"),
@@ -1394,22 +1406,22 @@ async fn fine_tune_job_catalog_crud() {
 
     // Get job — status should be "queued"
     let job = catalog.get_job("job-1").await.unwrap();
-    assert_eq!(job.status, "queued");
+    assert_eq!(job.status, JobStatus::Queued);
     assert_eq!(job.model_ref.as_deref(), Some("base-model::1"));
 
     // A worker claims the job → running, leased to it.
     let claimed = catalog
         .claim_next(
             "worker-x",
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(60),
         )
         .await
         .unwrap()
         .expect("the queued job is claimable");
-    assert_eq!(claimed.status, "running");
+    assert_eq!(claimed.status, JobStatus::Running);
     let job2 = catalog.get_job("job-1").await.unwrap();
-    assert_eq!(job2.status, "running");
+    assert_eq!(job2.status, JobStatus::Running);
     assert_eq!(job2.claimed_by.as_deref(), Some("worker-x"));
 
     // The lease owner stages its bundle and finalizes: the single
@@ -1481,7 +1493,7 @@ async fn fine_tune_job_catalog_crud() {
         ))
     );
     let job3 = catalog.get_job("job-1").await.unwrap();
-    assert_eq!(job3.status, "completed");
+    assert_eq!(job3.status, JobStatus::Completed);
     assert_eq!(
         job3.output_model_id.as_deref(),
         Some("jammi:fine-tuned:job-1")
@@ -1622,7 +1634,7 @@ async fn training_divergence_detection() {
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: "div-job",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some("div-test-model::1"),
@@ -1637,7 +1649,7 @@ async fn training_divergence_detection() {
     catalog
         .claim_next(
             "worker-div",
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(60),
         )
         .await
@@ -1756,7 +1768,7 @@ async fn training_early_stopping_triggers() {
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: "es-job",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some("es-test-model::1"),
@@ -1769,7 +1781,7 @@ async fn training_early_stopping_triggers() {
     catalog
         .claim_next(
             "worker-es",
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(60),
         )
         .await
@@ -1908,7 +1920,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
     let ft_rec = session
         .generate_text_embeddings(
             "patents",
-            job.model_id(),
+            job.output_model_id().unwrap(),
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
@@ -2088,9 +2100,10 @@ async fn durable_job_runs_on_separately_started_worker() {
         )
         .await
         .unwrap();
-    let queued = session.catalog().get_job(&job.job_id).await.unwrap();
+    let queued = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        queued.status, "queued",
+        queued.status,
+        JobStatus::Queued,
         "job sits queued until a worker claims it"
     );
 
@@ -2099,9 +2112,10 @@ async fn durable_job_runs_on_separately_started_worker() {
         .expect("default worker intervals are valid");
     job.wait().await.unwrap();
 
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        record.status, "completed",
+        record.status,
+        JobStatus::Completed,
         "the separately-started worker ran the job"
     );
 
@@ -2189,7 +2203,7 @@ async fn worker_that_lost_lease_does_not_finalize() {
     // to finalize.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], Duration::ZERO)
         .await
         .unwrap()
         .expect("worker-a claims the queued job");
@@ -2206,7 +2220,7 @@ async fn worker_that_lost_lease_does_not_finalize() {
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -2220,9 +2234,10 @@ async fn worker_that_lost_lease_does_not_finalize() {
     worker_a.run_claimed_job(&session, stale_claim).await;
 
     // The job is still `running`, owned by worker-b: worker-a did NOT finalize.
-    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_a = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after_a.status, "running",
+        after_a.status,
+        JobStatus::Running,
         "a worker that lost its lease must not finalize the job (CAS blocks it)"
     );
     assert_eq!(
@@ -2234,8 +2249,12 @@ async fn worker_that_lost_lease_does_not_finalize() {
     // The legitimate owner runs and finalizes exactly once.
     worker_b.run_claimed_job(&session, owned).await;
     job.wait().await.unwrap();
-    let after_b = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(after_b.status, "completed", "the lease owner finalizes");
+    let after_b = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(
+        after_b.status,
+        JobStatus::Completed,
+        "the lease owner finalizes"
+    );
     assert!(
         after_b.output_model_id.is_some(),
         "the owner records the output model"
@@ -2356,7 +2375,7 @@ fn worker_run_span_carries_job_and_tenant() {
             .catalog()
             .claim_next(
                 worker.worker_id(),
-                &["fine_tune"],
+                &[JobKind::FineTune],
                 Duration::from_secs(3600),
             )
             .await
@@ -2384,7 +2403,8 @@ fn worker_run_span_carries_job_and_tenant() {
 
         let after = session.catalog().get_job(&job_id).await.unwrap();
         assert_eq!(
-            after.status, "completed",
+            after.status,
+            JobStatus::Completed,
             "the worker ran the claimed job to completion"
         );
 
@@ -2484,11 +2504,11 @@ async fn configured_short_lease_drives_reclaim() {
     let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], lease)
+        .claim_next(worker.worker_id(), &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("the queued job is claimable");
-    assert_eq!(claimed.status, "running");
+    assert_eq!(claimed.status, JobStatus::Running);
     assert_eq!(claimed.claimed_by.as_deref(), Some(worker.worker_id()));
 
     // The worker "stalls" — it never heartbeats. Before the lease elapses the
@@ -2514,11 +2534,15 @@ async fn configured_short_lease_drives_reclaim() {
 
     // The job is back queued and re-claimable — the reclaim genuinely returned
     // it to the queue rather than failing it.
-    let job_after = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(job_after.status, "queued", "the reclaimed job is re-queued");
+    let job_after = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(
+        job_after.status,
+        JobStatus::Queued,
+        "the reclaimed job is re-queued"
+    );
     let reclaimed = session
         .catalog()
-        .claim_next("worker-second", &["fine_tune"], lease)
+        .claim_next("worker-second", &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("the re-queued job is claimable again");
@@ -2575,7 +2599,7 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     // re-claims under a long lease, so worker-b owns the job.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], Duration::ZERO)
         .await
         .unwrap()
         .expect("worker-a claims the queued job");
@@ -2589,7 +2613,7 @@ async fn loser_prefix_is_never_the_committed_artifact() {
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -2599,9 +2623,10 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     // worker-a runs its stale claim to completion: its finalize CAS fails, so the
     // job is NOT completed and no catalog model row records worker-a's prefix.
     worker_a.run_claimed_job(&session, stale_claim).await;
-    let after_loser = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_loser = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_ne!(
-        after_loser.status, "completed",
+        after_loser.status,
+        JobStatus::Completed,
         "the loser's finalize CAS fails; the job is not completed by it"
     );
 
@@ -2609,8 +2634,12 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     // the model row at the prefix worker-b published — the single atomic commit.
     worker_b.run_claimed_job(&session, owned).await;
     job.wait().await.unwrap();
-    let done = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(done.status, "completed", "the winner finalizes the job");
+    let done = session.catalog().get_job(job.job_id()).await.unwrap();
+    assert_eq!(
+        done.status,
+        JobStatus::Completed,
+        "the winner finalizes the job"
+    );
 
     // The committed artifact is the one the winner wrote: it fetches and verifies
     // (manifest + sha256) and holds a well-formed, non-empty safetensors map.
@@ -2733,12 +2762,12 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
     let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], lease)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     // Run the claimed job concurrently (not awaited inline) so the real
     // heartbeat task can actually tick while training is still in progress —
@@ -2820,7 +2849,7 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -2849,7 +2878,8 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
     // recorded `result`, neither of which a cancelled run ever writes.
     let after = session.catalog().get_job(&job_id).await.unwrap();
     assert_ne!(
-        after.status, "completed",
+        after.status,
+        JobStatus::Completed,
         "worker-a's cancelled run must not have finalized the job itself"
     );
     assert!(
@@ -2981,7 +3011,7 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
         .catalog()
         .claim_next(
             worker.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(3600),
         )
         .await
@@ -3148,7 +3178,7 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
     // under a long lease and is the rightful owner.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], Duration::ZERO)
         .await
         .unwrap()
         .expect("worker-a claims the queued job");
@@ -3162,7 +3192,7 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -3229,9 +3259,10 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
 
     // (3) The job stays `completed` — the zombie's run-start status write is
     // lease-guarded, so it could not regress the terminal status to `running`.
-    let after_zombie = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_zombie = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after_zombie.status, "completed",
+        after_zombie.status,
+        JobStatus::Completed,
         "the terminal status is undisturbed by the zombie (no completed → running regression)"
     );
 }
@@ -3285,7 +3316,7 @@ async fn training_bails_when_lease_lost_mid_run() {
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: "lease-job",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some("lease-model::1"),
@@ -3299,7 +3330,7 @@ async fn training_bails_when_lease_lost_mid_run() {
     // lease means the lease is already expired by the time reclaim runs — a
     // deterministic forced expiry, no sleep needed.
     catalog
-        .claim_next("worker-a", &["fine_tune"], std::time::Duration::ZERO)
+        .claim_next("worker-a", &[JobKind::FineTune], std::time::Duration::ZERO)
         .await
         .unwrap()
         .expect("claimed the queued job");
@@ -3346,7 +3377,8 @@ async fn training_bails_when_lease_lost_mid_run() {
     // The job was NOT marked completed — it is left for reclaim.
     let job = catalog.get_job("lease-job").await.unwrap();
     assert_ne!(
-        job.status, "completed",
+        job.status,
+        JobStatus::Completed,
         "a bailed job must not be completed"
     );
 
@@ -3359,7 +3391,8 @@ async fn training_bails_when_lease_lost_mid_run() {
     assert!(actioned >= 1, "the expired-lease job is reclaimed");
     let reclaimed = catalog.get_job("lease-job").await.unwrap();
     assert_eq!(
-        reclaimed.status, "queued",
+        reclaimed.status,
+        JobStatus::Queued,
         "a reclaimed job is re-queued for another worker"
     );
 }
@@ -3422,7 +3455,7 @@ async fn short_lease_job(dir: &TempDir) -> (Arc<InferenceSession>, String) {
         )
         .await
         .unwrap();
-    (session, job.job_id)
+    (session, job.job_id().to_string())
 }
 
 /// Claim `job_id` as a fresh worker and run the attempt on its own task,
@@ -3441,7 +3474,7 @@ async fn attempt_parked_before_publish(
     let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], lease)
+        .claim_next(worker.worker_id(), &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("the queued job is claimable");
@@ -3502,7 +3535,7 @@ async fn an_attempt_holds_its_lease_through_its_publish() {
         )
         .unwrap();
     let record = session.catalog().get_job(&job_id).await.unwrap();
-    assert_eq!((record.status.as_str(), record.attempts), ("completed", 1));
+    assert_eq!((record.status, record.attempts), (JobStatus::Completed, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3547,7 +3580,7 @@ async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
         .unwrap();
     assert_ne!(
         session.catalog().get_job(&job_id).await.unwrap().status,
-        "completed",
+        JobStatus::Completed,
         "attempt 1 lost its lease, so its finalize does not land"
     );
 
@@ -3556,14 +3589,14 @@ async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
     let lease = session.inner_config().lease.intervals().unwrap().lease();
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], lease)
+        .claim_next(worker.worker_id(), &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("the reclaimed job is claimable");
     worker.run_claimed_job(&session, claimed).await;
 
     let record = session.catalog().get_job(&job_id).await.unwrap();
-    assert_eq!((record.status.as_str(), record.attempts), ("completed", 2));
+    assert_eq!((record.status, record.attempts), (JobStatus::Completed, 2));
     let metrics = run_metrics(&session, &job_id).await;
     let walls: Vec<u64> = metrics["epoch_walls"]
         .as_array()
@@ -3577,11 +3610,12 @@ async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
         "the run's walls, not the resumed attempt's none"
     );
     assert_eq!(metrics["train_loss_curve"].as_array().unwrap().len(), 3);
-    let final_loss = metrics["final_loss"].as_f64().unwrap();
+    let best_loss = metrics["best_loss"].as_f64().unwrap();
     assert!(
-        final_loss.is_finite() && final_loss < 1e6,
-        "the run's best loss, not a sentinel: {final_loss}"
+        best_loss.is_finite() && best_loss < 1e6,
+        "the run's best loss, not a sentinel: {best_loss}"
     );
+    assert!(metrics["best_epoch"].as_u64().unwrap() < 3);
     let output = record
         .output_model_id
         .expect("the job names its output model");
@@ -3663,7 +3697,7 @@ async fn a_classification_fine_tune_serves_the_classes_it_trained() {
         let batches = session
             .infer(
                 "labels",
-                &ModelSource::parse(job.model_id()),
+                &ModelSource::parse(job.output_model_id().unwrap()),
                 ModelTask::Classification,
                 &["text".to_string()],
                 "text",

@@ -27,8 +27,7 @@ def test_dir_includes_lazy_names():
     """`__dir__` surfaces the lazily-resolved names for introspection /
     tab-completion alongside the eagerly-bound surface."""
     names = dir(jammi)
-    for name in ("AuditHandle", "EphemeralSession", "Job", "ModelTask",
-                 "PerQueryAudit"):
+    for name in ("AuditHandle", "EphemeralSession", "ModelTask", "PerQueryAudit"):
         assert name in names
 
 
@@ -50,4 +49,4 @@ def test_embedded_symbol_with_engine_returns_native_type():
     import jammi_native
 
     assert jammi.PerQueryAudit is jammi_native.PerQueryAudit
-    assert jammi.Job is jammi_native.Job
+    assert jammi.ModelTask is jammi_native.ModelTask

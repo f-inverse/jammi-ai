@@ -363,11 +363,8 @@ impl PyDatabase {
     /// read itself.
     fn job(&self, job_id: &str) -> PyResult<PyJob> {
         self.check_open()?;
-        PyJob::attach(
-            job_id.to_string(),
-            Arc::clone(&self.runtime),
-            Arc::clone(&self.session),
-        )
+        let handle = crate::released(&self.runtime, self.session.job(job_id)).map_err(to_pyerr)?;
+        Ok(PyJob::new(handle, Arc::clone(&self.runtime)))
     }
 
     /// List every job visible to the current tenant, most recent first. Each
@@ -378,11 +375,9 @@ impl PyDatabase {
     /// answers plus the submit-time identity, not a progress surface: read
     /// [`PyJob::progress`] on the individual handle for that.
     ///
-    /// `output_model_id` is stamped at submission for a training kind (and
-    /// always empty for a compute kind) and `error` is empty unless it
-    /// failed — the same two conventions `JobService.ListJobs` relays,
-    /// reproduced here rather than mapping absence onto `None` on one
-    /// transport only.
+    /// `output_model_id` names the model the job produced — `None` until a
+    /// training kind completes, and always for a compute kind — and each
+    /// other absent value is `None`, as `JobService.ListJobs` states it.
     ///
     /// Tenant-scoped by the catalog read itself
     /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
@@ -396,16 +391,13 @@ impl PyDatabase {
         for record in &records {
             let entry = PyDict::new(py);
             entry.set_item("job_id", &record.job_id)?;
-            entry.set_item("kind", &record.kind)?;
-            entry.set_item("status", &record.status)?;
-            entry.set_item("base_model_id", record.model_ref.as_deref().unwrap_or(""))?;
-            entry.set_item(
-                "output_model_id",
-                record.output_model_id.as_deref().unwrap_or(""),
-            )?;
+            entry.set_item("kind", record.kind.to_string())?;
+            entry.set_item("status", record.status.to_string())?;
+            entry.set_item("base_model_id", record.model_ref.as_deref())?;
+            entry.set_item("output_model_id", record.produced_model_id())?;
             entry.set_item("created_at", &record.created_at)?;
-            entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
-            entry.set_item("claimed_by", record.claimed_by.as_deref().unwrap_or(""))?;
+            entry.set_item("error", record.error.as_deref())?;
+            entry.set_item("claimed_by", record.claimed_by.as_deref())?;
             entry.set_item("ranks", &record.ranks)?;
             list.append(entry)?;
         }
@@ -434,10 +426,17 @@ impl PyDatabase {
         for w in &records {
             let entry = PyDict::new(py);
             entry.set_item("instance_id", &w.instance_id)?;
-            entry.set_item("label", w.label.as_deref().unwrap_or(""))?;
-            entry.set_item("host", w.host.as_deref().unwrap_or(""))?;
-            entry.set_item("kinds", &w.kinds)?;
-            entry.set_item("state", &w.state)?;
+            entry.set_item("label", w.label.as_deref())?;
+            entry.set_item("host", w.host.as_deref())?;
+            entry.set_item(
+                "kinds",
+                w.kinds
+                    .as_slice()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )?;
+            entry.set_item("state", w.state.to_string())?;
             entry.set_item("started_at", &w.started_at)?;
             entry.set_item("last_seen_at", &w.last_seen_at)?;
             list.append(entry)?;
@@ -1292,19 +1291,13 @@ impl PyDatabase {
         self.check_open()?;
         let spec =
             jammi_ai::wire::training_spec_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let kind = spec.kind().to_string();
         let key = idempotency_key.filter(|k| !k.is_empty());
-        let job = crate::released(
+        let handle = crate::released(
             &self.runtime,
             self.session.run_training_spec_deduped(spec, key),
         )
         .map_err(to_pyerr)?;
-        Ok(PyJob::new(
-            job,
-            kind,
-            Arc::clone(&self.runtime),
-            Arc::clone(&self.session),
-        ))
+        Ok(PyJob::new(handle, Arc::clone(&self.runtime)))
     }
 
     /// Predict a target's distribution with a trained context predictor by

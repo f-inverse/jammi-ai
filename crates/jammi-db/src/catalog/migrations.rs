@@ -255,6 +255,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "048_eval_runs_ground_truth",
         MigrationSql::Same(schema::MIGRATION_048_EVAL_RUNS_GROUND_TRUTH),
     ),
+    (
+        "049_job_progress_counts",
+        MigrationSql::Same(schema::MIGRATION_049_JOB_PROGRESS_COUNTS),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

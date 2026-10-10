@@ -681,7 +681,7 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
 
     // Submit + run through the worker, then read the catalogued model row.
     let job = session.train_context_predictor("fns", &spec).await.unwrap();
-    assert_eq!(job.model_id(), "ctx-predictor");
+    assert_eq!(job.output_model_id().unwrap(), "ctx-predictor");
     job.wait().await.unwrap();
 
     let record = session
@@ -851,7 +851,7 @@ async fn train(session: &Arc<InferenceSession>, spec: &ContextPredictorTrainConf
         .expect("default worker intervals are valid");
     let job = session.train_context_predictor("fns", spec).await.unwrap();
     job.wait().await.unwrap();
-    job.model_id().to_string()
+    job.output_model_id().unwrap().to_string()
 }
 
 /// Per-point coverage indicators of a conformal-wrapped predictor over a set of

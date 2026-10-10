@@ -30,7 +30,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::claim_test_hooks;
 use jammi_db::catalog::lease_keeper::HoldRelease;
-use jammi_db::catalog::status::JobStatus;
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::test_hook::{arm as arm_materialization, MaterializationPoint};
 use jammi_db::store::CachePolicy;
@@ -188,7 +188,7 @@ async fn wait_in_flight(shared: &WorkerShared, want: usize) {
     }
 }
 
-async fn wait_status(session: &InferenceSession, job_id: &str, want: &str, bound: Duration) {
+async fn wait_status(session: &InferenceSession, job_id: &str, want: JobStatus, bound: Duration) {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
         let row = session.catalog().get_job(job_id).await.unwrap();
@@ -263,8 +263,8 @@ async fn stop_and_join_lets_the_epoch_bundle_land() {
         .unwrap();
     assert_eq!(outcome, StopOutcome::Joined);
     assert_eq!(shared.loop_state(), LoopState::Stopped);
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Completed.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Completed);
     assert_eq!(row.attempts, 1);
     assert_eq!(row.releases, 0);
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
@@ -383,10 +383,10 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "the abort leaves the row exactly where it was -- no detached finalize lands"
     );
 
@@ -417,7 +417,7 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
     // trainer's fire (inside `save_epoch_checkpoint`, the instant its
     // `stage_checkpoint` write lands) can never race ahead of the arm.
     let bundle_landed = loop_test_hooks::arm_observed(
-        &handle.job_id,
+        handle.job_id(),
         loop_test_hooks::Event::ResumeCheckpointWritten,
     );
     let worker = spawn_worker(&session);
@@ -435,7 +435,7 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
              was ever observed",
         );
     assert!(
-        resume_epoch(&session, &handle.job_id).await.is_some(),
+        resume_epoch(&session, handle.job_id()).await.is_some(),
         "the observed write must have left a readable bundle behind"
     );
     let threads_before = training_test_hooks::training_threads_finished();
@@ -461,11 +461,11 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
         }),
         "{report:?}"
     );
-    let epoch_at_release = resume_epoch(&session, &handle.job_id)
+    let epoch_at_release = resume_epoch(&session, handle.job_id())
         .await
         .expect("the bundle is still there");
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running);
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -488,12 +488,12 @@ async fn release_and_stop_leaves_running_with_null_lease_and_no_new_bundle() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // … and never finalized, never wrote another bundle.
-    let after = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(after.status, JobStatus::Running.to_string());
+    let after = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(after.status, JobStatus::Running);
     assert_eq!(after.claimed_by.as_deref(), Some(session.instance_id()));
     assert!(after.lease_expires_at.is_none());
     assert_eq!(
-        resume_epoch(&session, &handle.job_id).await,
+        resume_epoch(&session, handle.job_id()).await,
         Some(epoch_at_release),
         "no bundle may land after the lease was handed back"
     );
@@ -529,7 +529,7 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
         .await
         .expect("the loop's writer parks inside finish");
     assert_eq!(in_flight(&shared), 1);
-    let mid = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let mid = session.catalog().get_job(handle.job_id()).await.unwrap();
     let first_table = mid
         .partial_result
         .clone()
@@ -548,8 +548,8 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
         .expect("RELEASE is bounded")
         .unwrap();
     assert_eq!(report.loop_state, LoopState::Aborted, "{report:?}");
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running);
     assert!(row.lease_expires_at.is_none());
     assert_eq!(row.releases, 1);
     let released = session
@@ -583,8 +583,8 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
     let worker2 = spawn_worker(&successor);
     wait_status(
         &successor,
-        &handle.job_id,
-        &JobStatus::Completed.to_string(),
+        handle.job_id(),
+        JobStatus::Completed,
         Duration::from_secs(25),
     )
     .await;
@@ -592,7 +592,7 @@ async fn release_mid_materialization_resumes_on_the_successor_without_backoff() 
         started.elapsed() < Duration::from_secs(DEFAULT_TIMING.lease),
         "a BackOff would have waited out a full lease window"
     );
-    let done = successor.catalog().get_job(&handle.job_id).await.unwrap();
+    let done = successor.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(done.attempts, 2);
     assert_eq!(done.claimed_by.as_deref(), Some(successor.instance_id()));
     let second_table = done.partial_result.clone().expect("the successor's table");
@@ -669,8 +669,8 @@ async fn release_with_the_loop_paused_inside_claim_next_does_not_abort() {
         claim_next_before_release,
         "no claim_next after 2a on the Running/cooperative-in-claim_next arm of 2e"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running);
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -703,8 +703,8 @@ async fn release_before_the_loop_reaches_claim_next_leaves_the_row_untouched() {
         "the idle sleep must be interrupted, not waited out"
     );
     assert_eq!(report.loop_state, LoopState::Stopped, "{report:?}");
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Queued.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Queued);
     assert_eq!((row.attempts, row.releases), (0, 0));
     assert!(row.claimed_by.is_none());
 }
@@ -725,7 +725,7 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
             embedding_spec(&source).into()
         };
         let handle = session.enqueue(spec, 0).await.unwrap();
-        let park = loop_test_hooks::arm(&handle.job_id, loop_test_hooks::ParkPoint::BeforeHold);
+        let park = loop_test_hooks::arm(handle.job_id(), loop_test_hooks::ParkPoint::BeforeHold);
         let dispatch_park =
             compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
         let worker = spawn_worker(&session);
@@ -761,8 +761,8 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
             claim_next_before_release,
             "{kind}: no claim_next after 2a on the Running/claim-to-hold-prologue arm of 2e"
         );
-        let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-        assert_eq!(row.status, JobStatus::Running.to_string(), "{kind}");
+        let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+        assert_eq!(row.status, JobStatus::Running, "{kind}");
         assert!(row.lease_expires_at.is_none(), "{kind}: {row:?}");
         assert_eq!((row.attempts, row.releases), (1, 1), "{kind}");
         // Nothing dispatched: a training thread would have retired the
@@ -776,7 +776,7 @@ async fn release_with_the_loop_paused_in_the_claim_to_hold_prologue_self_release
             row.acceleration_report
         );
         assert!(
-            resume_epoch(&session, &handle.job_id).await.is_none(),
+            resume_epoch(&session, handle.job_id()).await.is_none(),
             "{kind}: no _resume prefix"
         );
         assert!(
@@ -833,7 +833,7 @@ async fn release_job_leases_reaches_a_live_foreign_loops_prologue_and_self_relea
         .enqueue(never_dispatched_infer(&source).into(), 0)
         .await
         .unwrap();
-    let park = loop_test_hooks::arm(&handle.job_id, loop_test_hooks::ParkPoint::BeforeHold);
+    let park = loop_test_hooks::arm(handle.job_id(), loop_test_hooks::ParkPoint::BeforeHold);
     let dispatch_park =
         compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
     let worker = spawn_worker(&session);
@@ -877,8 +877,8 @@ async fn release_job_leases_reaches_a_live_foreign_loops_prologue_and_self_relea
             .is_err(),
         "the self-released claim must never reach the producer"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running);
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -991,12 +991,12 @@ async fn release_and_stop_completing_frees_the_slot_for_a_successor_not_stopped_
     let handle = session.enqueue(fine_tune(1), 0).await.unwrap();
     wait_status(
         &session,
-        &handle.job_id,
-        &JobStatus::Completed.to_string(),
+        handle.job_id(),
+        JobStatus::Completed,
         Duration::from_secs(60),
     )
     .await;
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
     assert_eq!(row.attempts, 1, "{row:?}");
     assert_eq!(
@@ -1103,8 +1103,8 @@ async fn release_gate_refuses_every_claim_when_phase_flips_without_a_stop() {
         "claim_next must never be called while phase != Running"
     );
     for handle in [&handle_a, &handle_b] {
-        let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-        assert_eq!(row.status, JobStatus::Queued.to_string(), "{row:?}");
+        let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+        assert_eq!(row.status, JobStatus::Queued, "{row:?}");
         assert_eq!((row.attempts, row.releases), (0, 0), "{row:?}");
         assert!(row.claimed_by.is_none(), "{row:?}");
     }
@@ -1266,8 +1266,8 @@ async fn release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_
         claim_next_before_release,
         "no claim_next may be initiated once phase/stop flip during the reclaim window"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Queued.to_string(), "{row:?}");
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Queued, "{row:?}");
     assert_eq!((row.attempts, row.releases), (0, 0), "{row:?}");
     assert!(row.claimed_by.is_none(), "{row:?}");
 }
@@ -1294,7 +1294,7 @@ async fn release_landing_during_the_reclaim_window_is_caught_by_the_second_gate_
 async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
     let (session, _dir) = session(FAST_TIMING).await;
     let handle = session.enqueue(fine_tune(20_000), 0).await.unwrap();
-    let park = loop_test_hooks::arm(&handle.job_id, loop_test_hooks::ParkPoint::BeforeHold);
+    let park = loop_test_hooks::arm(handle.job_id(), loop_test_hooks::ParkPoint::BeforeHold);
     let worker = spawn_worker(&session);
     park.wait_parked().await;
     let claim_next_before_release = loop_test_hooks::claim_next_calls(session.instance_id());
@@ -1327,8 +1327,8 @@ async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
     );
     assert_eq!(report.sweep_one.jobs, Some(1), "{report:?}");
     assert_eq!(report.sweep_two.jobs, Some(0), "{report:?}");
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Running);
     assert_eq!(row.claimed_by.as_deref(), Some(session.instance_id()));
     assert!(row.lease_expires_at.is_none(), "{row:?}");
     assert_eq!((row.attempts, row.releases), (1, 1));
@@ -1350,17 +1350,17 @@ async fn release_timeout_arm_leaves_the_honest_row_recovered_by_arm_1a() {
             .unwrap(),
         1
     );
-    let requeued = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    let requeued = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(requeued.status, JobStatus::Queued);
     let successor = session
         .catalog()
-        .claim_next("successor", &["fine_tune"], lease)
+        .claim_next("successor", &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("claimable by a successor");
-    assert_eq!(successor.job_id, handle.job_id);
+    assert_eq!(successor.job_id, handle.job_id());
     assert_eq!((successor.attempts, successor.releases), (2, 1));
-    assert_ne!(successor.status, JobStatus::Failed.to_string());
+    assert_ne!(successor.status, JobStatus::Failed);
 }
 
 /// (d): an inline `run_now` (parked before dispatch) is not the loop's:
@@ -1384,7 +1384,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
         .await
         .unwrap()
         .into_iter()
-        .find(|j| j.execution == "inline")
+        .find(|j| j.execution == JobExecution::Inline)
         .expect("the inline row exists while parked");
     assert!(inline.lease_expires_at.is_some());
 
@@ -1402,7 +1402,7 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
     );
     assert_eq!(in_flight(&shared), 0);
     let after = session.catalog().get_job(&inline.job_id).await.unwrap();
-    assert_eq!(after.status, JobStatus::Running.to_string());
+    assert_eq!(after.status, JobStatus::Running);
     assert!(
         after.lease_expires_at.is_some(),
         "the inline lease stays live"
@@ -1490,7 +1490,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     );
     let owning_row = owning_session
         .catalog()
-        .get_job(&owning_handle.job_id)
+        .get_job(owning_handle.job_id())
         .await
         .unwrap();
     assert!(owning_row.lease_expires_at.is_none(), "{owning_row:?}");
@@ -1511,7 +1511,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
         .await
         .unwrap()
         .into_iter()
-        .find(|j| j.execution == "inline")
+        .find(|j| j.execution == JobExecution::Inline)
         .expect("the inline row exists while parked");
     assert!(inline.lease_expires_at.is_some());
 
@@ -1520,7 +1520,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     let other_lease = Duration::from_secs(3600);
     let other_claimed = leases_session
         .catalog()
-        .claim_next("a-different-instance", &["fine_tune"], other_lease)
+        .claim_next("a-different-instance", &[JobKind::FineTune], other_lease)
         .await
         .unwrap()
         .expect("claimed by a different instance");
@@ -1560,7 +1560,7 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
 
     let other_after = leases_session
         .catalog()
-        .get_job(&other_handle.job_id)
+        .get_job(other_handle.job_id())
         .await
         .unwrap();
     assert_eq!(
@@ -1847,7 +1847,7 @@ async fn run_now_materialization_survives_release_and_stop() {
         .await
         .unwrap()
         .into_iter()
-        .find(|j| j.execution == "inline")
+        .find(|j| j.execution == JobExecution::Inline)
         .expect("the inline row exists while parked");
     let table = inline.partial_result.clone().expect("its building table");
     let lease_before = session
@@ -1909,6 +1909,6 @@ async fn run_now_materialization_survives_release_and_stop() {
             .await
             .unwrap()
             .status,
-        JobStatus::Completed.to_string()
+        JobStatus::Completed
     );
 }

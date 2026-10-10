@@ -44,7 +44,7 @@ use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
@@ -2754,7 +2754,7 @@ async fn assert_embedding_with_own_model_isolated() {
                 )
                 .await?;
             job.wait().await?;
-            Ok::<_, JammiError>(job.model_id().to_string())
+            Ok::<_, JammiError>(job.output_model_id().unwrap().to_string())
         })
         .await
         .expect("tenant A trains its own model");
@@ -2811,7 +2811,7 @@ async fn assert_training_create_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -2843,7 +2843,7 @@ async fn assert_training_list_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -2874,7 +2874,7 @@ async fn assert_cancel_job_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_cancel_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,
@@ -2913,7 +2913,7 @@ async fn assert_prune_jobs_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_prune_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,

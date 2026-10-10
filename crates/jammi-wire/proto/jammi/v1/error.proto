@@ -147,6 +147,7 @@ message JammiErrorDetail {
     TriggerErrorDetail trigger = 55;
     // `JammiError::ResultTableExists { table }`. Maps to `ALREADY_EXISTS`.
     ResultTableExistsError result_table_exists = 56;
+    JobFailedError job_failed = 57;
   }
   // Retired tags and names are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -227,12 +228,19 @@ message JobAttemptSupersededError {
 
 // `JammiError::JobCancelled { job_id }`. A job's executor observed
 // `jobs.cancel_requested` at a checkpoint boundary and stopped; the job is
-// recorded `failed` with this message. Maps to `Cancelled` — the caller
+// recorded `cancelled` with this message. Maps to `Cancelled` — the caller
 // asked for exactly this outcome, so it is not a fault, but it is also not
 // the terminal state the caller's own request expected without checking
 // status.
 message JobCancelledError {
   string job_id = 1;
+}
+
+// `JammiError::JobFailed { job_id, reason }`. A job a caller waited on ended
+// `failed`; `reason` is the error its executor recorded. Maps to `INTERNAL`.
+message JobFailedError {
+  string job_id = 1;
+  string reason = 2;
 }
 
 // `JammiError::IncompatibleFormat { artifact, found, supported }`. A

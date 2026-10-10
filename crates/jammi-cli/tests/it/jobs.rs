@@ -108,20 +108,21 @@ async fn register_model(catalog: &Catalog, model_id: &str) {
 /// rather than to a dedicated metrics column, which this schema has none of.
 /// The literal below is the full `jammi_ai::jobs::JobResult::Model` shape,
 /// including `cache_outcome` — a run that trained records `computed`, and
-/// so does this seed.
+/// so does this seed. A completed row always carries its result (the
+/// finalize writes both in one compare-and-set) and the output model id the
+/// submit stamped.
 async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_model_id: &str) {
     let job_id = fixture.job_id.to_string();
     let base_model_id = base_model_id.to_string();
-    let result = fixture.metrics.map(|m| {
-        serde_json::json!({
-            "kind": "model",
-            "model_id": format!("jammi:fine-tuned:{}", fixture.job_id),
-            "artifact_path": "file:///seed/unused",
-            "metrics": m,
-            "cache_outcome": {"outcome": "computed"},
-        })
-        .to_string()
-    });
+    let output_model_id = format!("jammi:fine-tuned:{}", fixture.job_id);
+    let result = serde_json::json!({
+        "kind": "model",
+        "model_id": output_model_id,
+        "artifact_path": "file:///seed/unused",
+        "metrics": fixture.metrics,
+        "cache_outcome": {"outcome": "computed"},
+    })
+    .to_string();
     let acceleration_report = fixture.acceleration_report.map(str::to_string);
     let now = jammi_db::catalog::lease::canonical_stamp_now();
 
@@ -139,9 +140,9 @@ async fn seed_completed_job(catalog: &Catalog, fixture: &JobFixture<'_>, base_mo
                     &[
                         SqlValue::TextOwned(job_id),
                         SqlValue::Null(SqlNullType::Text),
-                        SqlValue::from(result),
+                        SqlValue::TextOwned(result),
                         SqlValue::TextOwned(base_model_id),
-                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::TextOwned(output_model_id),
                         SqlValue::Null(SqlNullType::Text),
                         SqlValue::from(acceleration_report),
                         SqlValue::TextOwned(now),
@@ -287,7 +288,7 @@ async fn cli_train_status_shows_acceleration_report_when_present() {
         "cli-acc-base",
         &[JobFixture {
             job_id: "cli-acc-present",
-            metrics: Some(r#"{"final_loss":0.1}"#),
+            metrics: Some(r#"{"best_loss":0.1}"#),
             acceleration_report: Some(report),
         }],
     )
@@ -307,7 +308,7 @@ async fn cli_train_status_shows_acceleration_report_when_present() {
     );
     // The metrics section keeps rendering unaffected, same styling.
     assert!(
-        stdout.contains(r#"metrics:  {"final_loss":0.1}"#),
+        stdout.contains(r#"metrics:  {"best_loss":0.1}"#),
         "status output missing the metrics section:\n{stdout}"
     );
 }

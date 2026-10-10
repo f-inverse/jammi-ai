@@ -981,7 +981,7 @@ mod validation_tests {
     /// epoch 0 win `0.0 < f64::MAX` and write `checkpoint_best`, every later
     /// epoch fails `0.0 < 0.0` and burns patience, the loop breaks at
     /// `patience + 1` epochs, and the epoch-0 adapter publishes as the run's
-    /// result with a reported `final_loss` of 0.0. A silently untrained model
+    /// result with a reported `best_loss` of 0.0. A silently untrained model
     /// reported as perfect.
     ///
     /// Refused, not coerced. Auto-switching the metric to `TrainLoss` would

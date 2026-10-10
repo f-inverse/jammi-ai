@@ -189,7 +189,7 @@ async fn healthz_stays_200_while_draining() {
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while handle.status().await.unwrap() != "running" {
+    while handle.status().await.unwrap() != jammi_db::catalog::status::JobStatus::Running {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

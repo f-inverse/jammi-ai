@@ -23,6 +23,7 @@ use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::status::JobKind;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::{ArtifactStore, CachePolicy};
 use jammi_test_utils::tiny_vocab_text;
@@ -118,7 +119,7 @@ pub(crate) async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catal
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: tag,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&format!("{model_id}::1")),
@@ -131,7 +132,7 @@ pub(crate) async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catal
     catalog
         .claim_next(
             &format!("{tag}-worker"),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(60),
         )
         .await

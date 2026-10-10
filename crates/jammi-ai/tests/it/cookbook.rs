@@ -501,13 +501,13 @@ async fn recipe_fine_tune() {
         .await
         .unwrap();
 
-    assert!(!job.job_id.is_empty());
+    assert!(!job.job_id().is_empty());
 
     // Wait for completion (cookbook recipe)
     job.wait().await.unwrap();
 
     // Use the fine-tuned model (cookbook recipe)
-    let ft_model_id = job.model_id();
+    let ft_model_id = job.output_model_id().unwrap();
     assert!(ft_model_id.starts_with("jammi:fine-tuned:"));
 
     // Register a source and generate embeddings with the fine-tuned model

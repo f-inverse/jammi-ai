@@ -52,6 +52,9 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         // The end the caller asked for, distinct from a fault — the class the
         // remote client raises for a `cancelled` job (`RemoteJob.wait`).
         JammiError::JobCancelled { .. } => "JobCancelled",
+        // A job the caller waited on failed — the class the remote client
+        // raises for a `failed` job.
+        JammiError::JobFailed { .. } => "JobFailed",
         JammiError::InvalidKey { .. } => "InvalidKey",
         JammiError::NonUniqueKey { .. } => "NonUniqueKey",
         JammiError::NoQueryEncoder { .. } => "NoQueryEncoder",
@@ -73,8 +76,8 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
 /// (`MutableTableError`, `TriggerError`, …) without re-wrapping each one in a
 /// stringly-typed `JammiError::Catalog` first. The `JammiError` variant selects
 /// the taxonomy class (see [`jammi_error_class`]) so a caller catches the same
-/// class the remote client raises for the same failure — a failed training
-/// `wait()` (`JammiError::FineTune`) is a `TrainingError`, a bad argument is an
+/// class the remote client raises for the same failure — a failed job's
+/// `wait()` (`JammiError::JobFailed`) is a `JobFailed`, a bad argument is an
 /// `InvalidArgument`, a runtime/backend fault is a `BackendError`.
 pub fn to_pyerr<E: Into<JammiError>>(e: E) -> PyErr {
     let err = e.into();

@@ -2,7 +2,7 @@
 //! lease, reconstructs each from its persisted spec, executes it while
 //! renewing the lease, and records the terminal outcome.
 //!
-//! One worker drives every job kind ([`COMPILED_KINDS`]). A
+//! One worker drives every job kind ([`JobKind::ALL`]). A
 //! [`JobWorker::run_until`] tick — run only under
 //! [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]'s claimed
 //! session slot (one claim loop per session is structural, not merely
@@ -145,9 +145,13 @@ use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, 
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
 };
-use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerState};
+use jammi_db::catalog::jobs_repo::{
+    AssemblyOutcome, JobProgress, ProgressReporter, TrainingSetAssembly, WorkerState,
+};
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::ModelLocation;
+use jammi_db::catalog::result_repo::JobAttempt;
+use jammi_db::catalog::status::{JobKind, JobKinds, JobPhase};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
@@ -250,64 +254,6 @@ pub(crate) fn host_name() -> Option<String> {
 /// construction (`InferenceSession::instance_id`).
 pub(crate) fn mint_instance_id() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-/// Every job kind this binary can execute — the vocabulary
-/// `resolve_kinds` validates `[worker] kinds` against at startup.
-/// The three training kinds dispatch through `JobWorker::run_spec`; the
-/// seven compute kinds (every embedded synchronous compute verb is one of
-/// [`crate::jobs::ComputeSpec`]'s variants) dispatch through
-/// [`crate::jobs::execute_compute`].
-pub const COMPILED_KINDS: &[&str] = &[
-    "fine_tune",
-    "graph_fine_tune",
-    "context_predictor",
-    "neighbor_graph",
-    "propagate",
-    "graph_structure",
-    "asof_join",
-    "lexical_index",
-    "embedding",
-    "infer",
-];
-
-/// Whether `kind` is one of [`crate::jobs::ComputeSpec`]'s variants (dispatched
-/// through [`crate::jobs::execute_compute`]) rather than a [`TrainingSpec`]
-/// variant (dispatched through [`JobWorker::run_spec`]).
-pub(crate) fn is_compute_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "neighbor_graph"
-            | "propagate"
-            | "graph_structure"
-            | "asof_join"
-            | "lexical_index"
-            | "embedding"
-            | "infer"
-    )
-}
-
-/// Resolve `[worker] kinds` against [`COMPILED_KINDS`] at startup.
-/// `WorkerKinds::All` claims every compiled
-/// kind; `WorkerKinds::Only` is validated member-by-member and returned
-/// as-is — an unknown name is a typed [`JammiError::Config`], never a
-/// silently-ignored token.
-fn resolve_kinds(kinds: &jammi_db::config::WorkerKinds) -> Result<Vec<String>> {
-    use jammi_db::config::WorkerKinds;
-    match kinds {
-        WorkerKinds::All(_) => Ok(COMPILED_KINDS.iter().map(|s| s.to_string()).collect()),
-        WorkerKinds::Only(list) => {
-            for k in list {
-                if !COMPILED_KINDS.contains(&k.as_str()) {
-                    return Err(JammiError::Config(format!(
-                        "[worker] kinds names unknown job kind '{k}' -- compiled kinds are: {}",
-                        COMPILED_KINDS.join(", ")
-                    )));
-                }
-            }
-            Ok(list.clone())
-        }
-    }
 }
 
 /// This host's shutdown phase: `Running` until a
@@ -1227,13 +1173,13 @@ pub fn worker_devices(
     config: &jammi_db::config::JammiConfig,
     compute_device: ComputeDevice,
 ) -> Vec<DeviceFact> {
-    let kind = compute_device.kind().wire_str();
+    let kind = compute_device.kind();
     match config.worker.topology(&config.gpu) {
         Ok(topology) => topology
             .rank_devices()
             .iter()
             .map(|&ordinal| DeviceFact {
-                kind: kind.to_string(),
+                kind,
                 ordinal: ordinal.max(0) as u32,
             })
             .collect(),
@@ -1398,9 +1344,8 @@ pub struct JobWorker {
     /// with. `intervals.lease` is the single source of truth threaded to both
     /// the claim and the reclaim path.
     intervals: WorkerIntervals,
-    /// The job kinds this worker claims (`[worker] kinds`, validated against
-    /// [`COMPILED_KINDS`] by [`resolve_kinds`] at construction).
-    kinds: Vec<String>,
+    /// The job kinds this worker claims (`[worker] kinds`).
+    kinds: JobKinds,
     /// The session's [`HostAdmission`] (its own `Arc`, so holding it keeps
     /// no session alive): the phase and holder every loop this worker
     /// drives runs under.
@@ -1784,8 +1729,11 @@ impl JobWorker {
     pub fn new(session: &Arc<InferenceSession>) -> Result<Self> {
         let config = session.inner_config();
         let intervals = config.worker.worker_intervals(config.lease.intervals()?)?;
-        let kinds = resolve_kinds(&config.worker.kinds)?;
-        Ok(Self::with_intervals_and_kinds(session, intervals, kinds))
+        Ok(Self::with_intervals_and_kinds(
+            session,
+            intervals,
+            config.worker.kinds.resolve(),
+        ))
     }
 
     /// Build a worker over a session with explicit, already-validated timing
@@ -1798,7 +1746,7 @@ impl JobWorker {
     pub fn with_intervals_and_kinds(
         session: &Arc<InferenceSession>,
         intervals: WorkerIntervals,
-        kinds: Vec<String>,
+        kinds: JobKinds,
     ) -> Self {
         Self {
             session: Arc::downgrade(session),
@@ -1810,14 +1758,10 @@ impl JobWorker {
     }
 
     /// Build a worker over a session with explicit, already-validated timing
-    /// and every compiled kind. Kept for callers that do not need to select a
-    /// kind subset (most tests; a single-process deployment).
+    /// and every kind. Kept for callers that do not need to select a kind
+    /// subset (most tests; a single-process deployment).
     pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
-        Self::with_intervals_and_kinds(
-            session,
-            intervals,
-            COMPILED_KINDS.iter().map(|s| s.to_string()).collect(),
-        )
+        Self::with_intervals_and_kinds(session, intervals, JobKinds::all())
     }
 
     /// The worker's stable id (`claimed_by` value). Exposed for tests that assert
@@ -1878,7 +1822,7 @@ impl JobWorker {
             session.instance_registration(),
             &self.worker_id,
             WorkerFacts {
-                kinds: self.kinds.join(","),
+                kinds: self.kinds.clone(),
                 state: WorkerState::Warming,
                 devices: worker_devices(session.inner_config(), session.compute_device()),
             },
@@ -1910,7 +1854,7 @@ impl JobWorker {
                 session.instance_registration(),
                 &self.worker_id,
                 WorkerFacts {
-                    kinds: self.kinds.join(","),
+                    kinds: self.kinds.clone(),
                     state: WorkerState::Claiming,
                     devices: worker_devices(session.inner_config(), session.compute_device()),
                 },
@@ -1972,11 +1916,10 @@ impl JobWorker {
                 }
                 continue;
             };
-            let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::record_claim_next(&self.worker_id);
             let claimed = match catalog
-                .claim_next(&self.worker_id, &kind_refs, self.intervals.lease)
+                .claim_next(&self.worker_id, self.kinds.as_slice(), self.intervals.lease)
                 .await
             {
                 Ok(c) => c,
@@ -2148,7 +2091,7 @@ impl JobWorker {
         let attempt = record.attempts;
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
-        if is_compute_kind(&record.kind) {
+        if !record.kind.trains_a_model() {
             self.run_claimed_compute_job(session, &catalog, shared, &record)
                 .await;
             return;
@@ -2194,7 +2137,7 @@ impl JobWorker {
         };
         let Some(spec) = job_spec.as_training_spec() else {
             // `record.kind` (the `jobs.kind` column) named a training kind,
-            // routing this attempt here at all (the `is_compute_kind` guard
+            // routing this attempt here at all (the `trains_a_model` guard
             // above), but the persisted `spec` JSON's own `kind` decoded to
             // a compute variant — the two columns disagree. Same failure
             // shape as an undeserialisable spec: nothing has run yet.
@@ -2471,7 +2414,7 @@ impl JobWorker {
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    failed_job_message(&error),
+                    error.to_string(),
                 )
                 .await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
@@ -3165,8 +3108,21 @@ impl JobWorker {
                 // publishes the artifact and registers the model row through the
                 // tenant-pinned catalog (the same path the fine-tune kinds take),
                 // so the model lands under the job's tenant.
+                let progress = ProgressReporter::new(
+                    JobAttempt {
+                        job_id,
+                        instance_id: &self.worker_id,
+                        attempts: attempt,
+                    }
+                    .to_buf(),
+                );
                 session
-                    .run_context_predictor_training(source, predictor_spec, cancel)
+                    .run_context_predictor_training(
+                        source,
+                        predictor_spec,
+                        Arc::clone(cancel),
+                        Some((Arc::clone(catalog), progress)),
+                    )
                     .await
                     .map(|trained| AttemptOutput::Trained(Box::new(trained)))
                     .map_err(|e| classify(cancel, e))
@@ -3192,7 +3148,7 @@ impl JobWorker {
         materialization: &FineTuneMaterialization,
     ) -> std::result::Result<Option<ReusedModel>, WorkerJobError> {
         use jammi_db::catalog::jobs_repo::{FinishJobReusingArtifactParams, ReuseFinish};
-        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         let definition_hash = materialization
             .definition_hash()
             .map_err(WorkerJobError::from)?;
@@ -3286,7 +3242,7 @@ impl JobWorker {
             source: training_source,
             materialization,
         } = run;
-        let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let output_model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
 
         // The attempt's rank set is fixed here, whatever its topology: record
@@ -5708,7 +5664,7 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         job_id: &str,
-        kind: &str,
+        kind: JobKind,
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
@@ -5797,7 +5753,7 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         job_id: &str,
-        kind: &str,
+        kind: JobKind,
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
@@ -6036,10 +5992,7 @@ impl JobWorker {
                 } else if let Some(fault) = coordinator.fault() {
                     (CoordinatorEnd::LinkFault(fault), None)
                 } else {
-                    (
-                        CoordinatorEnd::TrainingFailed(failed_job_message(&error)),
-                        None,
-                    )
+                    (CoordinatorEnd::TrainingFailed(error.to_string()), None)
                 }
             }
         }
@@ -6498,6 +6451,21 @@ async fn publish_artifact(
     attempt: u32,
     dir: &tempfile::TempDir,
 ) -> Result<StagedArtifact> {
+    let attempt_ref = JobAttempt {
+        job_id,
+        instance_id: worker_id,
+        attempts: attempt,
+    };
+    catalog
+        .progress_job(
+            attempt_ref,
+            JobProgress {
+                phase: JobPhase::Publishing,
+                done: None,
+                total: None,
+            },
+        )
+        .await?;
     let mut files: Vec<(String, Bytes)> = Vec::new();
     for entry in std::fs::read_dir(dir.path())? {
         let entry = entry?;
@@ -6631,9 +6599,9 @@ async fn settle_reclaim(
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
     Cancelled,
-    /// The job failed for a real reason; record it as `failed` + the error's
-    /// message ([`failed_job_message`]), and keep the error typed for the
-    /// attempt's own end.
+    /// The job failed for a real reason; record it as `failed` with the
+    /// error's message — the text a waiter's `JobFailed` carries verbatim —
+    /// and keep the error typed for the attempt's own end.
     Failed(JammiError),
     /// The coordinator body ended this attempt WITHOUT a run reaching a
     /// terminal state (an assembly outcome, or a gang fault mid-run — see
@@ -6645,35 +6613,6 @@ enum WorkerJobError {
     /// re-assembles once its cooldown passes. The string is the reason, for
     /// the log.
     Abandoned(String),
-}
-
-/// Render a terminal training failure's message for `record_failed` to
-/// persist as the job's durable `error_message`.
-///
-/// The stored value is the RAW inner message, never pre-fixed with
-/// "Fine-tune error: " here. That prefix is `JammiError::FineTune`'s own
-/// `Display` output, and two callers re-wrap the stored message in a fresh
-/// `JammiError::FineTune` when they read a `failed` job back —
-/// `TrainingJob::wait()` (`training_job.rs`) and the Python binding's
-/// `poll_until_terminal` (`jammi-python/src/job.rs`) — so those two surfaces
-/// each apply the prefix exactly once, on read. Two OTHER surfaces read the
-/// same durable `error_message` unprefixed and never re-wrap it: the gRPC
-/// `JobStatus.error` field (`jammi-server/src/grpc/job.rs`) and
-/// the Python `Database.list_training_jobs`/`get_training_job` `error` entry
-/// (`jammi-python/src/database.rs`) both relay the raw column verbatim.
-/// Storing `e.to_string()` unconditionally for a `FineTune`-typed source
-/// error would have `wait()`'s (or `poll_until_terminal`'s) re-wrap double
-/// the prefix verbatim: "Fine-tune error: Fine-tune error: …" reaching a
-/// Python caller as `TrainingError("Fine-tune error: Fine-tune error:
-/// …")`. Stripped to the raw inner message for that one variant here avoids
-/// that double; every other variant's own (DIFFERENT) prefix is preserved
-/// unchanged — "Fine-tune error: Model error: …" is one informative
-/// nesting, not a literal duplicate.
-fn failed_job_message(e: &JammiError) -> String {
-    match e {
-        JammiError::FineTune(msg) => msg.clone(),
-        other => other.to_string(),
-    }
 }
 
 impl From<JammiError> for WorkerJobError {
@@ -7418,7 +7357,7 @@ pub mod training_test_hooks {
     /// Every member end the coordinator read for `job_id`'s output model
     /// (`fine_tuned_model_id(job_id)`), in reading order: `(rank, Debug)`.
     pub fn member_ends_for(job_id: &str) -> Vec<(u32, String)> {
-        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         member_ends()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -7728,9 +7667,8 @@ mod training_test_hooks_tests {
 }
 
 /// Record a terminal `Failed` status for a job this worker owns, surfacing
-/// the cause on `jobs.error` so a [`crate::fine_tune::training_job::TrainingJob::wait`]
-/// (or [`crate::jobs::JobHandle::wait`]) observer sees the failure instead of
-/// an indefinite `running` state.
+/// the cause on `jobs.error` so a [`crate::jobs::JobHandle::wait`] observer
+/// sees the failure instead of an indefinite `running` state.
 ///
 /// The write is lease-guarded (the failure peer of the finalize CAS): it lands
 /// only while this worker still holds the lease (`claimed_by = worker_id AND
@@ -8241,6 +8179,7 @@ fn run_fine_tune_blocking(
     );
 
     let resume = discover_resume(&artifact_store, &catalog, &job_id, &device)?;
+    let progress_job_id = job_id.clone();
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
@@ -8267,6 +8206,17 @@ fn run_fine_tune_blocking(
     // own durable-write gate (and its agreement with the rank context is
     // checked at `build`).
     builder = builder.runner_role(role);
+    // The rank that holds the job reports its optimizer steps onto the row.
+    if role.lease_holder().is_some() {
+        builder = builder.progress(ProgressReporter::new(
+            JobAttempt {
+                job_id: &progress_job_id,
+                instance_id: &worker_id,
+                attempts: attempt,
+            }
+            .to_buf(),
+        ));
+    }
     if let Some(restored) = resume {
         builder = builder.resume(restored);
     }
@@ -10093,7 +10043,7 @@ mod tests {
         assert_eq!(
             devices,
             vec![DeviceFact {
-                kind: "cpu".into(),
+                kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                 ordinal: 0,
             }],
             "{devices:?}"
@@ -10107,11 +10057,11 @@ mod tests {
             devices,
             vec![
                 DeviceFact {
-                    kind: "cpu".into(),
+                    kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                     ordinal: 0,
                 },
                 DeviceFact {
-                    kind: "cpu".into(),
+                    kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                     ordinal: 1,
                 },
             ],
@@ -10120,7 +10070,8 @@ mod tests {
 
         let cuda = worker_devices(&config, ComputeDevice::Cuda { ordinal: 0 });
         assert_eq!(
-            cuda[0].kind, "cuda",
+            cuda[0].kind,
+            jammi_datafusion::ComputeDeviceKind::Cuda,
             "the session's own ComputeDevice decides kind, uniformly"
         );
     }
@@ -10325,7 +10276,7 @@ mod tests {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "panic-job",
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("panic-base::1"),
@@ -10339,7 +10290,7 @@ mod tests {
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
         let claimed = catalog
-            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
+            .claim_next("worker-x", &[JobKind::FineTune], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
@@ -10369,7 +10320,7 @@ mod tests {
         let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine panic must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&error);
+        let msg = error.to_string();
         assert!(
             msg.contains("Panic:") && msg.contains("simulated candle kernel fault"),
             "a caught panic must carry its message into the failure, got: {msg}"
@@ -10390,7 +10341,7 @@ mod tests {
         let job = catalog.get_job("panic-job").await.unwrap();
         assert_eq!(
             job.status,
-            JobStatus::Failed.to_string(),
+            JobStatus::Failed,
             "a panicking job lands `failed`, never wedged `running`"
         );
         assert!(
@@ -10569,29 +10520,23 @@ mod tests {
         let WorkerJobError::Failed(oom) = classify_training_error(&cancel, &config, oom_err) else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&oom);
+        let msg = oom.to_string();
         assert!(
             msg.contains("out of memory") && msg.contains("batch_size=8"),
             "must carry the classified OOM guidance, got: {msg}"
         );
 
-        // not cancelled + non-OOM: byte-identical passthrough of the RAW
-        // inner message — `failed_job_message` strips `JammiError::FineTune`'s
-        // own "Fine-tune error: " prefix here (see its doc): that prefix is
-        // re-applied on read by `TrainingJob::wait()` and the Python
-        // binding's `poll_until_terminal`, so it must not survive into the
-        // stored `WorkerJobError::Failed` message a second time.
+        // not cancelled + non-OOM: byte-identical passthrough.
         let cancel = AtomicBool::new(false);
-        let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
-        let raw = JammiError::FineTune(raw_inner.into());
+        let raw = JammiError::FineTune("Encoder forward: CUDA_ERROR_INVALID_PTX".into());
+        let raw_msg = raw.to_string();
         let WorkerJobError::Failed(passed) = classify_training_error(&cancel, &config, raw) else {
             panic!("a non-OOM failure must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&passed);
         assert_eq!(
-            msg, raw_inner,
-            "a non-OOM error must pass through unchanged, minus the redundant \
-             Fine-tune-error prefix"
+            passed.to_string(),
+            raw_msg,
+            "a non-OOM error must pass through unchanged"
         );
     }
 
@@ -10653,7 +10598,7 @@ mod tests {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oom-job",
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("oom-base::1"),
@@ -10667,7 +10612,7 @@ mod tests {
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
         let claimed = catalog
-            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
+            .claim_next("worker-x", &[JobKind::FineTune], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
@@ -10706,7 +10651,7 @@ mod tests {
         let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&error);
+        let msg = error.to_string();
         assert!(
             msg.contains("batch_size=8")
                 && msg.contains("backbone_dtype does not apply to a frozen encoder")
@@ -10730,7 +10675,7 @@ mod tests {
         let job = catalog.get_job("oom-job").await.unwrap();
         assert_eq!(
             job.status,
-            JobStatus::Failed.to_string(),
+            JobStatus::Failed,
             "an OOM'd job lands `failed`, never wedged `running`"
         );
         assert!(
@@ -12152,7 +12097,7 @@ mod tests {
         catalog
             .submit_job(SubmitJobParams {
                 job_id: &job_id,
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("sweep-base::1"),
@@ -12163,7 +12108,7 @@ mod tests {
             .await
             .unwrap();
         let attempt = catalog
-            .claim_next(worker, &["fine_tune"], Duration::from_secs(3600))
+            .claim_next(worker, &[JobKind::FineTune], Duration::from_secs(3600))
             .await
             .unwrap()
             .expect("the queued job is claimable")

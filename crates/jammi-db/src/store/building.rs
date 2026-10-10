@@ -26,8 +26,9 @@ use std::sync::Arc;
 
 use tracing::{debug, warn, Instrument};
 
+use crate::catalog::jobs_repo::{JobProgress, ProgressReporter};
 use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
-use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
+use crate::catalog::result_repo::{JobAttemptBuf, ResultTableCas, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
@@ -75,6 +76,9 @@ pub struct BuildingTable {
     storage_precision: StoragePrecision,
     done: Arc<AtomicBool>,
     hold: Option<LeaseHold>,
+    /// Reports the build's progress onto the job that builds this table, when
+    /// a job does.
+    progress: Option<ProgressReporter>,
 }
 
 impl std::fmt::Debug for BuildingTable {
@@ -108,6 +112,7 @@ impl BuildingTable {
         tenant: Option<TenantId>,
         writer_id: String,
         storage_precision: StoragePrecision,
+        job: Option<JobAttemptBuf>,
     ) -> Self {
         let mut table = Self {
             store,
@@ -118,6 +123,7 @@ impl BuildingTable {
             storage_precision,
             done: Arc::new(AtomicBool::new(false)),
             hold: None,
+            progress: job.map(ProgressReporter::new),
         };
         table.rehold();
         table
@@ -197,6 +203,15 @@ impl BuildingTable {
             .catalog()
             .set_checkpoint(&self.cas(), batch)
             .await
+    }
+
+    /// Report how far the build has got onto the job that builds this table,
+    /// if one does (see [`ProgressReporter`]).
+    pub async fn report_progress(&mut self, progress: JobProgress) -> Result<()> {
+        match &mut self.progress {
+            Some(reporter) => reporter.report(self.store.catalog(), progress).await,
+            None => Ok(()),
+        }
     }
 
     /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of

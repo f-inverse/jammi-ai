@@ -70,6 +70,7 @@ from ._assembly import (
     expiry_report_to_dict,
 )
 from ._capability import Capability
+from ._jobs import JobKind, JobPhase, JobProgress, JobStatus, WorkerState, from_wire
 from ._sessions import register as _register_session
 from ._sessions import unregister as _unregister_session
 from ._credentials import (
@@ -96,6 +97,7 @@ from .errors import (
     NotRefreshable,
     NotSupportedOnBackend,
     JobCancelled,
+    JobFailed,
     TrainingError,
     Unavailable,
     VersionUnavailable,
@@ -129,6 +131,7 @@ MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
 _DETAIL_CLASS = {
     "fine_tune": TrainingError,
     "job_cancelled": JobCancelled,
+    "job_failed": JobFailed,
     "invalid_key": InvalidKey,
     "non_unique_key": NonUniqueKey,
     "no_query_encoder": NoQueryEncoder,
@@ -268,29 +271,31 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _present(message, field: str) -> Optional[str]:
+    """A `jammi.v1` optional field's value, or ``None`` when the peer left it
+    absent."""
+    return getattr(message, field) if message.HasField(field) else None
+
+
 def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
     """Project a wire `JobSummary` into the job dict a caller reads.
 
-    Every field the message carries and nothing else — the embedded
-    `list_jobs` builds the same nine keys at its FFI boundary from the
-    catalog record, applying the same conventions this message documents:
-    `output_model_id` is the model a training kind registers under, stamped
-    at submission (always empty for a compute kind), `error` is empty unless
-    it failed,
-    `claimed_by` is empty while queued, and `ranks` (the instance that ran
-    each rank of the latest training attempt, in rank order) is an empty list
-    for a compute kind and until an attempt records it. No arm maps any of
-    them onto `None`, so a caller branches on one thing on both transports.
+    The embedded `list_jobs` builds the same keys from the catalog record:
+    ``kind`` and ``status`` typed; ``output_model_id`` the model the job
+    produced, present only once it completed; ``base_model_id`` absent for a
+    compute kind; ``error`` absent unless it failed; ``claimed_by`` absent
+    while queued; ``ranks`` empty for a compute kind and until a training
+    attempt records them.
     """
     return {
         "job_id": j.job_id,
-        "kind": j.kind,
-        "status": j.status,
-        "base_model_id": j.base_model_id,
-        "output_model_id": j.output_model_id,
+        "kind": from_wire(JobKind, job_pb2.JobKind, j.kind),
+        "status": from_wire(JobStatus, job_pb2.JobStatus, j.status),
+        "base_model_id": _present(j, "base_model_id"),
+        "output_model_id": _present(j, "output_model_id"),
         "created_at": j.created_at,
-        "error": j.error,
-        "claimed_by": j.claimed_by,
+        "error": _present(j, "error"),
+        "claimed_by": _present(j, "claimed_by"),
         "ranks": list(j.ranks),
     }
 
@@ -676,23 +681,6 @@ def _calibration_report_to_dict(
 # accepts, matching the embed binding's `ChannelColumnType::as_str`.
 _CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
 
-# Terminal job states, matching the engine's `JobStatus::ALL` filtered by
-# `JobStatus::is_terminal` (`crates/jammi-db/src/catalog/status.rs:70-78`) —
-# the ONE Rust-side terminality predicate; this set must stay equal to it.
-_TERMINAL_STATES = {"completed", "failed", "cancelled"}
-# The terminal-unsuccessful subset (mirrors `JobStatus::is_terminal_unsuccessful`),
-# kept as its own named set rather than bare literals so a status joining the
-# vocabulary is one edit here, not a hunt for every literal compare.
-_TERMINAL_UNSUCCESSFUL_STATES = {"failed", "cancelled"}
-# `JobStatus::Cancelled`'s rendered spelling: the one terminal-unsuccessful
-# status a waiter reports as its own exception (`JobCancelled`).
-_CANCELLED_STATE = "cancelled"
-# `JobStatus::Queued`'s rendered spelling — the ONE place a caller (this
-# module or a test) that needs the exact "freshly submitted, unclaimed"
-# literal reads it from, instead of hand-typing `"queued"` again.
-_QUEUED_STATE = "queued"
-
-
 def _verify_verdict_to_dict(
     resp: "catalog_pb2.VerifyMaterializationResponse",
 ) -> Dict[str, Any]:
@@ -863,9 +851,9 @@ class RemoteJob:
     poll, a ``progress()`` read, a ``cancel()`` request, and a ``wait()``
     that blocks until a terminal state and returns the tagged terminal result
     (raising on failure with the wire error). `output_model_id` is the
-    deterministic output id `SubmitJob` returned at submit time; `wait()`
-    polls `JobStatus` and, on ``failed``, raises :class:`jammi.TrainingError`
-    carrying the worker's error message — mirroring the embedded `Job.wait`.
+    output id `SubmitJob` returned at submit time; `wait()` polls `JobStatus`
+    and, on ``failed``, raises :class:`jammi.JobFailed` carrying the worker's
+    error message — mirroring the embedded `Job.wait`.
     """
 
     # Poll interval for `wait()`. Matches the embedded `Job.wait`'s 100ms
@@ -878,8 +866,8 @@ class RemoteJob:
         metadata,
         *,
         job_id: str,
-        kind: str,
-        output_model_id: str,
+        kind: JobKind,
+        output_model_id: Optional[str],
     ) -> None:
         self._stub = stub
         self._metadata = metadata
@@ -893,14 +881,14 @@ class RemoteJob:
         return self._job_id
 
     @property
-    def kind(self) -> str:
-        """The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`)."""
+    def kind(self) -> JobKind:
+        """The kind this job submitted under."""
         return self._kind
 
     @property
-    def output_model_id(self) -> str:
-        """The deterministic output model id the trained artifact registers
-        under. Empty for a compute-kind job."""
+    def output_model_id(self) -> Optional[str]:
+        """The model a training kind registers, stamped at submission;
+        ``None`` for a compute kind."""
         return self._output_model_id
 
     def _status_response(self) -> job_pb2.JobStatusResponse:
@@ -912,25 +900,24 @@ class RemoteJob:
         except grpc.RpcError as exc:
             # A transport fault while polling maps onto the taxonomy, like every
             # other remote hop; a `failed` terminal status (not an RpcError) is
-            # surfaced as `TrainingError` by `wait()`.
+            # surfaced as `JobFailed` by `wait()`.
             raise _rpc_to_jammi(exc) from exc
 
-    def status(self) -> str:
-        """The job's current status string. Maps to `JobService.JobStatus`."""
-        return self._status_response().status
+    def status(self) -> JobStatus:
+        """The job's current status. Maps to `JobService.JobStatus`."""
+        return from_wire(JobStatus, job_pb2.JobStatus, self._status_response().status)
 
-    def progress(self) -> Dict[str, Any]:
-        """This job's progress: `{"rows_done", "rows_total", "phase"}` —
-        `rows_done`/`rows_total` are `None` until the executor has recorded
-        any (a legal `0` is distinguished from "not recorded yet"); `phase`
-        is the empty string until the producer names one. Mirrors the
-        embedded `Job.progress`'s shape field-for-field."""
+    def progress(self) -> Optional[JobProgress]:
+        """This job's latest recorded progress, or ``None`` before the executor
+        records any. Mirrors the embedded `EmbeddedJob.progress`."""
         p = self._status_response().progress
-        return {
-            "rows_done": p.rows_done if p.HasField("rows_done") else None,
-            "rows_total": p.rows_total if p.HasField("rows_total") else None,
-            "phase": p.phase,
-        }
+        if p.phase == job_pb2.JOB_PHASE_UNSPECIFIED:
+            return None
+        return JobProgress(
+            phase=from_wire(JobPhase, job_pb2.JobPhase, p.phase),
+            done=p.done if p.HasField("done") else None,
+            total=p.total if p.HasField("total") else None,
+        )
 
     def cancel(self) -> bool:
         """Request cancellation. `True` when the request landed on a still
@@ -951,18 +938,21 @@ class RemoteJob:
 
         Polls `JobStatus` until ``completed`` (returns the result) or a
         terminal-unsuccessful status, raising :class:`jammi.JobCancelled` for a
-        ``cancelled`` job and :class:`jammi.TrainingError` with the wire error
-        message for a ``failed`` one — the remote peer of the embedded
-        `Job.wait`, which raises the same classes for the same ends.
+        ``cancelled`` job and :class:`jammi.JobFailed` for a ``failed`` one,
+        each carrying the error the job recorded — the remote peer of the
+        embedded `Job.wait`, which raises the same classes for the same ends.
         """
+        ends = {JobStatus.CANCELLED: JobCancelled, JobStatus.FAILED: JobFailed}
         while True:
             resp = self._status_response()
-            if resp.status == "completed":
+            status = from_wire(JobStatus, job_pb2.JobStatus, resp.status)
+            if status is JobStatus.COMPLETED:
                 return _job_result_to_dict(resp)
-            if resp.status == _CANCELLED_STATE:
-                raise JobCancelled(resp.error or "job cancelled")
-            if resp.status in _TERMINAL_UNSUCCESSFUL_STATES:
-                raise TrainingError(resp.error or "job failed")
+            if status in ends:
+                error = _present(resp, "error")
+                if error is None:
+                    raise BackendError(f"job '{self._job_id}' ended {status} with no recorded error")
+                raise ends[status](error)
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
     def metrics(self) -> Dict[str, Any]:
@@ -972,8 +962,8 @@ class RemoteJob:
         `JobStatusResponse.model.metrics_json` field the server fills
         verbatim from the catalog's tagged `jobs.result` payload — the
         run-summary blob the trainer hands the worker at completion
-        (`final_loss`, `early_stopping_metric`, `total_steps`, `started_at`,
-        `completed_at`, and the per-epoch `train_loss_curve` /
+        (`best_epoch`, `best_loss`, `early_stopping_metric`, `total_steps`,
+        `started_at`, `completed_at`, and the per-epoch `train_loss_curve` /
         `val_loss_curve` arrays). Returns ``{}`` for a job that has not yet
         recorded any metrics (e.g. still queued or running before
         completion, or a compute-kind job, which carries no `model` result at
@@ -1120,7 +1110,7 @@ class RemoteDatabase:
     # --- The closed-session guard -----------------------------------------------
 
     def _check_open(self) -> None:
-        """Raise the typed :class:`BackendError` once :meth:`close` has run.
+        """Raise the typed :class:`FailedPrecondition` once :meth:`close` has run.
 
         The remote peer of the embedded engine's FFI-boundary guard
         (`_NativeDatabase::check_open`), and the reason a closed
@@ -1138,7 +1128,7 @@ class RemoteDatabase:
         all, so there is no per-verb list to drift.
         """
         if self._closed:
-            raise BackendError("Database is closed")
+            raise FailedPrecondition("Database is closed")
 
     # --- The single wire choke point --------------------------------------------
 
@@ -2918,20 +2908,13 @@ class RemoteDatabase:
         :class:`~jammi.errors.BackendError`, the same class the embedded arm
         raises for the same miss.
 
-        `output_model_id` reads the same on both arms at EVERY lifecycle state
-        — queued, running, completed, failed — not only once the job has
-        finished. It is the id the server resolved for this row
-        (`JobStatusResponse.output_model_id`): the stamped value once
-        the job completes, and before then the engine's own re-derivation from
-        the persisted spec, which is exactly what the embedded attach reports
-        because both call the SAME engine function. This client re-derives
-        nothing — the naming rule belongs to the engine, and a second
-        implementation here is the drift the conformance suite exists to catch.
-        Empty for a compute-kind job — no compute kind ever registers a model.
+        `output_model_id` reads the same on both arms at every lifecycle state:
+        the submit stamps it on the job's row, and both arms relay that column
+        (`JobStatusResponse.output_model_id` here). ``None`` for a compute
+        kind, which registers no model.
 
-        Note that `list_jobs()`'s `output_model_id` is the SAME field, relayed
-        verbatim by `JobSummary` too — stamped at submission, so the listing
-        and this handle agree at every lifecycle state.
+        A listing (`list_jobs()`) names only a model the job produced, so a
+        queued, running, failed or cancelled job lists none.
         """
         resp = self._call(
             self._job.JobStatus,
@@ -2941,19 +2924,18 @@ class RemoteDatabase:
             self._job,
             self._metadata,
             job_id=job_id,
-            kind=resp.kind,
-            output_model_id=resp.output_model_id,
+            kind=from_wire(JobKind, job_pb2.JobKind, resp.kind),
+            output_model_id=_present(resp, "output_model_id"),
         )
 
     def list_jobs(self) -> List[Dict[str, Any]]:
         """Jobs visible to the current tenant, most recent first.
 
         Maps to `JobService.ListJobs`; same dict shape per entry as
-        the embedded :meth:`jammi.EmbeddedBackend.list_jobs` — the
-        wire's `JobSummary` field set, with ``output_model_id`` stamped at
-        submission (always empty for a compute kind), ``error`` empty unless
-        it failed, and ``claimed_by`` / ``ranks`` saying where it ran. A listing of :meth:`job`
-        answers plus the submit-time identity; read
+        the embedded :meth:`jammi.EmbeddedBackend.list_jobs` (see
+        `_job_summary_to_dict`): ``output_model_id`` is the model the job
+        produced, present once it completed; ``error`` is present once it
+        failed; ``claimed_by`` / ``ranks`` say where it ran. Read
         :meth:`job(job_id).progress() <RemoteJob.progress>` for the mid-run
         progress surface.
         """
@@ -2979,12 +2961,12 @@ class RemoteDatabase:
         return [
             {
                 "instance_id": w.instance_id,
-                "label": w.label,
-                "host": w.host,
-                "kinds": w.kinds,
+                "label": _present(w, "label"),
+                "host": _present(w, "host"),
+                "kinds": [from_wire(JobKind, job_pb2.JobKind, k) for k in w.kinds],
                 "started_at": w.started_at,
                 "last_seen_at": w.last_seen_at,
-                "state": w.state,
+                "state": from_wire(WorkerState, job_pb2.WorkerState, w.state),
             }
             for w in resp.workers
         ]
@@ -3003,8 +2985,8 @@ class RemoteDatabase:
             self._job,
             self._metadata,
             job_id=resp.job_id,
-            kind=resp.kind,
-            output_model_id=resp.output_model_id,
+            kind=from_wire(JobKind, job_pb2.JobKind, resp.kind),
+            output_model_id=_present(resp, "output_model_id"),
         )
 
     # --- Stateless conformal / RRF numerics (computed client-side) ---------------

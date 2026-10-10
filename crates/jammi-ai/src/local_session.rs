@@ -40,6 +40,7 @@ use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
@@ -700,7 +701,7 @@ impl Session {
             .engine
             .fine_tune(source, base_model, columns, method, task, config)
             .await?;
-        Ok(FineTuneJobId(job.job_id))
+        Ok(FineTuneJobId(job.job_id().to_string()))
     }
 
     /// Submit a column-source fine-tune from the flattened request shape, and
@@ -715,11 +716,11 @@ impl Session {
     /// that builds no request.
     pub async fn submit_fine_tune(&self, request: FineTuneRequest) -> Result<FineTuneJobId> {
         let job = self.engine.submit_fine_tune(request).await?;
-        Ok(FineTuneJobId(job.job_id))
+        Ok(FineTuneJobId(job.job_id().to_string()))
     }
 
-    /// Current status string for a fine-tune job, looked up by id.
-    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
+    /// The current status of a fine-tune job, looked up by id.
+    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<JobStatus> {
         let record = self.engine.catalog().get_job(&id.0).await?;
         Ok(record.status)
     }

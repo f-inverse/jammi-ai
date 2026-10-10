@@ -316,13 +316,13 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// (deferred-error) contract: submit returns `Ok` from either transport, and
 /// the worker drives the job to `failed` whichever transport submitted it.
 ///
-/// `JobStatus` now carries the worker's failure `error` (and the output
-/// `model_id`) alongside the status string, so a remote `wait()` can surface the
-/// failure reason — see the pure-Python `RemoteTrainingJob.wait`, which raises
-/// `TrainingError` with that wire message, and the verb-parity coverage in
+/// `JobStatus` carries the worker's failure `error` (and the output
+/// `model_id`) alongside the status, so a remote `wait()` can surface the
+/// failure reason — see the pure-Python `RemoteJob.wait`, which raises
+/// `JobFailed` with that wire message, and the verb-parity coverage in
 /// `crates/jammi-python/tests/test_conformance.py`. The data-plane client
-/// exposed here reads back only the status string (its `fine_tune_status`
-/// signature is status-only), so this test asserts the deferred-failure contract
+/// exposed here reads back only the status (its `fine_tune_status` returns a
+/// `JobStatus`), so this test asserts the deferred-failure contract
 /// — submit returns `Ok`, the worker drives the job to `failed` — over both
 /// transports; the error-message round-trip is exercised through the Python
 /// handle that consumes the new `error` field.
@@ -379,13 +379,13 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String>;
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus>;
     }
     impl FineTuneStatus for Session {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -393,7 +393,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -404,11 +404,12 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == jammi_db::catalog::status::JobStatus::Failed.to_string() {
+            if status == jammi_db::catalog::status::JobStatus::Failed {
                 return;
             }
             assert_ne!(
-                status, "completed",
+                status,
+                jammi_db::catalog::status::JobStatus::Completed,
                 "patents has no training-format columns — the job must fail, not complete"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -475,9 +476,9 @@ async fn add_training_pairs(session: &Session) {
 /// Parity: a completed fine-tune job's run-metrics blob round-trips
 /// over the wire, on the divergence-prone case — the multi-epoch
 /// `train_loss_curve` / `val_loss_curve` arrays, not a single scalar. The
-/// embedded surface reads the catalog's `training_jobs.metrics` column
-/// directly (the same read `jammi-python`'s `TrainingJob.metrics()`
-/// performs); the remote surface reads it back through the
+/// embedded surface reads the job's recorded result directly (the same read
+/// `jammi-python`'s `Job.metrics()` performs); the remote surface reads it
+/// back through the
 /// `JobStatus`'s result.model.metrics_json wire field.
 ///
 /// THE byte-equality parity oracle is the SAME-JOB comparison: this test
@@ -541,13 +542,13 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String>;
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus>;
     }
     impl FineTuneStatus for Session {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -555,7 +556,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -565,11 +566,12 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == jammi_db::catalog::status::JobStatus::Completed.to_string() {
+            if status == jammi_db::catalog::status::JobStatus::Completed {
                 return;
             }
             assert_ne!(
-                status, "failed",
+                status,
+                jammi_db::catalog::status::JobStatus::Failed,
                 "the minimal LoRA fine-tune over training_pairs.csv must complete"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -580,7 +582,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     poll_until_completed(&remote, &remote_job).await;
 
     // Embedded read: straight off the catalog record, the same field
-    // `jammi-python`'s `TrainingJob.metrics()` decodes.
+    // `jammi-python`'s `Job.metrics()` decodes.
     let local_record = server
         .engine
         .catalog()

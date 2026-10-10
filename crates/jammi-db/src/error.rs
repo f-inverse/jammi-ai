@@ -325,14 +325,25 @@ pub enum JammiError {
     },
 
     /// A job's executor observed `jobs.cancel_requested` at a checkpoint
-    /// boundary and stopped: the job is recorded `failed` with this message
+    /// boundary and stopped: the job is recorded `cancelled` with this message
     /// and no result is returned. Raised by `InferenceSession::run_now` for
-    /// an inline job and by the worker's claimed-compute path; the request
-    /// itself is `Catalog::cancel_request`.
+    /// an inline job, by the worker's claimed-compute path, and by a waiter on
+    /// a cancelled job; the request itself is `Catalog::cancel_request`.
     #[error("job `{job_id}`: cancelled at the executor's request checkpoint")]
     JobCancelled {
         /// The job whose cancel request was honoured.
         job_id: String,
+    },
+
+    /// A job a caller waited on ended `failed`. `reason` is the error its
+    /// executor recorded, verbatim — the text every surface that reads the
+    /// job reports.
+    #[error("{reason}")]
+    JobFailed {
+        /// The job that failed.
+        job_id: String,
+        /// The error its executor recorded.
+        reason: String,
     },
 
     /// A source cannot be deleted while a live writer is still materialising a
@@ -663,10 +674,12 @@ impl JammiError {
                 _ => ErrorClass::Internal,
             },
             // Engine-side faults: a broken invariant, an unreadable artifact,
-            // a failed computation or an I/O failure underneath.
+            // a failed computation or an I/O failure underneath. A failed job
+            // records only its executor's text, so its class is the fault's.
             Self::Catalog(_)
             | Self::Inference(_)
             | Self::FineTune(_)
+            | Self::JobFailed { .. }
             | Self::Gpu(_)
             | Self::Backend(_)
             | Self::Json(_)

@@ -315,12 +315,12 @@ async fn open_clip_text_tower_adapter_trains_and_serves() {
         .expect("the text-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "open_clip", Tower::Text);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "open_clip text");
@@ -426,7 +426,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         .expect("the text-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves warm");
     assert_differs(
@@ -442,7 +442,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves cold");
 
@@ -461,13 +461,13 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "open_clip text",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::text_serve(base_model.clone(), PROBE),
-        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+        serve_tuned: &common::text_serve(job.output_model_id().unwrap().to_string(), PROBE),
     })
     .await;
 }
@@ -711,12 +711,12 @@ async fn open_clip_vision_tower_adapter_trains_and_serves() {
         .expect("the vision-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "open_clip", Tower::Vision);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "open_clip vision");
@@ -810,7 +810,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
         .expect("the vision-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves warm");
     assert_differs(
@@ -825,7 +825,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves cold");
 
@@ -845,13 +845,16 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "open_clip vision",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::image_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        serve_tuned: &common::image_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::image_serve(
+            job.output_model_id().unwrap().to_string(),
+            Arc::clone(&probe_bytes),
+        ),
     })
     .await;
 }
@@ -913,12 +916,12 @@ async fn clap_audio_tower_adapter_trains_and_serves() {
         .expect("the audio-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "clap_audio_model", Tower::Audio);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "clap audio");
@@ -1006,7 +1009,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
         .expect("the audio-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves warm");
     assert_differs(
@@ -1021,7 +1024,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves cold");
 
@@ -1041,13 +1044,16 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "clap audio",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::audio_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        serve_tuned: &common::audio_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::audio_serve(
+            job.output_model_id().unwrap().to_string(),
+            Arc::clone(&probe_bytes),
+        ),
     })
     .await;
 }
@@ -1234,7 +1240,7 @@ async fn an_absent_model_type_trains_and_serves_as_bert() {
         .await
         .expect("a checkpoint that declares no model_type fine-tunes as BERT");
 
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let raw = std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
         .expect("a published adapted-encoder bundle carries adapter_config.json");
     let saved: SavedAdapter = serde_json::from_str(&raw).expect("adapter_config.json parses");

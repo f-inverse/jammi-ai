@@ -12,9 +12,10 @@ use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 
 use crate::eval::runner::EvalRunner;
+use crate::fine_tune::spec::fine_tuned_model_id;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::jobs::JobHandle;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
 use crate::model::hub::HubSource;
@@ -740,8 +741,8 @@ impl InferenceSession {
         self.inner.catalog()
     }
 
-    /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
-    /// handle clones to poll its job after the submitting call returns.
+    /// The shared catalog handle behind an `Arc` — the form a [`JobHandle`]
+    /// clones to poll its job after the submitting call returns.
     pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
     }
@@ -1963,7 +1964,7 @@ impl InferenceSession {
     /// Submit a LoRA fine-tuning job on a registered source.
     ///
     /// Persists a self-describing [`TrainingSpec::FineTune`] into a `queued`
-    /// catalog job and returns a [`TrainingJob`] handle immediately — the
+    /// catalog job and returns a [`JobHandle`] immediately — the
     /// training runs later under a [`crate::fine_tune::worker::JobWorker`]
     /// that claims the job under a lease, reconstructs the data loader from the
     /// persisted source + columns, and trains while heartbeating. Call
@@ -1977,7 +1978,7 @@ impl InferenceSession {
         method: FineTuneMethod,
         task: ModelTask,
         config: Option<FineTuneConfig>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let config = config.unwrap_or_default();
 
         let spec = TrainingSpec::FineTune {
@@ -2021,7 +2022,7 @@ impl InferenceSession {
     pub async fn submit_fine_tune(
         &self,
         request: jammi_wire::request::FineTuneRequest,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let jammi_wire::request::FineTuneRequest {
             source,
             base_model,
@@ -2057,7 +2058,7 @@ impl InferenceSession {
     /// from the persisted spec. The row's `model_ref`/`output_model_id` come
     /// from [`Self::training_job_links`], the one derivation `enqueue` and
     /// the context-predictor submit share.
-    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<TrainingJob> {
+    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<JobHandle> {
         self.submit_fine_tune_spec_deduped(spec, None).await
     }
 
@@ -2076,7 +2077,7 @@ impl InferenceSession {
         &self,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         // The ONE admission (per-kind validation, rank admission) is
         // applied HERE, before anything durable
         // exists: this method is one of the durable submit edges for a
@@ -2098,39 +2099,43 @@ impl InferenceSession {
         // place that construction happens.
         let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
         let job_id = uuid::Uuid::new_v4().to_string();
+        self.submit_training(&admitted, job_id, 0, idempotency_key)
+            .await
+    }
+
+    /// Submit an admitted training spec as job `job_id` and hand back its
+    /// handle — the one tail every durable training submit edge shares. The
+    /// row's links come from [`Self::training_job_links`]. When
+    /// `idempotency_key` collides with a still-known prior submission, the
+    /// handle is THAT job's, attached by id: the row of record, never this
+    /// call's unused id.
+    pub(crate) async fn submit_training(
+        &self,
+        admitted: &crate::fine_tune::spec::AdmittedTrainingSpec,
+        job_id: String,
+        priority: i32,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobHandle> {
         let links = self.training_job_links(admitted.spec(), &job_id).await?;
         let submitted = crate::fine_tune::spec::submit_admitted_training(
-            self.inner.catalog(),
-            &admitted,
+            self.catalog(),
+            admitted,
             &job_id,
             links.model_ref.as_deref(),
             &links.output_model_id,
-            0,
+            priority,
             idempotency_key,
         )
         .await?;
-        let recorded_job_id = submitted.recorded_job_id;
-
-        if recorded_job_id == job_id {
-            Ok(TrainingJob::new(
+        if submitted.recorded_job_id == job_id {
+            Ok(JobHandle::new(
                 job_id,
-                "queued".into(),
-                links.output_model_id,
-                Arc::clone(self.inner.catalog()),
+                admitted.spec().kind(),
+                Some(links.output_model_id),
+                Arc::clone(self.catalog_arc()),
             ))
         } else {
-            // A concurrent or prior call already holds this idempotency key
-            // — the durable row of record, not this call's own (unused)
-            // job_id. Re-read its current state rather than guessing
-            // `"queued"`: a racing caller may observe it already claimed.
-            let record = self.inner.catalog().get_job(&recorded_job_id).await?;
-            let model_id = resolve_model_id(&recorded_job_id, &record)?;
-            Ok(TrainingJob::new(
-                recorded_job_id,
-                record.status,
-                model_id,
-                Arc::clone(self.inner.catalog()),
-            ))
+            JobHandle::attach(Arc::clone(self.catalog_arc()), &submitted.recorded_job_id).await
         }
     }
 
@@ -2236,7 +2241,7 @@ impl InferenceSession {
         base_model: &str,
         sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
         config: Option<FineTuneConfig>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let config = config.unwrap_or_default();
 
         // The job record's `source` field records the node source — the model is
@@ -2269,7 +2274,7 @@ impl InferenceSession {
     /// [`TrainingSpec`] and submit it here, so an identical decode yields an
     /// identical job on either transport. The dispatch lives once, beside the
     /// entry points it calls, rather than being re-written per transport.
-    pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<TrainingJob> {
+    pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<JobHandle> {
         self.run_training_spec_deduped(spec, None).await
     }
 
@@ -2291,7 +2296,7 @@ impl InferenceSession {
         self: &Arc<Self>,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         match spec {
             TrainingSpec::ContextPredictor {
                 source,

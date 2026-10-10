@@ -46,8 +46,10 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::jobs_repo::{JobProgress, ProgressReporter};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobPhase;
 use jammi_db::error::{JammiError, Result};
 
 use serde::{Deserialize, Serialize};
@@ -591,8 +593,7 @@ impl InferenceSession {
 
     /// Submit an episodic in-context-predictor meta-training job on
     /// `source_id`'s embedding table per `spec`, returning a
-    /// [`TrainingJob`](crate::fine_tune::training_job::TrainingJob) handle
-    /// immediately.
+    /// [`JobHandle`](crate::jobs::JobHandle) immediately.
     ///
     /// Like the fine-tune verbs, this persists a self-describing
     /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and
@@ -601,13 +602,13 @@ impl InferenceSession {
     /// (deterministic task split via the seed), drives the predictor train loop
     /// while heartbeating, and registers the trained predictor. Call
     /// `job.wait().await` to block until a worker drives it to completion;
-    /// `job.model_id()` is the model id the predictor registers under (the
-    /// spec's `model_id`).
+    /// `job.output_model_id()` is the model id the predictor registers under
+    /// (the spec's `model_id`).
     pub async fn train_context_predictor(
         self: &Arc<Self>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+    ) -> Result<crate::jobs::JobHandle> {
         self.train_context_predictor_deduped(source_id, spec, None)
             .await
     }
@@ -623,7 +624,7 @@ impl InferenceSession {
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
         idempotency_key: Option<&str>,
-    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+    ) -> Result<crate::jobs::JobHandle> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let training_spec = TrainingSpec::ContextPredictor {
             source: source_id.to_string(),
@@ -638,42 +639,8 @@ impl InferenceSession {
         // place that construction happens.
         let admitted =
             crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training_spec)?;
-        // `model_ref`/`output_model_id` come from the one derivation every
-        // training submitter shares (`InferenceSession::training_job_links`):
-        // the source's embedding model's PK, and the predictor's own id.
-        let links = self.training_job_links(admitted.spec(), &job_id).await?;
-        let submitted = crate::fine_tune::spec::submit_admitted_training(
-            self.catalog(),
-            &admitted,
-            &job_id,
-            links.model_ref.as_deref(),
-            &links.output_model_id,
-            0,
-            idempotency_key,
-        )
-        .await?;
-        let recorded_job_id = submitted.recorded_job_id;
-
-        if recorded_job_id == job_id {
-            Ok(crate::fine_tune::training_job::TrainingJob::new(
-                job_id,
-                "queued".into(),
-                links.output_model_id,
-                Arc::clone(self.catalog_arc()),
-            ))
-        } else {
-            // A concurrent or prior call already holds this idempotency key
-            // — re-read its current state rather than assuming "queued".
-            let record = self.catalog().get_job(&recorded_job_id).await?;
-            let model_id =
-                crate::fine_tune::training_job::resolve_model_id(&recorded_job_id, &record)?;
-            Ok(crate::fine_tune::training_job::TrainingJob::new(
-                recorded_job_id,
-                record.status,
-                model_id,
-                Arc::clone(self.catalog_arc()),
-            ))
-        }
+        self.submit_training(&admitted, job_id, 0, idempotency_key)
+            .await
     }
 
     /// The embedding table a context-predictor training run reads: the spec's
@@ -746,11 +713,17 @@ impl InferenceSession {
     /// tenant-scoped: the worker runs this whole call inside the job's tenant
     /// scope, so the session's shared tenant binding resolves to the job's tenant
     /// rather than the worker's unbound default.
+    ///
+    /// The fit itself is CPU-bound, so it runs on a blocking thread; at each
+    /// epoch it reports the optimizer steps taken onto the job's row through
+    /// `progress` (the job's tenant-pinned catalog and its reporter), when
+    /// given.
     pub(crate) async fn run_context_predictor_training(
         self: &Arc<Self>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        progress: Option<(Arc<jammi_db::catalog::Catalog>, ProgressReporter)>,
     ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let sampled = self.sample_context_episodes(source_id, spec).await?;
         if sampled.train.is_empty() {
@@ -772,15 +745,41 @@ impl InferenceSession {
 
         let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
         let started_at = chrono::Utc::now();
-        let mut curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
-        let report = fit_context_predictor(
-            spec,
-            &varmap,
-            &predictor,
-            &sampled.train,
-            cancel,
-            |trained, _| curve.after_epoch(spec, trained, &sampled),
-        )?;
+        let curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
+        let sampled = Arc::new(sampled);
+        let fit_sampled = Arc::clone(&sampled);
+        let fit_spec = spec.clone();
+        let fit_varmap = varmap.clone();
+        let (report, curve) = tokio::task::spawn_blocking(move || {
+            let (mut curve, mut progress) = (curve, progress);
+            let steps_per_epoch = fit_sampled.train.len() as u64;
+            let total = Some(fit_spec.epochs as u64 * steps_per_epoch);
+            let report = fit_context_predictor(
+                &fit_spec,
+                &fit_varmap,
+                &predictor,
+                &fit_sampled.train,
+                &cancel,
+                |trained, epoch| {
+                    curve.after_epoch(&fit_spec, trained, &fit_sampled)?;
+                    match progress.as_mut() {
+                        Some((catalog, reporter)) => {
+                            let steps = JobProgress {
+                                phase: JobPhase::Training,
+                                done: Some(epoch as u64 * steps_per_epoch),
+                                total,
+                            };
+                            tokio::runtime::Handle::current()
+                                .block_on(reporter.report(catalog, steps))
+                        }
+                        None => Ok(()),
+                    }
+                },
+            )?;
+            Ok::<_, JammiError>((report, curve))
+        })
+        .await
+        .map_err(|e| JammiError::Internal(format!("context predictor training task: {e}")))??;
         let metrics = ContextPredictorMetrics {
             started_at,
             completed_at: chrono::Utc::now(),

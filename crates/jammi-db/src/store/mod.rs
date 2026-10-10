@@ -2140,6 +2140,7 @@ impl ResultStore {
             tenant,
             self.writer_id.to_string(),
             storage_precision,
+            origin.job_attempt.map(|attempt| attempt.to_buf()),
         );
 
         // The table-created window: the `building` row is committed and heartbeating,
@@ -3090,6 +3091,7 @@ impl ResultStore {
             tenant,
             claim_writer_id,
             table.storage_precision.unwrap_or_default(),
+            None,
         )))
     }
 

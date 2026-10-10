@@ -39,7 +39,8 @@ from ._sessions import (
 # `_embedded` is native-free at import (it imports `jammi_native` lazily, inside
 # `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi`
 # native-free — the client-import guard the positive conformance test pins.
-from ._embedded import EmbeddedBackend
+from ._embedded import EmbeddedBackend, EmbeddedJob
+from ._jobs import JobKind, JobPhase, JobProgress, JobStatus, WorkerState
 from ._target import LocalTarget, RemoteTarget, Target, parse_target
 from .errors import (
     BackendError,
@@ -48,6 +49,7 @@ from .errors import (
     NoEmbeddedEngineError,
     NotSupportedOnBackend,
     JobCancelled,
+    JobFailed,
     TrainingError,
 )
 
@@ -75,6 +77,13 @@ __all__ = [
     # but its module (`_embedded`) imports `jammi_native` lazily, so referencing
     # the name does not pull the engine — only opening a `file://` target does.
     "EmbeddedBackend",
+    "EmbeddedJob",
+    # The job queue's vocabulary, shared by both transports.
+    "JobStatus",
+    "JobKind",
+    "JobPhase",
+    "JobProgress",
+    "WorkerState",
     # The JammiError taxonomy (also `jammi.errors`).
     "errors",
     "JammiError",
@@ -82,6 +91,7 @@ __all__ = [
     "NotSupportedOnBackend",
     "NoEmbeddedEngineError",
     "JobCancelled",
+    "JobFailed",
     "TrainingError",
     "BackendError",
     # Credentials + targets.
@@ -203,7 +213,6 @@ def connect(
 _EMBEDDED_ONLY = (
     "AuditHandle",
     "EphemeralSession",
-    "Job",
     "ModelTask",
     "PerQueryAudit",
 )

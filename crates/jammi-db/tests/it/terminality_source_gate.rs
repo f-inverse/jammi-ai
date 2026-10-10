@@ -4,10 +4,9 @@
 //! either language hand-enumerates the job-status terminality vocabulary as
 //! a literal string compare (`status == "completed"`, `status != "failed"`,
 //! and their reversed/`match`-arm shapes). A literal compare outside the one
-//! predicate makes `WaitJob`, the embedded
-//! `Job.wait`/`TrainingJob.wait`/`RemoteJob.wait`, and the Python client's
-//! `_TERMINAL_STATES` liable to silently hang or misclassify the moment this
-//! vocabulary grows a new terminal member. The scanned universe is derived from `git ls-files`,
+//! predicate makes `WaitJob`, `JobHandle::wait`, and the Python clients'
+//! waits liable to silently hang or misclassify the moment this vocabulary
+//! grows a new terminal member. The scanned universe is derived from `git ls-files`,
 //! never a hand-rolled directory walk, so a file the scan should reach but cannot read is a hard
 //! failure naming it, never a silent skip.
 //!

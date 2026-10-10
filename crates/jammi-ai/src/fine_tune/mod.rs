@@ -48,8 +48,6 @@ pub mod target;
 #[cfg(feature = "local")]
 pub mod trainer;
 #[cfg(feature = "local")]
-pub mod training_job;
-#[cfg(feature = "local")]
 pub mod training_set;
 #[cfg(feature = "local")]
 pub mod worker;

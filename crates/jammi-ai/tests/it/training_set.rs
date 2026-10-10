@@ -13,7 +13,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
-use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
@@ -128,7 +128,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.unwrap();
 
     // The pinned adapter prints below must be produced by the
@@ -298,7 +298,7 @@ async fn run_regression_parity_fixture(
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.unwrap();
 
     // The target scaler and the pinned prints below must
@@ -402,7 +402,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait()
         .await
         .expect("a W=1 GradCache run over the eager loader must complete");
@@ -536,7 +536,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
             )
             .await
             .unwrap();
-        let job_id = job.job_id.clone();
+        let job_id = job.job_id().to_string();
         job.wait()
             .await
             .expect("a W=1 mining-config run must complete");
@@ -717,7 +717,7 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
             .await
             .unwrap();
         job.wait().await.unwrap();
-        model_ids.push(job.model_id().to_string());
+        model_ids.push(job.output_model_id().unwrap().to_string());
     }
     assert_ne!(
         model_ids[0], model_ids[1],
@@ -825,7 +825,7 @@ async fn empty_projection_is_refused_through_the_job_path() {
         .await
         .unwrap();
     let outcome = job.wait().await;
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
     println!("empty-training-set job outcome = {outcome:?}");
     println!(
         "empty-training-set job status = {:?} error = {:?}",
@@ -833,7 +833,8 @@ async fn empty_projection_is_refused_through_the_job_path() {
     );
 
     assert_eq!(
-        record.status, "failed",
+        record.status,
+        JobStatus::Failed,
         "a zero-row projection must fail the job, never train on nothing"
     );
     let error = record.error.clone().unwrap_or_default();

@@ -21,7 +21,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::ModelLocation;
-use jammi_db::catalog::status::ArtifactState;
+use jammi_db::catalog::status::{ArtifactState, JobKind, JobStatus};
 use jammi_db::store::{CacheOutcome, CachePolicy, ReconcileOptions, ReusedArtifact};
 use std::time::Duration;
 
@@ -89,16 +89,17 @@ async fn submit_and_run(
         .catalog()
         .claim_next(
             worker.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(3600),
         )
         .await
         .unwrap()
         .expect("the queued job is claimable");
     worker.run_claimed_job(session, claimed).await;
-    let after = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after.status, "completed",
+        after.status,
+        JobStatus::Completed,
         "the job must complete for either outcome (fresh train or cache hit): {after:?}"
     );
     let result: JobResult = serde_json::from_str(
@@ -116,7 +117,11 @@ async fn submit_and_run(
     else {
         panic!("a training kind's result must be JobResult::Model, got {result:?}");
     };
-    (job.model_id.clone(), metrics.is_some(), cache_outcome)
+    (
+        job.output_model_id().unwrap().to_string(),
+        metrics.is_some(),
+        cache_outcome,
+    )
 }
 
 /// Two submissions of the SAME `TrainingSpec::FineTune` under `Use` train
@@ -272,7 +277,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     // the expired lease and re-claims under a long one.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], Duration::ZERO)
         .await
         .unwrap()
         .expect("worker-a claims the queued cache=Use job");
@@ -286,7 +291,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -296,16 +301,17 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     // worker-a runs its STALE claim: the probe hits, but the attempt guard
     // inside the reusing finalize misses, so nothing is written.
     worker_a.run_claimed_job(&session, stale_claim).await;
-    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_a = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after_a.status, "running",
+        after_a.status,
+        JobStatus::Running,
         "a worker that lost its lease must not finalize, even on a cache hit"
     );
     assert_eq!(after_a.claimed_by.as_deref(), Some(worker_b.worker_id()));
     assert!(
         session
             .catalog()
-            .get_model(&job.model_id)
+            .get_model(job.output_model_id().unwrap())
             .await
             .unwrap()
             .is_none(),
@@ -342,7 +348,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     job.wait().await.unwrap();
     let second = session
         .catalog()
-        .get_model(&job.model_id)
+        .get_model(job.output_model_id().unwrap())
         .await
         .unwrap()
         .expect("the legitimate owner's model row must exist");
@@ -433,7 +439,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
         )
         .await
         .unwrap();
-    let output_name = job.model_id().to_string();
+    let output_name = job.output_model_id().unwrap().to_string();
     job.wait().await.unwrap();
     worker
         .stop_and_join()

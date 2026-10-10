@@ -23,6 +23,8 @@ from bisect import bisect_left
 from itertools import accumulate
 from typing import List, Optional, Sequence, Tuple
 
+from .errors import InvalidArgument
+
 # Cormack's default `k_rrf` (SIGIR 2009). Robust across [40, 80]; damps the
 # contribution of deep ranks so a row's top-of-list appearances dominate. Kept
 # identical to the engine's `query::DEFAULT_K_RRF`.
@@ -32,7 +34,7 @@ DEFAULT_K_RRF = 60
 def _validate_alpha(alpha: float) -> None:
     """Reject a miscoverage level outside the open interval ``(0, 1)``."""
     if not (alpha > 0.0 and alpha < 1.0):
-        raise ValueError(f"conformal alpha must lie in (0, 1), got {alpha}")
+        raise InvalidArgument(f"conformal alpha must lie in (0, 1), got {alpha}")
 
 
 def finite_sample_quantile(scores: Sequence[float], alpha: float) -> float:
@@ -49,9 +51,9 @@ def finite_sample_quantile(scores: Sequence[float], alpha: float) -> float:
     """
     _validate_alpha(alpha)
     if not scores:
-        raise ValueError("conformal calibration requires at least one score")
+        raise InvalidArgument("conformal calibration requires at least one score")
     if any(math.isnan(s) for s in scores):
-        raise ValueError("conformal calibration scores must be finite")
+        raise InvalidArgument("conformal calibration scores must be finite")
     n = len(scores)
     # rank = ⌈(n+1)(1-alpha)⌉, a 1-based order statistic index.
     rank = math.ceil((n + 1) * (1.0 - alpha))
@@ -65,7 +67,7 @@ def finite_sample_quantile(scores: Sequence[float], alpha: float) -> float:
 def _validate_weights(weights: Sequence[float]) -> None:
     """Likelihood ratios must each be finite and non-negative."""
     if any(w < 0.0 or not math.isfinite(w) for w in weights):
-        raise ValueError(
+        raise InvalidArgument(
             "weighted conformal weights must be finite and non-negative"
         )
 
@@ -77,9 +79,9 @@ class _WeightedScores:
 
     def __init__(self, scores: Sequence[float], weights: Sequence[float]) -> None:
         if not scores:
-            raise ValueError("conformal calibration requires at least one score")
+            raise InvalidArgument("conformal calibration requires at least one score")
         if any(math.isnan(s) for s in scores):
-            raise ValueError("conformal calibration scores must be finite")
+            raise InvalidArgument("conformal calibration scores must be finite")
         _validate_weights(weights)
         pairs = sorted(zip(scores, weights), key=lambda pair: pair[0])
         self._sorted = [score for score, _ in pairs]
@@ -92,7 +94,7 @@ class _WeightedScores:
         _validate_weights([test_weight])
         total = self._cumulative[-1] + test_weight
         if total <= 0.0:
-            raise ValueError("weighted conformal requires a positive total weight")
+            raise InvalidArgument("weighted conformal requires a positive total weight")
         reached = bisect_left(self._cumulative, (1.0 - alpha) * total)
         return self._sorted[reached] if reached < len(self._sorted) else math.inf
 
@@ -134,7 +136,7 @@ def _thresholds(
         _validate_alpha(alpha)
         calibration = _WeightedScores(cal_scores, weights)
         return [calibration.threshold(w, alpha) for w in test_weights]
-    raise ValueError(
+    raise InvalidArgument(
         "conformal takes `groups` with `test_groups`, or `weights` with "
         "`test_weights`, and not both"
     )
@@ -142,14 +144,14 @@ def _thresholds(
 
 def _one_per_row(what: str, given: int, rows: int) -> None:
     if given != rows:
-        raise ValueError(
+        raise InvalidArgument(
             f"conformal needs one {what} per calibration row: {given} for {rows} rows"
         )
 
 
 def _one_per_test_row(given: int, rows: int) -> None:
     if given != rows:
-        raise ValueError(
+        raise InvalidArgument(
             f"conformal needs one entry per test row: {given} for {rows} rows"
         )
 
@@ -159,7 +161,7 @@ def score_family(score: Optional[str]) -> str:
     ``"aps"``)."""
     family = (score or "aps").lower()
     if family not in ("lac", "aps", "raps"):
-        raise ValueError(
+        raise InvalidArgument(
             f"unknown classification conformal score '{score}', "
             "expected 'lac', 'aps', or 'raps'"
         )
@@ -201,11 +203,11 @@ def _validate_probabilities(probs: Sequence[float]) -> None:
     corrupt the rank.
     """
     if not probs:
-        raise ValueError(
+        raise InvalidArgument(
             "classification conformal requires at least one class probability"
         )
     if any(math.isnan(p) for p in probs):
-        raise ValueError("classification conformal probabilities must be finite")
+        raise InvalidArgument("classification conformal probabilities must be finite")
 
 
 def _true_label_score(
@@ -214,7 +216,7 @@ def _true_label_score(
     """The nonconformity of one calibration row evaluated at its true class."""
     _validate_probabilities(probs)
     if label >= len(probs) or label < 0:
-        raise ValueError(
+        raise InvalidArgument(
             f"true label {label} out of range for {len(probs)} classes"
         )
     if score == "lac":
@@ -293,12 +295,12 @@ def conformalize(
     family = score_family(score)
     reg = raps_params if raps_params is not None else (0.0, 1)
     if len(calibration) != len(true_labels):
-        raise ValueError(
+        raise InvalidArgument(
             f"classification conformal: {len(calibration)} probability rows "
             f"but {len(true_labels)} labels"
         )
     if not calibration:
-        raise ValueError(
+        raise InvalidArgument(
             "classification conformal requires at least one calibration row"
         )
     cal_scores = [
@@ -335,12 +337,12 @@ def conformalize_interval(
     Returns one ``(lower, upper)`` tuple per test row.
     """
     if len(predictions) != len(observed):
-        raise ValueError(
+        raise InvalidArgument(
             f"absolute-residual conformal: {len(predictions)} predictions "
             f"but {len(observed)} observations"
         )
     if not predictions:
-        raise ValueError(
+        raise InvalidArgument(
             "regression conformal requires at least one calibration row"
         )
     _ensure_finite(predictions, "predictions")
@@ -379,16 +381,16 @@ def conformalize_cqr(
     Returns one ``(lower, upper)`` tuple per test row.
     """
     if len(lower) != len(observed) or len(upper) != len(observed):
-        raise ValueError(
+        raise InvalidArgument(
             f"CQR conformal: {len(lower)} lower / {len(upper)} upper quantiles "
             f"but {len(observed)} observations"
         )
     if not observed:
-        raise ValueError(
+        raise InvalidArgument(
             "regression conformal requires at least one calibration row"
         )
     if len(test_lower) != len(test_upper):
-        raise ValueError(
+        raise InvalidArgument(
             "cqr conformal: 'test_lower' and 'test_upper' must have equal length"
         )
     _ensure_finite(lower, "lower quantiles")
@@ -445,4 +447,4 @@ def rrf_fuse(
 def _ensure_finite(values: Sequence[float], what: str) -> None:
     """Reject non-finite values in a regression input slice."""
     if any(not math.isfinite(v) for v in values):
-        raise ValueError(f"regression conformal {what} must be finite")
+        raise InvalidArgument(f"regression conformal {what} must be finite")

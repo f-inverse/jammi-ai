@@ -13,7 +13,7 @@ the transport itself stay with the consumer that owns the channel.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
 
 import pyarrow as pa
 
@@ -26,6 +26,20 @@ from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
 from ._generated.jammi.v1 import trigger_pb2
 from .errors import BackendError, InvalidArgument
+
+_V = TypeVar("_V")
+
+
+def _choice(argument: str, vocabulary: Mapping[str, _V], value: str) -> _V:
+    """`value`'s entry in the closed `vocabulary` an `argument` takes; any other
+    spelling is the caller's bad argument, refused with every accepted one."""
+    try:
+        return vocabulary[value]
+    except KeyError:
+        raise InvalidArgument(
+            f"{argument} must be one of {sorted(vocabulary)} (got {value!r})"
+        ) from None
+
 
 # snake-case modality string → the `Modality` enum the wire carries. One map,
 # shared by every `modality=` parameter; the unified form (no per-modality
@@ -109,12 +123,7 @@ def _modality_value(modality: Optional[str]) -> int:
     """Resolve a `modality=` argument to its wire enum, defaulting to text."""
     if modality is None:
         return embedding_pb2.Modality.TEXT
-    try:
-        return _MODALITY[modality]
-    except KeyError:
-        raise ValueError(
-            f"modality must be 'text', 'image', or 'audio' (got {modality!r})"
-        ) from None
+    return _choice("modality", _MODALITY, modality)
 
 
 def _cache_policy_value(cache: Optional[str]) -> int:
@@ -132,7 +141,7 @@ def _cache_policy_value(cache: Optional[str]) -> int:
         return inference_pb2.CachePolicy.CACHE_POLICY_UNSPECIFIED
     if cache == "use":
         return inference_pb2.CachePolicy.CACHE_POLICY_USE
-    raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
+    raise InvalidArgument(f"cache must be 'use' or 'bypass' (got {cache!r})")
 
 
 def _local_source_url(url: str) -> str:
@@ -277,13 +286,7 @@ def _channel_columns_message(
     """
     out: List[catalog_pb2.ChannelColumn] = []
     for name, dtype in columns:
-        try:
-            data_type = _CHANNEL_COLUMN_TYPE[dtype]
-        except KeyError:
-            raise ValueError(
-                f"channel column dtype must be one of "
-                f"{sorted(_CHANNEL_COLUMN_TYPE)} (got {dtype!r})"
-            ) from None
+        data_type = _choice("channel column dtype", _CHANNEL_COLUMN_TYPE, dtype)
         out.append(catalog_pb2.ChannelColumn(name=name, data_type=data_type))
     return out
 
@@ -327,7 +330,7 @@ def _embedding_loss_message(
                 temperature=mnrl_temperature if mnrl_temperature is not None else 20.0
             )
         )
-    raise ValueError(
+    raise InvalidArgument(
         f"Unknown embedding_loss {embedding_loss!r}. Use 'cosent', 'angle', "
         f"'cosine_mse', 'triplet', or 'mnrl'."
     )
@@ -371,7 +374,7 @@ def _regression_loss_message(
         return training_pb2.RegressionLoss(
             pinball=training_pb2.RegressionLoss.Pinball()
         )
-    raise ValueError(
+    raise InvalidArgument(
         f"Unknown regression_loss {regression_loss!r}. Use 'gaussian_nll', "
         f"'beta_nll', 'crps', or 'pinball'."
     )
@@ -388,10 +391,10 @@ def _set_encoder(
     given leaves the arm unset, which the engine reads as an adapted encoder
     at its default sites."""
     if encoder not in (None, "adapted", "frozen"):
-        raise ValueError(f"Unknown encoder {encoder!r}. Use 'adapted' or 'frozen'.")
+        raise InvalidArgument(f"Unknown encoder {encoder!r}. Use 'adapted' or 'frozen'.")
     if encoder == "frozen":
         if target_modules is not None:
-            raise ValueError(
+            raise InvalidArgument(
                 "target_modules names the sites of an adapted encoder; a frozen "
                 "encoder trains none"
             )
@@ -473,7 +476,7 @@ def build_fine_tune_config(
     if early_stopping_patience is not None:
         config.early_stopping_patience = early_stopping_patience
     if warmup_steps is not None and warmup_fraction is not None:
-        raise ValueError("warmup is a step count or a fraction of the run, not both")
+        raise InvalidArgument("warmup is a step count or a fraction of the run, not both")
     if warmup_steps is not None:
         config.warmup_steps = warmup_steps
     if warmup_fraction is not None:
@@ -482,21 +485,9 @@ def build_fine_tune_config(
         config.gradient_accumulation_steps = gradient_accumulation_steps
     _set_encoder(config, encoder, target_modules)
     if early_stopping_metric is not None:
-        try:
-            config.early_stopping_metric = _EARLY_STOPPING_METRIC[early_stopping_metric]
-        except KeyError:
-            raise ValueError(
-                f"Unknown early_stopping_metric {early_stopping_metric!r}. "
-                f"Use 'val_loss' or 'train_loss'."
-            ) from None
+        config.early_stopping_metric = _choice("early_stopping_metric", _EARLY_STOPPING_METRIC, early_stopping_metric)
     if backbone_dtype is not None:
-        try:
-            config.backbone_dtype = _BACKBONE_DTYPE[backbone_dtype]
-        except KeyError:
-            raise ValueError(
-                f"Unknown backbone_dtype {backbone_dtype!r}. Use 'f32', "
-                f"'bf16', or 'f16'."
-            ) from None
+        config.backbone_dtype = _choice("backbone_dtype", _BACKBONE_DTYPE, backbone_dtype)
     if weight_decay is not None:
         config.weight_decay = weight_decay
     if max_grad_norm is not None:
@@ -645,13 +636,8 @@ def build_fine_tune_request(
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _cache_policy_value(cache)
-    try:
-        wire_method = _FINE_TUNE_METHOD[method]
-    except KeyError:
-        raise ValueError(
-            f"method must be one of {sorted(_FINE_TUNE_METHOD)} (got {method!r})"
-        ) from None
-    wire_task = _MODEL_TASK[task] if task is not None else _MODEL_TASK["text_embedding"]
+    wire_method = _choice("method", _FINE_TUNE_METHOD, method)
+    wire_task = _choice("task", _MODEL_TASK, task if task is not None else "text_embedding")
 
     config = build_fine_tune_config(
         lora_rank=lora_rank,
@@ -773,13 +759,7 @@ def build_fine_tune_graph_request(
     """
     wire_world_size = _wire_world_size(world_size)
     wire_cache = _cache_policy_value(cache)
-    try:
-        provenance = _EDGE_PROVENANCE[edge_provenance]
-    except KeyError:
-        raise ValueError(
-            f"edge_provenance must be 'declared' or 'similarity' "
-            f"(got {edge_provenance!r})"
-        ) from None
+    provenance = _choice("edge_provenance", _EDGE_PROVENANCE, edge_provenance)
 
     # The graph defaults match the engine's `GraphSampleConfig::default()`;
     # an omitted knob keeps the engine default.
@@ -799,7 +779,7 @@ def build_fine_tune_graph_request(
     # training knobs are `fine_tune`'s own, through the one config builder;
     # the graph sampler's `sample_seed` and the LoRA `seed` stay distinct.
     if embedding_loss not in (None, "mnrl", "triplet"):
-        raise ValueError(
+        raise InvalidArgument(
             f"Unknown embedding_loss {embedding_loss!r} for graph fine-tune. "
             f"Use 'mnrl' (default) or 'triplet'."
         )
@@ -896,13 +876,7 @@ def build_context_predictor_request(
     names the table the contexts are read from (the source's default when
     unset); the resolved table is recorded with the trained predictor.
     """
-    try:
-        wire_architecture = _CONTEXT_ARCHITECTURE[architecture]
-    except KeyError:
-        raise ValueError(
-            f"Unknown architecture {architecture!r}. Use 'cnp', 'attncnp', "
-            f"or 'tnp'."
-        ) from None
+    wire_architecture = _choice("architecture", _CONTEXT_ARCHITECTURE, architecture)
 
     if output == "gaussian":
         if objective == "crps":
@@ -924,21 +898,21 @@ def build_context_predictor_request(
                 )
             )
         else:
-            raise ValueError(
+            raise InvalidArgument(
                 f"Unknown gaussian objective {objective!r}. Use 'crps', 'nll', "
                 f"or 'betanll'."
             )
         head = training_pb2.PredictiveHead(gaussian=gaussian)
     elif output == "quantile":
         if levels is None:
-            raise ValueError(
+            raise InvalidArgument(
                 "output='quantile' requires `levels` (ascending levels in (0, 1))"
             )
         head = training_pb2.PredictiveHead(
             quantile=training_pb2.PredictiveHead.Quantile(levels=list(levels))
         )
     else:
-        raise ValueError(
+        raise InvalidArgument(
             f"Unknown output {output!r}. Use 'gaussian' or 'quantile'."
         )
 
@@ -998,7 +972,7 @@ def build_infer_request(
     return inference_pb2.InferRequest(
         source_id=source,
         model_id=model,
-        task=_MODEL_TASK[task],
+        task=_choice("task", _MODEL_TASK, task),
         columns=list(columns),
         key_column=key,
         cache=_cache_policy_value(cache),
@@ -1082,37 +1056,20 @@ def build_propagate_embeddings_request(
     )
     if hop_weights is not None:
         if output != "weighted_sum":
-            raise ValueError("hop_weights is only read under output='weighted_sum'")
+            raise InvalidArgument("hop_weights is only read under output='weighted_sum'")
         request.hop_weights.extend(hop_weights)
     if embedding_table is not None:
         request.embedding_table = embedding_table
     if direction is not None:
-        try:
-            request.direction = _EDGE_DIRECTION[direction]
-        except KeyError:
-            raise ValueError(
-                f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
-            ) from None
+        request.direction = _choice("direction", _EDGE_DIRECTION, direction)
     if hops is not None:
         request.hops = hops
     if weighting is not None:
-        try:
-            request.weighting = _PROPAGATION_WEIGHTING[weighting]
-        except KeyError:
-            raise ValueError(
-                "weighting must be 'degree_normalized', 'uniform', or "
-                f"'edge_similarity' (got {weighting!r})"
-            ) from None
+        request.weighting = _choice("weighting", _PROPAGATION_WEIGHTING, weighting)
     if alpha is not None:
         request.alpha = alpha
     if output is not None:
-        try:
-            request.output = _PROPAGATION_OUTPUT[output]
-        except KeyError:
-            raise ValueError(
-                "output must be 'final', 'jumping_knowledge', or 'weighted_sum' "
-                f"(got {output!r})"
-            ) from None
+        request.output = _choice("output", _PROPAGATION_OUTPUT, output)
     return request
 
 
@@ -1153,12 +1110,12 @@ def _require_one_graph(
     """A graph verb names its edges exactly once: an engine-built graph table or
     a registered edge source."""
     if edge_graph_table is not None and edge_source is not None:
-        raise ValueError(
+        raise InvalidArgument(
             "pass exactly one of edge_graph_table (S9 graph) or edge_source "
             "(registered edges), not both"
         )
     if edge_graph_table is None and edge_source is None:
-        raise ValueError(f"{verb} requires a graph: edge_graph_table or edge_source")
+        raise InvalidArgument(f"{verb} requires a graph: edge_graph_table or edge_source")
 
 
 def _graph_fine_tune_edges(
@@ -1223,20 +1180,9 @@ def build_generate_structure_embeddings_request(
     if key_column is not None:
         request.key_column = key_column
     if direction is not None:
-        try:
-            request.direction = _EDGE_DIRECTION[direction]
-        except KeyError:
-            raise ValueError(
-                f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
-            ) from None
+        request.direction = _choice("direction", _EDGE_DIRECTION, direction)
     if weighting is not None:
-        try:
-            request.weighting = _PROPAGATION_WEIGHTING[weighting]
-        except KeyError:
-            raise ValueError(
-                "weighting must be 'degree_normalized', 'uniform', or "
-                f"'edge_similarity' (got {weighting!r})"
-            ) from None
+        request.weighting = _choice("weighting", _PROPAGATION_WEIGHTING, weighting)
     if dimensions is not None:
         request.dimensions = dimensions
     if weights is not None:
@@ -1277,7 +1223,7 @@ def build_asof_join_request(
     binding submits in-process.
     """
     if tolerance_duration_micros is not None and tolerance_steps is not None:
-        raise ValueError(
+        raise InvalidArgument(
             "pass at most one tolerance unit: tolerance_duration_micros or "
             "tolerance_steps, not both"
         )
@@ -1289,19 +1235,9 @@ def build_asof_join_request(
         project=list(project) if project is not None else [],
     )
     if direction is not None:
-        try:
-            request.direction = _ASOF_DIRECTION[direction]
-        except KeyError:
-            raise ValueError(
-                f"direction must be 'backward', 'forward', or 'nearest' (got {direction!r})"
-            ) from None
+        request.direction = _choice("direction", _ASOF_DIRECTION, direction)
     if boundary is not None:
-        try:
-            request.boundary = _ASOF_BOUNDARY[boundary]
-        except KeyError:
-            raise ValueError(
-                f"boundary must be 'inclusive' or 'exclusive' (got {boundary!r})"
-            ) from None
+        request.boundary = _choice("boundary", _ASOF_BOUNDARY, boundary)
     if tolerance_duration_micros is not None:
         request.tolerance.duration_micros = tolerance_duration_micros
     elif tolerance_steps is not None:
@@ -1349,12 +1285,7 @@ def build_recompute_request(
     """
     request = pipeline_pb2.RecomputeRequest(table=table)
     if cascade is not None:
-        try:
-            request.cascade = _CASCADE[cascade]
-        except KeyError:
-            raise ValueError(
-                f"cascade must be 'report_only' or 'downstream' (got {cascade!r})"
-            ) from None
+        request.cascade = _choice("cascade", _CASCADE, cascade)
     return request
 
 
@@ -1416,12 +1347,7 @@ def build_assemble_context_request(
         hybrid=hybrid,
     )
     if aggregator is not None:
-        try:
-            request.aggregator = _SET_AGGREGATOR[aggregator]
-        except KeyError:
-            raise ValueError(
-                f"aggregator must be 'mean', 'sum', or 'max' (got {aggregator!r})"
-            ) from None
+        request.aggregator = _choice("aggregator", _SET_AGGREGATOR, aggregator)
     if exclude_key is not None:
         request.exclude_key = exclude_key
     if split is not None:
@@ -1441,13 +1367,7 @@ def build_assemble_context_request(
         if edge_fanout is not None:
             gather.fanout = edge_fanout
         if edge_direction is not None:
-            try:
-                gather.direction = _EDGE_DIRECTION[edge_direction]
-            except KeyError:
-                raise ValueError(
-                    f"edge_direction must be 'out', 'in', or 'undirected' "
-                    f"(got {edge_direction!r})"
-                ) from None
+            gather.direction = _choice("edge_direction", _EDGE_DIRECTION, edge_direction)
         if edge_types is not None:
             gather.edge_types.extend(edge_types)
         if min_weight is not None:
@@ -1583,7 +1503,7 @@ def build_search_request(
     binding submits in-process.
     """
     if (query is None) == (row_key is None):
-        raise ValueError("search ranks by exactly one of query (a vector) or row_key")
+        raise InvalidArgument("search ranks by exactly one of query (a vector) or row_key")
     request = embedding_pb2.SearchRequest(source_id=source, k=k, select=list(select or []))
     _set_search_method(request.method, oversample=oversample, exact=exact)
     if query is not None:
@@ -1605,7 +1525,7 @@ def _set_search_method(
     approximate at the table's own oversample. `exact` scores every vector and
     takes no `oversample`."""
     if exact and oversample is not None:
-        raise ValueError("an exact ranking scores every vector; it takes no oversample")
+        raise InvalidArgument("an exact ranking scores every vector; it takes no oversample")
     if oversample is not None:
         method.oversample = oversample
     if exact:
@@ -1632,12 +1552,7 @@ def build_lexical_index_request(
     stemming) or ``"raw"`` (lowercase, no stemming). The same request the
     embed binding submits in-process.
     """
-    try:
-        wire_analyzer = _LEXICAL_ANALYZER[analyzer]
-    except KeyError:
-        raise ValueError(
-            f"analyzer must be one of {sorted(_LEXICAL_ANALYZER)} (got {analyzer!r})"
-        ) from None
+    wire_analyzer = _choice("analyzer", _LEXICAL_ANALYZER, analyzer)
     return pipeline_pb2.BuildLexicalIndexRequest(
         source_id=source, columns=list(columns), key_column=key, analyzer=wire_analyzer
     )
@@ -1854,12 +1769,7 @@ def build_eval_inference_request(
     labels by full catalog path or bare name, with `label_column` naming the
     gold-label column. The same request the embed binding submits in-process.
     """
-    try:
-        task_value = _EVAL_TASK[task]
-    except KeyError:
-        raise ValueError(
-            f"task must be 'classification' or 'ner' (got {task!r})"
-        ) from None
+    task_value = _choice("task", _EVAL_TASK, task)
     return eval_pb2.EvalInferenceRequest(
         model_id=model,
         source_id=source,
@@ -1916,12 +1826,7 @@ def build_eval_calibration_request(
     record's per-record scores. The same request the embed binding submits
     in-process.
     """
-    try:
-        shape_value = _CALIBRATION_SHAPE[shape]
-    except KeyError:
-        raise ValueError(
-            f"shape must be 'gaussian' or 'sample' (got {shape!r})"
-        ) from None
+    shape_value = _choice("shape", _CALIBRATION_SHAPE, shape)
     request = eval_pb2.EvalCalibrationRequest(
         source_id=source,
         ground_truth=ground_truth,
@@ -1957,12 +1862,7 @@ def build_refresh_embeddings_request(
     """
     request = embedding_pb2.RefreshEmbeddingsRequest(table=table)
     if deletes is not None:
-        try:
-            request.deletes = _DELETE_POLICY[deletes]
-        except KeyError:
-            raise ValueError(
-                f"deletes must be 'tombstone' or 'retain' (got {deletes!r})"
-            ) from None
+        request.deletes = _choice("deletes", _DELETE_POLICY, deletes)
     return request
 
 
@@ -2022,7 +1922,7 @@ def build_subscribe_request(
     """Assemble the `SubscribeRequest` a collect drives. A collect that follows
     the live tail needs `max_batches`: the tail never ends on its own."""
     if not replay_only and max_batches is None:
-        raise ValueError(
+        raise InvalidArgument(
             "a collect that follows the live tail (replay_only=False) needs "
             "max_batches: the tail never ends on its own"
         )

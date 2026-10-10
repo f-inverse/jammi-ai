@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Union
 from urllib.parse import urlparse
 
+from .errors import InvalidArgument
+
 
 @dataclass(frozen=True)
 class LocalTarget:
@@ -87,15 +89,15 @@ def parse_target(target: Union[str, Target]) -> Target:
         if parsed.netloc and parsed.path:
             artifact_dir = parsed.netloc + parsed.path
         if not artifact_dir:
-            raise ValueError(f"file:// target carries no artifact directory: {target!r}")
+            raise InvalidArgument(f"file:// target carries no artifact directory: {target!r}")
         return LocalTarget(artifact_dir=artifact_dir)
 
     if scheme in _REMOTE_SCHEMES:
         if not parsed.netloc:
-            raise ValueError(f"{scheme}:// target carries no host: {target!r}")
+            raise InvalidArgument(f"{scheme}:// target carries no host: {target!r}")
         return RemoteTarget(endpoint=parsed.netloc, tls=_REMOTE_SCHEMES[scheme])
 
-    raise ValueError(
+    raise InvalidArgument(
         f"unrecognised target scheme {scheme!r} in {target!r}: "
         "use file:// (local), or http(s):// / grpc(s):// (remote)"
     )

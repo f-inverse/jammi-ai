@@ -55,7 +55,10 @@ def evaluate(db) -> dict:
     propagated = keystone.propagate(db, arxiv, raw)
     truth = keystone.subject_relevance(db, arxiv)
     era = {pid: name for name, ids in arxiv.split.items() for pid in ids}
-    queries = db.sql(f"SELECT DISTINCT query_id FROM {truth}").column(0).to_pylist()
+    relevant = db.sql(
+        f"SELECT query_id, COUNT(*) AS relevant FROM {truth} GROUP BY query_id"
+    ).to_pylist()
+    queries = [row["query_id"] for row in relevant]
 
     retrieval = db.eval_embeddings(
         source=arxiv.papers, ground_truth=truth, embedding_table=raw, k=10,
@@ -96,6 +99,7 @@ def evaluate(db) -> dict:
         a_channels = db.list_channels()
 
     return {
+        "relevant": relevant,
         "retrieval": retrieval, "per_query": per_query, "compared": compared,
         "classification": classification, "ner": ner,
         "channels": {"a": a_channels, "b_before": seen_by_b, "b": b_channels,
@@ -122,7 +126,10 @@ print(f"evaluated in process and at {server.endpoint}")
 
 ## The reports
 
-Retrieval quality of the raw embeddings, overall and by cohort. The engine
+Retrieval quality of the raw embeddings, overall and by cohort. Each query's
+relevant set is every paper of its subject, far more than the ten a search
+returns, so recall\@10 has a ceiling: a perfect ranking recalls at most ten of
+a query's relevant papers. Precision\@10 is the figure to read. The engine
 never interprets a cohort tag; it carries each query's tags on its per-query
 record, so a slice is a group-by over those records. The ground truth asks its first
 200 papers by id, so which eras those queries fall in is a property of the
@@ -133,6 +140,9 @@ from collections import defaultdict
 
 agg = local["retrieval"]["aggregate"]
 print("  ".join(f"{m} {agg[m]:.3f}" for m in ("precision_at_k", "recall_at_k", "mrr", "ndcg")))
+sizes = [row["relevant"] for row in local["relevant"]]
+ceiling = sum(min(10, n) / n for n in sizes) / len(sizes)
+print(f"relevant papers per query: {min(sizes)}–{max(sizes)}; recall@10 ceiling {ceiling:.3f}")
 by_era = defaultdict(list)
 for record in local["retrieval"]["per_query"]:
     by_era[record["cohorts"]["era"]].append(record["metrics"]["precision"])
@@ -170,6 +180,8 @@ baseline = local["compared"]["per_table"][0]["embedding_eval"]["aggregate"]["pre
 propagated = treated["embedding_eval"]["aggregate"]["precision_at_k"]
 claim("the report is persisted one row per query",
       len(local["per_query"]) == len(local["retrieval"]["per_query"]))
+claim("recall@10 stays under the ceiling the relevant sets set",
+      agg["recall_at_k"] <= ceiling + 1e-9, f"{agg['recall_at_k']:.3f} ≤ {ceiling:.3f}")
 claim("the comparison's delta is the propagated table's precision@10 less the raw table's",
       abs(delta["absolute"] - (propagated - baseline)) < 1e-9,
       f"{propagated:.3f} − {baseline:.3f}")

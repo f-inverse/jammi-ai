@@ -353,5 +353,4 @@ db.close()
 > al. 2023). The textbook remedy is
 > weighted / stratified conformal (Tibshirani et al. 2019; NAPS, Clarkson et al.
 > 2023; CF-GNN, Huang et al. 2023) — but it repairs only a shift the
-> nonconformity score can *see*. This is the tier with **no monograph and no
-> Neptune analogue** — the moat.
+> nonconformity score can *see*.

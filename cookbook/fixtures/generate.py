@@ -32,7 +32,7 @@ Produces:
 Re-run with `python cookbook/fixtures/generate.py` whenever the schema or row
 shape needs to change. Output is fully deterministic — same content every run.
 
-The corpus is synthetic public-domain text (no tenant data, no scraped content)
+The corpus is synthetic public-domain text (no scraped content)
 and the row count is intentionally small so the entire cookbook fixtures tree
 stays under 5 MB. The image corpus is rendered programmatically (no real patent
 imagery — licensing) as simple geometric shapes.
@@ -514,7 +514,7 @@ def write_image_corpus() -> None:
 # band-limited noise. Within a family the four members differ by a small pitch
 # detune / duration so the corpus is not degenerate, but members of the same
 # family are spectrally closer to each other than to other families. Every
-# sample is synthesised here — no recorded audio (licensing), no tenant data.
+# sample is synthesised here — no recorded audio (licensing).
 #
 # The held-out query set is one extra clip per family (a fifth member with a
 # distinct detune). `tiny_audio_golden.json` maps each query to its family's

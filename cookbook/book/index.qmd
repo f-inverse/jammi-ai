@@ -50,7 +50,7 @@ capability deep and measure it.
 Every chapter shows the numbers it just measured and checks the claims it teaches
 against them: an ordering, a bound or an equality the engine guarantees, so a claim
 holds on your machine as it does on ours, and a chapter whose claim fails stops
-and names it. Every chapter runs on every change to the engine it documents, and
-every notebook is also run nightly exactly as a reader runs it — installed from
-PyPI in a fresh runtime. The [API reference](chapters/api-reference.qmd) lists every
+and names it. Every chapter runs, with the real models it teaches with, on a GPU
+before every release, and every notebook is also run nightly exactly as a reader
+runs it — installed from PyPI in a fresh runtime. The [API reference](chapters/api-reference.qmd) lists every
 verb the book calls.

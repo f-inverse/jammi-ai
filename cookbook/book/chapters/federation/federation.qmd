@@ -51,7 +51,7 @@ def rows(table) -> str:
 ## Three stores
 
 The documents go into Postgres: the twenty rows of the book's `tiny_corpus`, each
-naming the organisation that filed it by `assignee_id`.
+naming the organisation that wrote it by `assignee_id`.
 
 ```{python}
 corpus = pq.read_table(fixtures.path("tiny_corpus.parquet")).to_pylist()
@@ -172,7 +172,7 @@ claim("searching the federated table ranks exactly as searching the same rows fr
       ranked == file_ranked)
 ```
 
-The hits are keys into the database, so the other stores describe them — who filed
+The hits are keys into the database, so the other stores describe them — who wrote
 each neighbour, and what it is about:
 
 ```{python}

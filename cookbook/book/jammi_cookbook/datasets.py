@@ -1,7 +1,7 @@
 """The book's two graph datasets, at either scale — Air Routes and ogbn-arxiv.
 
-* **Air Routes** (Neptune's own teaching dataset; permissive, from
-  ``krlawrence/graph``) — 3504 airports, the airport↔airport ``route`` graph
+* **Air Routes** (Kelvin R. Lawrence's sample graph from *Practical
+  Gremlin*; permissive, from ``krlawrence/graph``) — 3504 airports, the airport↔airport ``route`` graph
   and the continent→country→airport ``contains`` hierarchy. Small enough to run
   whole, so both scales read the committed ``air_routes`` fixture; the scales
   differ only in the encoder.

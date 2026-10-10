@@ -12,7 +12,7 @@ direction nearly every representation projects onto
 binary sidecar is built over [@malkov2020hnsw] and the recall-vs-memory trade
 quantization buys [@johnson2021billion] · **Checked:** measurement (the anisotropy diagnosis
 itself — `‖μ‖/E‖v‖` and the collapsed-dimension count — plain-vs-asymmetric no-rescore
-recall@1/@10 against the engine's exact search, and the rescore companion's identity to the
+recall\@1 and recall\@10 against the engine's exact search, and the rescore companion's identity to the
 normalized input; every number measured live).
 
 `binary-precision.qmd` measured `storage_precision = "binary"`'s retrieve→rescore trade —

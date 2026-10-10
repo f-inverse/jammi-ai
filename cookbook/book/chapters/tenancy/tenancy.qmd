@@ -31,9 +31,9 @@ engine validates the form, never who the tenant is.
 
 ## The setup — two tenants over one corpus
 
-We reuse `jammi_cookbook.rails` verbatim — `tenant` (the bind-in-place/restore context
-manager), `assert_listing_isolated`, and `assert_rows_isolated`, the corrected helpers,
-not a re-implementation. `set_tenant` binds the scope to the connection *in place*; the
+The book's tenancy helpers come from `jammi_cookbook.rails`: `tenant` (the
+bind-in-place/restore context manager), `assert_listing_isolated`, and
+`assert_rows_isolated`. `set_tenant` binds the scope to the connection *in place*; the
 bound scope drives both isolation layers (`tenant_scope` is the block-scoped form the
 `tenant` helper delegates to).
 
@@ -144,7 +144,7 @@ print(f"tenant A reads B's discriminator-less source: {caveat_visible} of {len(b
 print("the engine does not authenticate — access-gating lives above it")
 ```
 
-This is the claim that is easy to overstate and that this chapter must not re-break: a
+This is the claim that is easy to overstate: a
 *separate per-tenant source* is hidden from the **listing** (Property 1), but its rows are
 **not** hidden from a direct named read. Data isolation is the discriminator column
 (Property 2), not source separation.

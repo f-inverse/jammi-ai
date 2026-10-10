@@ -117,11 +117,6 @@ propagation buys depends on what the graph knows that the encoder does not.
 The same low-pass filter runs on **Air Routes**: the airport embeddings,
 propagated over the declared `route` graph (the flight network), undirected.
 
-> **Neptune-contrast.** Neptune Analytics ships `pageRank`/`degree`/`wcc` as
-> `CALL`s over the Air Routes graph; here, propagation-as-low-pass-filter is a
-> Jammi recipe — the *same* operation over the *same* route graph, expressed as
-> substrate computation.
-
 ```{python}
 air = datasets.air_routes(db)
 air_embeddings = db.generate_embeddings(
@@ -148,12 +143,9 @@ benchmark; but the raw→propagated delta over it is a legitimate measured numbe
 
 The evaluation ranks **exactly** (`exact=True`): every vector is scored, as
 `search(exact=True)` scores them, rather than searched through the table's ANN
-index. That matters here. Airport descriptions are short, and at `small` scale the
-tiny encoder knows few of their words, so many airports embed to the same vector,
-and about half the queries have a tie at the tenth place. Among identical
-vectors an exact ranking orders by row key, the same way on every machine; an
-approximate index returns whichever of them its graph walk reaches first, which
-differs from machine to machine, and so would the measured precision.
+index, so the delta below is the propagation's alone and not mixed with what an
+approximate index gives up (the [ANN chapter](../ann-recall/ann-recall.qmd)
+measures that on its own).
 
 ```{python}
 airports = db.sql(

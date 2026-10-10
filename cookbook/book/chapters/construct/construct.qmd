@@ -143,14 +143,14 @@ print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")
 # Air Routes — the on-ramp
 
 The keystone above runs on ogbn-arxiv. The book *opens*, though, on **Air
-Routes** — Neptune's own teaching dataset: 3,504 airports, a declared `route`
+Routes** — Kelvin R. Lawrence's sample graph from *Practical Gremlin*: 3,504
+airports, a declared `route`
 graph (airport↔airport) and a `contains` hierarchy (continent→airport). The
 same recipe runs here unchanged.
 
-> **Neptune-contrast.** Neptune *loads* a given graph and runs
-> `CALL neptune.algo.*` over it. Jammi *constructs* the similarity graph from
-> the airport text **and** *registers* the declared `route`/`contains` graphs
-> beside it — the two-graphs contrast in miniature.
+The engine *constructs* the similarity graph from the airport text **and**
+*registers* the declared `route`/`contains` graphs beside it — the two-graphs
+contrast in miniature.
 
 ```{python}
 air = datasets.air_routes(db)
@@ -328,11 +328,9 @@ claim("a discriminator-less source is globally readable: A reads every one of it
 db.close()
 ```
 
-> **Neptune-contrast.** Multi-tenant isolation on a property graph is a
-> deployment-and-governance concern Neptune leaves to IAM/VPC around the
-> database. Here, two layers are *substrate* properties: `set_tenant` scopes
-> catalog listing, and a `tenant_id` discriminator column row-filters a shared
-> source. But the engine does not authenticate — a discriminator-less source
-> any tenant can name is global by design, so cross-tenant data isolation is a
-> property you *opt into* (a discriminator column) or *gate above* (an
-> interceptor), not a blanket guarantee.
+Two isolation layers are properties of the engine itself: `set_tenant` scopes
+catalog listing, and a `tenant_id` discriminator column row-filters a shared
+source. But the engine does not authenticate — a discriminator-less source any
+tenant can name is global by design, so cross-tenant data isolation is a property
+you *opt into* (a discriminator column) or *gate above* (an interceptor), not a
+blanket guarantee.

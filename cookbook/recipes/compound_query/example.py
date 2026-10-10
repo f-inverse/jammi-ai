@@ -30,8 +30,9 @@ MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # %% [markdown]
 # ## A second source to join
 #
-# The corpus is 20 patents, each with an `assignee_id` from 101 to 110. A small
-# `assignees` table says who holds each patent and where.
+# The corpus is 20 paper abstracts, each with an `assignee_id` from 101 to 110,
+# the organisation that wrote it. A small `assignees` table says which
+# organisation that is, and where.
 
 # %%
 ASSIGNEES = [
@@ -57,11 +58,11 @@ assignees_url = assignees_path.as_uri()
 # %% [markdown]
 # ## Two statements
 #
-# The first enriches every patent with its assignee's company and country by a
+# The first enriches every paper with its organisation's name and country by a
 # join. The second runs the model inside the query:
 # `annotate(model, task, relation, key_column, content_column)` embeds every
-# patent, and the statement joins each vector back to its patent and its
-# assignee and keeps the US-held ones.
+# paper, and the statement joins each vector back to its paper and its
+# organisation and keeps the papers from US organisations.
 
 # %%
 ENRICHED = """
@@ -92,22 +93,22 @@ def compound(db) -> tuple[list[dict], list[dict]]:
 # %% [markdown]
 # ## Run them in process
 #
-# Every patent gains its assignee's company and country. The annotated
-# statement keeps exactly the US-held patents, each once, with a vector the
-# model computed from that patent's text.
+# Every paper gains its organisation's name and country. The annotated
+# statement keeps exactly the papers from US organisations, each once, with a
+# vector the model computed from that paper's text.
 
 # %%
 with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
     enriched, annotated = compound(db)
 
-print(f"enriched: {len(enriched)} patents, e.g. {enriched[0]}")
+print(f"enriched: {len(enriched)} papers, e.g. {enriched[0]}")
 assert len(enriched) == 20 and all(r["company_name"] for r in enriched)
 
 us_ids = [r["id"] for r in enriched if r["country"] == "US"]
-assert [r["id"] for r in annotated] == us_ids, "annotate kept every US patent once"
+assert [r["id"] for r in annotated] == us_ids, "annotate kept every US paper once"
 width = len(annotated[0]["vector"])
 assert width > 0 and all(len(r["vector"]) == width for r in annotated)
-print(f"annotated: {len(annotated)} US-held patents, {width}-dim vectors")
+print(f"annotated: {len(annotated)} papers from US organisations, {width}-dim vectors")
 for row in annotated[:3]:
     print(f"  {row['id']:>2}  {row['company_name']:<20}  {row['title']}")
 
@@ -116,14 +117,14 @@ for row in annotated[:3]:
 #
 # `vector_mean`, `vector_sum` and `vector_max` reduce a group of vectors
 # element by element, the way `avg`, `sum` and `max` reduce numbers. Grouping
-# the patents' vectors by category gives each category's centroid, the
+# the papers' vectors by category gives each category's centroid, the
 # direction its abstracts share; searching the corpus with a centroid finds
-# that category's patents. The sum is the count times the mean, and the
+# that category's papers. The sum is the count times the mean, and the
 # element-wise maximum is at least the mean in every element.
 
 # %%
 CENTROIDS = f"""
-    SELECT p.category, count(*) AS patents,
+    SELECT p.category, count(*) AS papers,
            vector_mean(ann.vector) AS centroid,
            vector_sum(ann.vector)  AS total,
            vector_max(ann.vector)  AS peak
@@ -140,11 +141,11 @@ with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
     db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
     for g in groups:
         centroid, total, peak = (np.asarray(g[c]) for c in ("centroid", "total", "peak"))
-        np.testing.assert_allclose(total, g["patents"] * centroid, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(total, g["papers"] * centroid, rtol=1e-4, atol=1e-5)
         assert np.all(peak >= centroid - 1e-6)
         hits = db.search("corpus", query=g["centroid"], k=3,
                          select=["id", "category", "title"]).to_pylist()
-        print(f"{g['category']:<12} ({g['patents']} patents) -> "
+        print(f"{g['category']:<12} ({g['papers']} papers) -> "
               f"{[(h['id'], h['category']) for h in hits]}")
         assert hits[0]["category"] == g["category"], (g["category"], hits)
 

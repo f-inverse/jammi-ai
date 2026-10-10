@@ -1,11 +1,7 @@
-# `jammi` API reference
-
 These are the `jammi` Python signatures the chapters call, **confirmed by
 introspecting the installed client** — `inspect.signature` resolved on a live
-`connect("file://…")` instance, the way a caller invokes a verb through the thin
-`Session` wrapper's composition (explicit methods on the wrapper, every other verb
-forwarded to the native handle via `__getattr__`) — not transcribed from a spec.
-Call them exactly as written. `scripts/check_api_reference.py` fails CI when an
+`connect("file://…")` session — not transcribed from a spec. Call them exactly as
+written. `scripts/check_api_reference.py` fails CI when an
 installed signature differs from this page.
 
 ## Two planes, one verb surface
@@ -25,8 +21,7 @@ The client splits provisioning from execution, and the book's teaching spine is 
 surface is identical across planes:
 
 - `jammi.connect("file:///path")  -> EmbeddedBackend` — embedded, in-process engine
-  (the CPU engine, or CUDA with `jammi-ai-native-cu12`). CI and a `small`-scale run
-  render the book on this arm.
+  (the CPU engine, or CUDA with `jammi-ai-native-cu12`).
 - `jammi.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
   client (`jammi`) over a running `jammi-server`. A `RemoteDatabase` may carry a bearer credential
   (`jammi.connect(endpoint, credentials=jammi.BearerCredentials(token))`);
@@ -35,9 +30,7 @@ surface is identical across planes:
   a separate `pyarrow.flight` transport). The engine enforces auth on no
   transport by design; verifying the bearer is a gateway-in-front's job.
 
-A recipe written against either handle runs unchanged against the other — the
-keystone's heavy emit connects `grpc://` to the GPU server; every chapter loads
-the committed cache and runs `file://` on CPU.
+A recipe written against either handle runs unchanged against the other.
 
 ## Setup / sources
 

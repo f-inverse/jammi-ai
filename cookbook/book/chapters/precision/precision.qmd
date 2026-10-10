@@ -180,8 +180,8 @@ graph, with no rebuild — reachable where a caller looks for it, `search`'s own
 > memory on the structure a search traverses without buying error into what a caller receives,
 > *provided* `oversample` is wide enough that the true neighbours are still in the candidate set
 > the rescore gets to see. Measured here at `oversample=4` (the engine's own default), that
-> provision holds exactly: `int8` recall matches `f32` recall while the graph shrinks to
-> roughly a quarter its size — the trade this book keeps insisting on: not assumed, measured.
+> provision holds: `int8` recall matches `f32` recall while the graph shrinks to about a
+> third of its size.
 > And both knobs — the deployment-default `storage_precision` and the per-request
 > `oversample` override — are reachable from the same public `jammi.connect` / `search` surface
 > every other chapter in this book writes against.

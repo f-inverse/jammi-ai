@@ -86,7 +86,7 @@ bytes.
   timbre families (sine / harmonic / square / saw / noise), 4 per family, plus
   a held-out query clip per family under `queries/`. Synthesised
   programmatically by `cookbook/fixtures/generate.py` — **no recorded audio**
-  (licensing), no tenant data.
+  (licensing).
 - `cookbook/fixtures/tiny_audio_golden.json` — per-query → expected corpus IDs
   (same timbre family).
 

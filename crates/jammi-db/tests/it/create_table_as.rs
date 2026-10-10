@@ -10,7 +10,7 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -171,6 +171,24 @@ async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// A `CREATE TABLE … AS` over a table its source does not hold is the typed
+/// NotFound naming that relation — never the table the statement
+/// defines, which is not expected to exist yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_table_as_over_a_missing_relation_names_the_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, _store, patents) = session_with_store(dir.path()).await;
+    let missing = format!("{patents}.public.retracted");
+    let err = session
+        .sql(&format!("CREATE TABLE copied AS SELECT id FROM {missing}"))
+        .await
+        .expect_err("a query over a table its source does not hold cannot plan");
+    assert!(
+        matches!(&err, JammiError::NotFound(Missing::Relation { name }) if *name == missing),
+        "expected the typed NotFound naming the read relation, got {err:?}"
+    );
 }
 
 /// The `(id, title)` rows of `"jammi.<name>"`, by id, and the `ready`

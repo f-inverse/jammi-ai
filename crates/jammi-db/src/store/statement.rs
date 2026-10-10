@@ -331,6 +331,42 @@ impl RefusedStatement {
     }
 }
 
+/// The first relation `statement` reads or writes that the session's catalogs
+/// do not hold — the condition DataFusion's planner refuses as a bare "table
+/// not found" string — so a planning failure over a missing relation surfaces
+/// as the [`JammiError::NotFound`] every other missing thing is. The relation
+/// a `CREATE TABLE` / `CREATE VIEW` defines is not one it needs to exist.
+async fn missing_relation(
+    state: &SessionState,
+    statement: &DfStatement,
+) -> DfResult<Option<String>> {
+    let defined = match statement {
+        DfStatement::Statement(inner) => match inner.as_ref() {
+            SqlStatement::CreateTable(create) => Some(create.name.to_string()),
+            SqlStatement::CreateView(view) => Some(view.name.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let catalog = &state.config_options().catalog;
+    for reference in state.resolve_table_references(statement)? {
+        if defined.as_deref() == Some(reference.to_string().as_str()) {
+            continue;
+        }
+        let resolved = reference
+            .clone()
+            .resolve(&catalog.default_catalog, &catalog.default_schema);
+        let present = match state.schema_for_ref(reference.clone()) {
+            Ok(schema) => schema.table(&resolved.table).await?.is_some(),
+            Err(_) => false,
+        };
+        if !present {
+            return Ok(Some(reference.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// The one identifier a result-table statement names, or the refusal.
 fn statement_name(name: &TableReference) -> std::result::Result<String, RefusalReason> {
     match name.schema() {
@@ -348,20 +384,29 @@ impl StatementClass {
     /// whether its rows come from a join.
     pub async fn plan(state: &SessionState, sql: &str) -> DfResult<Self> {
         let dialect = state.config().options().sql_parser.dialect;
-        let plan = match state.sql_to_statement(sql, &dialect)? {
+        let statement = state.sql_to_statement(sql, &dialect)?;
+        let planned = match statement.clone() {
             DfStatement::Statement(statement) => match *statement {
                 SqlStatement::Update(update) if update.from.is_some() => {
-                    plan_update_from(state, update).await?
+                    plan_update_from(state, update).await
                 }
                 statement => {
                     state
                         .statement_to_plan(DfStatement::Statement(Box::new(statement)))
-                        .await?
+                        .await
                 }
             },
-            statement => state.statement_to_plan(statement).await?,
+            statement => state.statement_to_plan(statement).await,
         };
-        Self::of(plan)
+        match planned {
+            Ok(plan) => Self::of(plan),
+            Err(refusal) => Err(match missing_relation(state, &statement).await? {
+                Some(name) => DataFusionError::External(Box::new(JammiError::NotFound(
+                    crate::error::Missing::Relation { name },
+                ))),
+                None => refusal,
+            }),
+        }
     }
 
     /// Classify `plan`, the logical plan of one statement.

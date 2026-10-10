@@ -151,35 +151,35 @@ _CODE_CLASS = {
 }
 
 
-def _error_detail(exc: grpc.RpcError) -> Optional[str]:
-    """The typed engine detail a server attached to a failed call — the
-    `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
-    trailer's `google.rpc.Status` envelope, as `variant` or, for a variant that
-    names a case of its own (`not_found`), `variant.case` — or None when it
-    carries none."""
+def _status_bytes(exc: grpc.RpcError) -> Optional[bytes]:
+    """The `google.rpc.Status` envelope a server attached to a failed gRPC call
+    (its `grpc-status-details-bin` trailer), or None when it carries none."""
     trailers = exc.trailing_metadata() if hasattr(exc, "trailing_metadata") else None
-    for key, value in trailers or ():
-        if key != "grpc-status-details-bin":
-            continue
-        for packed in error_pb2.RpcStatus.FromString(value).details:
-            detail = error_pb2.JammiErrorDetail()
-            if packed.Unpack(detail):
-                variant = detail.WhichOneof("variant")
-                if variant == "not_found":
-                    return f"not_found.{detail.not_found.WhichOneof('missing')}"
-                return variant
+    return next((value for key, value in trailers or () if key == "grpc-status-details-bin"), None)
+
+
+def _error_detail(status: error_pb2.RpcStatus) -> Optional[str]:
+    """The typed engine detail a status envelope packs — the `JammiErrorDetail`
+    variant, as `variant` or, for a variant that names a case of its own
+    (`not_found`), `variant.case` — or None when it carries none."""
+    for packed in status.details:
+        detail = error_pb2.JammiErrorDetail()
+        if packed.Unpack(detail):
+            variant = detail.WhichOneof("variant")
+            if variant == "not_found":
+                return f"not_found.{detail.not_found.WhichOneof('missing')}"
+            return variant
     return None
 
 
-def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
-    """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy.
+def _status_to_jammi(code: grpc.StatusCode, message: str, envelope: Optional[bytes]) -> JammiError:
+    """The :class:`JammiError` a failed remote call raises, whichever lane
+    carried it: the typed gRPC verbs, or the Flight SQL lane, whose errors keep
+    the same `google.rpc.Status` envelope.
 
-    So every remote failure — not only the client-constructed validation and
-    malformed-response ones, but a live transport fault — descends from
-    ``JammiError``, and one ``except JammiError`` catches the whole remote
-    surface. A typed engine detail on the status raises its leaf class — the
-    class the embedded engine raises for the same error. Otherwise the status
-    code decides:
+    A typed engine detail on the status raises its leaf class — the class the
+    embedded engine raises for the same error. Otherwise the status code
+    decides:
 
     * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — a server-detected bad
       argument, the SAME class the embedded engine raises for the same rejection.
@@ -195,15 +195,35 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
     attribute so the few call-sites that branch on ``NOT_FOUND`` (``describe_*``
     → ``None``; ``*if_exists*`` drops → no-op) keep working after the remap.
     """
-    code = exc.code()
-    detail = exc.details() or str(exc)
-    leaf = _DETAIL_CLASS.get(_error_detail(exc))
-    if leaf is not None:
-        mapped: JammiError = leaf(detail)
-    else:
-        mapped = _CODE_CLASS.get(code, BackendError)(detail)
+    leaf = _DETAIL_CLASS.get(_error_detail(error_pb2.RpcStatus.FromString(envelope))) if envelope else None
+    mapped: JammiError = (leaf or _CODE_CLASS.get(code, BackendError))(message)
     mapped.code = code
     return mapped
+
+
+def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
+    """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy,
+    so every remote failure — a live transport fault included — descends from
+    ``JammiError`` and one ``except JammiError`` catches the whole remote
+    surface (see :func:`_status_to_jammi`)."""
+    return _status_to_jammi(exc.code(), exc.details() or str(exc), _status_bytes(exc))
+
+
+def _flight_to_jammi(exc: "pa.ArrowException") -> JammiError:
+    """Map a Flight SQL lane failure onto the :class:`JammiError` taxonomy. A
+    statement the engine refused carries the engine's `google.rpc.Status`
+    envelope as the Flight error's extra info — the server sends Arrow's status
+    trailer for exactly this — and classifies as the typed lane does. A failure
+    with no envelope is the transport's own: an unreachable server is
+    :class:`Unavailable`, anything else a :class:`BackendError`."""
+    envelope = getattr(exc, "extra_info", None) or None
+    if envelope is not None:
+        status = error_pb2.RpcStatus.FromString(envelope)
+        code = next((c for c in grpc.StatusCode if c.value[0] == status.code), grpc.StatusCode.UNKNOWN)
+        return _status_to_jammi(code, status.message or str(exc), envelope)
+    if isinstance(exc, pa.flight.FlightUnavailableError):
+        return _status_to_jammi(grpc.StatusCode.UNAVAILABLE, str(exc), None)
+    return _status_to_jammi(grpc.StatusCode.UNKNOWN, str(exc), None)
 
 
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
@@ -3112,10 +3132,9 @@ class RemoteDatabase:
         client = self._flight_client()
         options = self._flight_options()
         # The Flight SQL lane is a separate transport whose faults surface as
-        # `pyarrow.flight.FlightError`, not `grpc.RpcError`; map them onto the
-        # taxonomy too so `sql()` — like every typed verb — raises only
-        # `JammiError`. A Flight fault is a transport/runtime failure of the
-        # compound-query lane, so it maps to `BackendError`.
+        # pyarrow's exceptions, not `grpc.RpcError`; `_flight_to_jammi` maps
+        # them onto the taxonomy so `sql()` — like every typed verb — raises
+        # only `JammiError`, of the class the embedded engine raises.
         try:
             info = client.get_flight_info(
                 pa.flight.FlightDescriptor.for_command(_command_statement_query(query)),
@@ -3123,8 +3142,8 @@ class RemoteDatabase:
             )
             reader = client.do_get(info.endpoints[0].ticket, options)
             return reader.read_all()
-        except pa.flight.FlightError as exc:
-            raise BackendError(str(exc)) from exc
+        except pa.ArrowException as exc:
+            raise _flight_to_jammi(exc) from exc
 
     def _flight_client(self):
         # The Flight SQL lane is a separate pyarrow.flight transport from the

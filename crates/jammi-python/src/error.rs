@@ -141,6 +141,18 @@ mod tests {
         );
     }
 
+    /// Embedded ⇄ remote parity for a topic verb: a missing topic raises the
+    /// class the server's `NOT_FOUND` raises remotely, so an `except NotFound`
+    /// holds on both transports.
+    #[test]
+    fn a_missing_topic_raises_the_class_the_remote_transport_raises() {
+        let err = JammiError::Trigger(jammi_db::trigger::TriggerError::TopicNotFound(
+            "never.registered".to_string(),
+        ));
+        assert_eq!(jammi_wire::status_code(&err), Code::NotFound);
+        assert_eq!(jammi_error_class(&err), "NotFound");
+    }
+
     /// Embedded ⇄ remote parity for the retryable condition: a stalled Hub
     /// download (`Unavailable`) raises the class the remote client raises for
     /// the `UNAVAILABLE` the server sends, so one `except Unavailable` retries

@@ -268,6 +268,29 @@ pub enum MutableTableError {
     Backend(#[from] BackendError),
 }
 
+impl MutableTableError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]): a
+    /// missing table is the `if_exists` no-op signal and an id collision is
+    /// distinct from a fault, so neither collapses onto `Internal`.
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::NotFound(_) => ErrorClass::NotFound,
+            Self::AlreadyExists(_) => ErrorClass::AlreadyExists,
+            Self::InvalidId(_)
+            | Self::Schema(_)
+            | Self::MissingPrimaryKey(_)
+            | Self::ReservedColumn(_)
+            | Self::NoOrderColumn
+            | Self::AmbiguousUpdate { .. } => ErrorClass::InvalidArgument,
+            // Lost a race with another writer: re-running the statement
+            // selects against the new rows.
+            Self::WriteConflict { .. } => ErrorClass::Aborted,
+            Self::Backend(_) => ErrorClass::Internal,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

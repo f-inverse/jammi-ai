@@ -29,6 +29,8 @@ jammi-numerics.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
+# Decodes a Flight descriptor's `Any` to plan its statement through the engine.
+prost.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -167,7 +169,6 @@ parquet.workspace = true
 # hand to exercise the wire surface end-to-end; the server's own code reaches
 # these only through `jammi_ai::wire`, so they are test-only deps.
 arrow-ipc.workspace = true
-prost.workspace = true
 prost-types.workspace = true
 # The bring-your-own-auth worked example (`grpc_byo_auth`) mints and verifies a
 # generic signed bearer token to drive its custom authenticating interceptor.

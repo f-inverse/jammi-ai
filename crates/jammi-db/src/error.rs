@@ -511,6 +511,130 @@ pub enum JammiError {
     Other(String),
 }
 
+/// The condition an engine error reports, whatever transport carries it: the
+/// one classification every surface shares. The gRPC surface sends each class
+/// as its status code, and the Python client raises the `jammi.errors` class of
+/// that code, so a failure is the same condition in process and over the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The request is malformed or names something it cannot ask for.
+    InvalidArgument,
+    /// Something the request names, or needs, does not exist for the caller.
+    NotFound,
+    /// The thing the request creates exists already.
+    AlreadyExists,
+    /// The state the request needs does not hold; changing the state, not the
+    /// request, is the remedy.
+    FailedPrecondition,
+    /// The caller may not act on the thing it names.
+    PermissionDenied,
+    /// The request lost a race with a concurrent writer; a retry can succeed.
+    Aborted,
+    /// The caller asked for the operation to stop, and it stopped.
+    Cancelled,
+    /// A bounded resource (memory, quota) was exhausted.
+    ResourceExhausted,
+    /// A dependency could not be reached; a retry with backoff can succeed.
+    Unavailable,
+    /// A fault in the engine itself, with no condition the caller can change.
+    Internal,
+}
+
+impl ErrorClass {
+    /// Whether the condition is the caller's to change — the request, the state
+    /// it asks about, or its own decision to stop — rather than a fault of the
+    /// engine or of a dependency.
+    pub fn is_caller_condition(self) -> bool {
+        match self {
+            Self::InvalidArgument
+            | Self::NotFound
+            | Self::AlreadyExists
+            | Self::FailedPrecondition
+            | Self::PermissionDenied
+            | Self::Cancelled => true,
+            Self::Aborted | Self::ResourceExhausted | Self::Unavailable | Self::Internal => false,
+        }
+    }
+}
+
+impl JammiError {
+    /// The condition this error reports. Exhaustive by construction: a new
+    /// variant does not compile until it is classified here.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            // The standard set is coarser than the enum: Source / Model /
+            // Tenant / Config / Schema / Eval all land on `InvalidArgument`,
+            // and the typed detail a transport attaches carries the rest.
+            Self::Config(_)
+            | Self::Source { .. }
+            | Self::Model { .. }
+            | Self::Tenant(_)
+            | Self::Schema { .. }
+            | Self::Eval(_)
+            // The remedy is an argument: a tie-break column.
+            | Self::AmbiguousAsofMatch { .. }
+            // The caller asked to encode a query into a space no encoder
+            // produced.
+            | Self::NoQueryEncoder { .. }
+            // Data-shape faults of the caller's input.
+            | Self::InvalidKey { .. }
+            | Self::NonUniqueKey { .. }
+            | Self::EmptyTrainingSet { .. } => ErrorClass::InvalidArgument,
+            // An absent row is a NotFound, never the bad-argument `Source` /
+            // `Model` fault; a manifest or version that cannot be served is
+            // an absent resource too.
+            Self::NotFound(_)
+            | Self::RowGone { .. }
+            | Self::MissingManifest { .. }
+            | Self::VersionUnavailable { .. } => ErrorClass::NotFound,
+            // "Fix state, then retry": a reference to release, a writer to
+            // finish, a table to recompute, an environment to restore.
+            Self::ModelReferenced { .. }
+            | Self::SourceBusy { .. }
+            | Self::NotRefreshable { .. }
+            | Self::DefinitionDrift { .. } => ErrorClass::FailedPrecondition,
+            // The strict tenant arm refused the write — the code a
+            // forged-tenant read is refused with elsewhere.
+            Self::TenantMismatch { .. } => ErrorClass::PermissionDenied,
+            // The caller's view of a row was stale by the time its CAS ran: a
+            // transient conflict a retry from a fresh read resolves.
+            Self::LeaseLost { .. }
+            | Self::CasFailed { .. }
+            | Self::ParentMoved { .. }
+            | Self::JobAttemptSuperseded { .. } => ErrorClass::Aborted,
+            // The executor honoured a cancel request: the outcome the caller
+            // asked for.
+            Self::JobCancelled { .. } => ErrorClass::Cancelled,
+            Self::ResourcesExhausted { .. } => ErrorClass::ResourceExhausted,
+            // A peer's segment could not be served by its owner, its retry
+            // candidate or the local load: visible, never masked by a scan.
+            Self::Unavailable { .. } => ErrorClass::Unavailable,
+            Self::MutableTable(e) => e.class(),
+            Self::ChannelCatalog(e) => e.class(),
+            Self::Trigger(e) => e.class(),
+            // Engine-side faults: a broken invariant, an unreadable artifact,
+            // a failed computation or an I/O failure underneath.
+            Self::Catalog(_)
+            | Self::Inference(_)
+            | Self::FineTune(_)
+            | Self::Gpu(_)
+            | Self::Backend(_)
+            | Self::Io(_)
+            | Self::BackendDriver(_)
+            | Self::Toml(_)
+            | Self::Json(_)
+            | Self::DataFusion(_)
+            | Self::ChannelAssembly(_)
+            | Self::Lexical(_)
+            | Self::Storage(_)
+            | Self::IncompatibleFormat { .. }
+            | Self::DependencyCycle { .. }
+            | Self::NotRecomputable { .. }
+            | Self::Other(_) => ErrorClass::Internal,
+        }
+    }
+}
+
 /// The catalog row a [`JammiError::NotFound`] names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Missing {
@@ -533,6 +657,12 @@ pub enum Missing {
     ResultTable {
         /// The table name.
         table: String,
+    },
+    /// A relation a SQL statement reads or writes: a source's table, a
+    /// mutable table, or a result table, as the statement spelled it.
+    Relation {
+        /// The relation's name.
+        name: String,
     },
     /// A source's ready index of one kind, which the verb resolves when the
     /// caller names no table.
@@ -587,6 +717,7 @@ impl std::fmt::Display for Missing {
             Self::Model { model_id } => write!(f, "model `{model_id}` not found"),
             Self::Job { job_id } => write!(f, "job `{job_id}` not found"),
             Self::ResultTable { table } => write!(f, "result table `{table}` not found"),
+            Self::Relation { name } => write!(f, "table `{name}` not found"),
             Self::ReadyIndex { source_id, index } => {
                 let (what, verb) = index.described();
                 write!(

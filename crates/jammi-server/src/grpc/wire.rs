@@ -25,7 +25,7 @@ use jammi_db::error::JammiError;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{attach_error_detail, attach_trigger_detail};
-use tonic::{Code, Request, Status};
+use tonic::{Request, Status};
 
 use crate::grpc::session::SessionTenant;
 
@@ -123,37 +123,7 @@ pub fn map_engine_error(err: JammiError) -> Status {
 /// [`CatalogService`](crate::grpc::catalog) and the publish/subscribe verbs on
 /// [`TriggerService`](crate::grpc::trigger).
 pub fn map_trigger_error(err: TriggerError) -> Status {
-    let (code, message) = match &err {
-        TriggerError::TopicNotFound(name) => (Code::NotFound, name.clone()),
-        TriggerError::BatchSchemaMismatch(detail) => (Code::InvalidArgument, detail.clone()),
-        TriggerError::SchemaConflict { topic, detail } => (
-            Code::FailedPrecondition,
-            format!("schema conflict on {topic}: {detail}"),
-        ),
-        TriggerError::UnsupportedSchemaType { column, data_type } => (
-            Code::InvalidArgument,
-            format!("unsupported topic schema type for '{column}': {data_type}"),
-        ),
-        TriggerError::PublishTenantMismatch {
-            topic,
-            topic_tenant,
-            publish_tenant,
-        } => (
-            Code::PermissionDenied,
-            format!(
-                "publish tenant mismatch on topic '{topic}': topic_tenant={topic_tenant:?}, publish_tenant={publish_tenant:?}"
-            ),
-        ),
-        TriggerError::PredicateParse(detail) | TriggerError::PredicateUnsupported(detail) => {
-            (Code::InvalidArgument, format!("predicate: {detail}"))
-        }
-        TriggerError::PredicateEval(detail) => (Code::Internal, format!("predicate: {detail}")),
-        TriggerError::BackingTable(e) => (Code::Internal, format!("backing table: {e}")),
-        TriggerError::Backend(e) => (Code::Internal, format!("backend: {e}")),
-        TriggerError::Driver(detail) => (Code::Unavailable, format!("broker: {detail}")),
-        TriggerError::Catalog(detail) => (Code::Internal, format!("catalog: {detail}")),
-    };
-    attach_trigger_detail(code, message, &err)
+    attach_trigger_detail(jammi_wire::class_code(err.class()), err.to_string(), &err)
 }
 
 #[cfg(test)]
@@ -161,6 +131,7 @@ mod tests {
     use super::*;
     use jammi_db::error::Missing;
     use jammi_wire::error_from_status;
+    use tonic::Code;
 
     /// An absent model from a lifecycle verb is a model `NotFound`, which maps to
     /// gRPC `NotFound` — distinct from the bad-argument `Model` fault, which maps

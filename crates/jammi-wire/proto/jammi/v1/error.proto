@@ -386,9 +386,9 @@ message ModelReferencedError {
 }
 
 // `JammiError::NotFound(Missing)`: which catalog row is absent. A row the
-// caller named carries its id; a source's ready index carries the source and
-// the index kind (`embedding` / `lexical`), which names the verb that builds
-// one.
+// caller named carries its id, and a relation a statement names its name; a
+// source's ready index carries the source and the index kind (`embedding` /
+// `lexical`), which names the verb that builds one.
 message NotFoundError {
   oneof missing {
     string source_id = 1;
@@ -396,6 +396,8 @@ message NotFoundError {
     string job_id = 3;
     string result_table = 4;
     ReadyIndexMissing ready_index = 5;
+    // A relation a SQL statement names, as the statement spelled it.
+    string relation = 6;
   }
 }
 

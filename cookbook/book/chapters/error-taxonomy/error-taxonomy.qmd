@@ -108,7 +108,9 @@ A missing thing is a `NotFound` whether the caller named it or the verb went
 looking for it. A `search` or `lexical_search` that names no table resolves the
 source's newest ready index; before one is built, that is `NoReadyIndex`, a
 `NotFound` whose message names the verb that builds the index. A table named
-but never built is a plain `NotFound`.
+but never built is a plain `NotFound`, and so is a SQL query over a table its
+source does not hold — on a server it travels the Flight SQL lane, and arrives
+as the same class.
 
 ```{python}
 from jammi.errors import NoReadyIndex
@@ -125,6 +127,8 @@ def missing(db) -> dict:
             "lexical_search before any index": lambda: db.lexical_search(
                 "corpus", text="protein folding", k=3),
             "describe a table never built": lambda: db.describe_table("corpus_never_built"),
+            "query a table the source does not hold": lambda: db.sql(
+                "SELECT * FROM corpus.public.never_written"),
         }.items():
             try:
                 action()
@@ -150,6 +154,7 @@ claim("each missing-artifact failure is measured on both transports",
           "search before any embedding table",
           "lexical_search before any index",
           "describe a table never built",
+          "query a table the source does not hold",
       })
 claim("each raises the same class with the same message in process and from a server, as NOT_FOUND",
       all(local_missing[name][0] == cls and code == "NOT_FOUND" and local_missing[name][2] == message
@@ -159,8 +164,9 @@ claim("a search with nothing to search is NoReadyIndex, naming the verb that bui
       and "generate_embeddings" in served_missing["search before any embedding table"][2]
       and served_missing["lexical_search before any index"][0] == "NoReadyIndex"
       and "build_lexical_index" in served_missing["lexical_search before any index"][2])
-claim("and a table never built is NotFound",
-      served_missing["describe a table never built"][0] == "NotFound")
+claim("and a table never built, or a query over one no source holds, is NotFound",
+      served_missing["describe a table never built"][0] == "NotFound"
+      and served_missing["query a table the source does not hold"][0] == "NotFound")
 ```
 
 ## Bridge note

@@ -10,6 +10,7 @@ import tempfile
 import pyarrow as pa
 
 import jammi
+from jammi.errors import NotFound
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
@@ -67,7 +68,8 @@ print(collected.to_pydict())
 # ## Drop the topic
 #
 # `drop_topic` removes it from the catalog. With `if_exists=True`, a topic
-# that is already gone is not an error; without it, the error names the topic.
+# that is already gone is not an error; without it, the drop raises `NotFound`
+# naming the topic.
 
 # %%
 db.drop_topic("events.demo")
@@ -77,7 +79,7 @@ db.drop_topic("events.demo", if_exists=True)
 
 try:
     db.drop_topic("never.registered")
-except (ValueError, RuntimeError) as missing:
+except NotFound as missing:
     assert "never.registered" in str(missing), f"drop-missing error lost topic name: {missing}"
     print(missing)
 else:

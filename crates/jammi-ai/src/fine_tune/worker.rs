@@ -2458,7 +2458,14 @@ impl JobWorker {
                 .await;
             }
             Err(WorkerJobError::Failed(error)) => {
-                tracing::error!(job_id = %job_id, error = %error, "training job failed");
+                // A job refused on the caller's own condition (its config, the
+                // data it named) reaches the caller typed through `wait`; only
+                // an engine or dependency fault is an operator's error.
+                if error.class().is_caller_condition() {
+                    tracing::info!(job_id = %job_id, error = %error, "training job refused");
+                } else {
+                    tracing::error!(job_id = %job_id, error = %error, "training job failed");
+                }
                 record_failed(
                     holder,
                     &catalog,
@@ -8354,7 +8361,7 @@ fn validate_backbone_precision(
     device: &candle_core::Device,
 ) -> Result<()> {
     if precision == jammi_numerics::ComputePrecision::BF16 && !device.is_cuda() {
-        return Err(JammiError::FineTune(
+        return Err(JammiError::Config(
             "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
              device, whose matmul does not implement bf16. Use f16 for a reduced-precision \
              backbone on CPU, or f32."
@@ -9143,7 +9150,7 @@ fn build_encoder_adapters(
         .unwrap_or("<absent>");
 
     let family = EncoderFamily::from_config(&model_config).ok_or_else(|| {
-        JammiError::FineTune(format!(
+        JammiError::Config(format!(
             "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
              (base model '{base_model_id}'); supported: bert, roberta, camembert, \
              xlm-roberta, distilbert, modernbert, an OpenCLIP checkpoint \
@@ -9446,7 +9453,7 @@ fn build_encoder_adapters(
             Some(layers) => format!(" restricted to layers {layers:?}"),
             None => String::new(),
         };
-        return Err(JammiError::FineTune(format!(
+        return Err(JammiError::Config(format!(
             "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
              (base model '{base_model_id}', model_type '{model_type}'), so this job would \
              train zero parameters and publish an adapter that changes nothing. This \
@@ -10172,8 +10179,8 @@ mod tests {
             "error must name a usable alternative: {msg}"
         );
         assert!(
-            matches!(err, JammiError::FineTune(_)),
-            "typed error, got {err:?}"
+            matches!(err, JammiError::Config(_)),
+            "a refusal of the job's own configuration, got {err:?}"
         );
     }
 

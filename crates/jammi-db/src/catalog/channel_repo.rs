@@ -68,6 +68,25 @@ pub enum ChannelCatalogError {
     InvalidColumnType(String),
 }
 
+impl ChannelCatalogError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]). A
+    /// same-type redeclare and a duplicate channel are both `AlreadyExists`
+    /// (the resource is present); a different-type redeclare conflicts with
+    /// the stored declaration; a bad slug or column-type token is the caller's
+    /// input.
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::AlreadyExists(_) | Self::ColumnAlreadyDeclared { .. } => {
+                ErrorClass::AlreadyExists
+            }
+            Self::NotRegistered(_) => ErrorClass::NotFound,
+            Self::ColumnConflict { .. } => ErrorClass::FailedPrecondition,
+            Self::InvalidId(_) | Self::InvalidColumnType(_) => ErrorClass::InvalidArgument,
+        }
+    }
+}
+
 /// A column-type token (`"Float32"`, `"Utf8"`, …) that is not one of the closed
 /// set of PascalCase Arrow names. A neutral parse outcome carrying the offending
 /// token, with no caller-vs-corruption verdict baked in: [`ChannelColumnType::

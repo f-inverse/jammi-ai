@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use futures::StreamExt;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
 };
@@ -651,10 +651,10 @@ async fn drop_makes_select_fail(backend: BackendKind) {
         ))
         .await
         .unwrap_err();
-    let msg = err.to_string();
+    let named = format!("mutable.public.{}", id.as_str());
     assert!(
-        msg.contains("not found") || msg.contains("Table") || msg.contains(id.as_str()),
-        "expected table-not-found error; got: {msg}"
+        matches!(&err, JammiError::NotFound(Missing::Relation { name }) if *name == named),
+        "a query over a dropped table is the typed NotFound naming it; got: {err:?}"
     );
 }
 

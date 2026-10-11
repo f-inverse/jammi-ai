@@ -50,6 +50,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
+use jammi_db::catalog::status::{JobKind, JobKinds};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 pub(crate) use crate::gang_fixtures::{
@@ -121,7 +122,12 @@ async fn register_member(engine: &Arc<InferenceSession>, id: &str, addr: std::ne
         .unwrap();
     engine
         .catalog()
-        .upsert_worker(id, "fine_tune", WorkerState::Claiming, &[])
+        .upsert_worker(
+            id,
+            &JobKinds::new(vec![JobKind::FineTune]),
+            WorkerState::Claiming,
+            &[],
+        )
         .await
         .unwrap();
 }
@@ -144,7 +150,7 @@ async fn claim(engine: &Arc<InferenceSession>, worker: &JobWorker, within: Durat
             .unwrap();
         if let Some(record) = engine
             .catalog()
-            .claim_next(worker.worker_id(), &["fine_tune"], LEASE)
+            .claim_next(worker.worker_id(), &[JobKind::FineTune], LEASE)
             .await
             .unwrap()
         {
@@ -269,7 +275,7 @@ async fn a_member_answering_unavailable_ends_the_attempt_cooled_and_the_next_att
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job within the serveable world submits on a one-device host");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     let worker = JobWorker::new(&engine).unwrap();
 
     // ── attempt 1: the member's slot is busy ────────────────────────────
@@ -415,7 +421,7 @@ async fn a_member_whose_body_fails_ends_the_attempt_failed_under_the_coordinator
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job within the serveable world submits");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     training_test_hooks::fail_member_outcome(&job_id, "injected member failure");
     let worker = JobWorker::new(&engine).unwrap();
 
@@ -585,7 +591,12 @@ async fn register_graph_member(
         .unwrap();
     engine
         .catalog()
-        .upsert_worker(id, "graph_fine_tune", WorkerState::Claiming, &[])
+        .upsert_worker(
+            id,
+            &JobKinds::new(vec![JobKind::GraphFineTune]),
+            WorkerState::Claiming,
+            &[],
+        )
         .await
         .unwrap();
 }
@@ -607,7 +618,7 @@ async fn claim_graph(
             .unwrap();
         if let Some(record) = engine
             .catalog()
-            .claim_next(worker.worker_id(), &["graph_fine_tune"], LEASE)
+            .claim_next(worker.worker_id(), &[JobKind::GraphFineTune], LEASE)
             .await
             .unwrap()
         {
@@ -702,7 +713,7 @@ async fn graph_fine_tune_runs_as_a_peer_gang() {
         .run_training_spec(two_rank_graph_spec())
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     let worker = JobWorker::new(&engine).unwrap();
 
     let record = claim_graph(&engine, &worker, Duration::from_secs(20)).await;

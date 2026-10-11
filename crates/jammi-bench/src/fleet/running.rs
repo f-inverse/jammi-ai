@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::JobRecord;
-use jammi_db::catalog::status::JobStatus;
+use jammi_db::catalog::status::{JobKind, JobStatus};
 use jammi_db::config::{
     CatalogConfig, DistributedConfig, GpuConfig, JammiConfig, LeaseConfig, StorageConfig,
     WorkerConfig,
@@ -114,7 +114,7 @@ impl RunningFleet {
             .into_iter()
             .map(|w| Member {
                 label: w.label.clone().unwrap_or_else(|| w.instance_id.clone()),
-                role: if w.kinds.contains("fine_tune") {
+                role: if w.kinds.contains(JobKind::FineTune) {
                     MemberRole::Compute
                 } else {
                     MemberRole::Query
@@ -317,10 +317,8 @@ impl RunningFleet {
         job_id: &str,
         what: &str,
     ) -> Result<JobRecord, Box<dyn std::error::Error + Send + Sync>> {
-        self.await_job(job_id, what, |r| {
-            r.status == JobStatus::Completed.to_string()
-        })
-        .await
+        self.await_job(job_id, what, |r| r.status == JobStatus::Completed)
+            .await
     }
 
     /// Where the completed job `record` ran, as the catalog says: the member

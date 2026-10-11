@@ -54,6 +54,7 @@ use jammi_ai::fine_tune::worker::{training_test_hooks, Holder, JobWorker};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::instance::{InstanceRegistration, MemberRoot, PeerAddr};
 use jammi_db::catalog::jobs_repo::{JobRecord, WorkerState};
+use jammi_db::catalog::status::{JobKind, JobKinds};
 use jammi_db::config::{CatalogConfig, JammiConfig};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -239,7 +240,7 @@ pub(crate) async fn claim_within(
             .expect("reclaim");
         if let Some(record) = session
             .catalog()
-            .claim_next(worker_id, &["fine_tune"], lease)
+            .claim_next(worker_id, &[JobKind::FineTune], lease)
             .await
             .expect("claim")
         {
@@ -297,7 +298,7 @@ impl Member {
             .catalog()
             .upsert_worker(
                 session.instance_id(),
-                "fine_tune",
+                &JobKinds::new(vec![JobKind::FineTune]),
                 WorkerState::Claiming,
                 &[],
             )
@@ -607,8 +608,8 @@ async fn submit(coordinator: &Coordinator) -> String {
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job submits")
-        .job_id
-        .clone()
+        .job_id()
+        .to_string()
 }
 
 /// The end the coordinator recorded for `attempt`: `(description,

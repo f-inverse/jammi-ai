@@ -267,7 +267,7 @@ async fn run_peer_w2_resumed(fleet: &Fleet) -> Vec<u8> {
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job submits");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     // ── attempt 1: armed BEFORE the claim, killed once observed ──────────
     let bundle_written =
@@ -317,7 +317,7 @@ async fn run_local_w2_resumed(fleet: &Fleet) -> Vec<u8> {
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job submits on a local_ranks = 2 host");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     // ── attempt 1: armed BEFORE the claim, killed once observed ──────────
     let bundle_written =
@@ -408,7 +408,7 @@ async fn run_corrupted_epoch_1_checkpoint(
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job submits");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     let bundle_written =
         loop_test_hooks::arm_observed(&job_id, loop_test_hooks::Event::ResumeCheckpointWritten);
@@ -547,7 +547,7 @@ async fn run_torn_epoch_1_write_resumed(
         .run_training_spec(two_rank_spec())
         .await
         .expect("a two-rank job submits");
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     let torn = host
         .session

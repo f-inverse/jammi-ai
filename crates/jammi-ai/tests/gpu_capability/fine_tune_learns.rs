@@ -75,13 +75,9 @@ async fn fine_tune_learns_on_gpu() {
         .unwrap();
 
     // (a) completes on the GPU.
-    job.wait().await.unwrap();
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(
-        record.status, "completed",
-        "GPU fine-tune job should complete, got {}",
-        record.status
-    );
+    // `wait` returns a result only for a completed job, and the job's own
+    // recorded error for any other end.
+    job.wait().await.expect("GPU fine-tune job completes");
 
     // (b) loss decreases first→last epoch.
     let curve = harness::loss_capture::captured();

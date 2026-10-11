@@ -19,8 +19,8 @@
 //!   `Vec<RecordBatch>` out. The fluent [`crate::query::QueryBuilder`] is an
 //!   internal mechanism the session drives — never the return type.
 //! * **Fine-tune** returns a job **id**; status is polled by id through
-//!   [`Session::fine_tune_status`]. The in-process `TrainingJob` handle never
-//!   escapes.
+//!   [`Session::fine_tune_status`]. The engine's [`crate::jobs::JobHandle`]
+//!   never escapes.
 //! * **Audit** is four flat methods rather than a borrow-scoped handle.
 //! * **Subscribe** returns a `Pin<Box<dyn Stream>>`, the transport-neutral
 //!   streaming shape.

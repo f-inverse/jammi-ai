@@ -3018,8 +3018,11 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
         .unwrap()
         .expect("the queued job is claimable");
     let attempt = claimed.attempts;
-    let job_id = job.job_id.clone();
-    let output_name = job.model_id().to_string();
+    let job_id = job.job_id().to_string();
+    let output_name = job
+        .output_model_id()
+        .expect("a fine-tune stamps the model it registers")
+        .to_string();
 
     let epoch0_dir = local_checkpoint_dir(&session, &job_id, attempt, 0);
     let epoch1_dir = local_checkpoint_dir(&session, &job_id, attempt, 1);
@@ -3062,7 +3065,7 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
     };
 
     let after = session.catalog().get_job(&job_id).await.unwrap();
-    if after.status != jammi_db::catalog::status::JobStatus::Completed.to_string() {
+    if after.status != jammi_db::catalog::status::JobStatus::Completed {
         restore_epoch0();
         panic!("the run must complete and finalize as the sole winner, got status {after:?}");
     }

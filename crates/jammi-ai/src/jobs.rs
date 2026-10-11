@@ -1089,7 +1089,9 @@ impl InferenceSession {
     }
 
     /// A handle to the job `job_id` names, submitted by this session or any
-    /// other: see [`JobHandle::attach`].
+    /// other. Existence is resolved by the catalog read itself: a job this
+    /// tenant cannot see is that read's not-found, never a handle that fails on
+    /// first use.
     pub async fn job(&self, job_id: &str) -> Result<JobHandle> {
         JobHandle::attach(Arc::clone(self.catalog_arc()), job_id).await
     }

@@ -1308,7 +1308,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
     // sticky-bound session's blocking-thread `open_streamed_source` call
     // would "accidentally" resolve the right tenant even without this
     // commit's fix.
-    // `TrainingJob::wait` polls `Catalog::get_job`, which ALSO scopes on
+    // `JobHandle::wait` polls `Catalog::get_job`, which ALSO scopes on
     // `current_tenant()` (`jobs_repo.rs::get_job`) — outside this scope the
     // session carries no sticky tenant at all, so the wait must run INSIDE
     // the same task-local scope as the submit, exactly like the gRPC

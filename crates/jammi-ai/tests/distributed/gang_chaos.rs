@@ -25,6 +25,7 @@
 //! reproduce afterwards: rank 1 is read from the same listing verb, in the
 //! same order, never recomputed from a different view.
 
+use jammi_db::catalog::status::JobKind;
 use jammi_test_utils::DistributedBackends;
 
 use crate::harness::{self, Fleet, JobSize};
@@ -81,7 +82,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
     let source = harness::unique_source_name(TEST_PEER);
     harness::register_training_source(&session, &source).await;
     let mut fleet = Fleet::spawn(&backends, &result_root, 3);
-    harness::await_fleet_gang_ready(&mut fleet, &session, "fine_tune", 3).await;
+    harness::await_fleet_gang_ready(&mut fleet, &session, JobKind::FineTune, 3).await;
     let (job_id, expected_model) =
         harness::submit_gang_fine_tune(&session, &source, JobSize::Crashable).await;
     let coordinator = harness::await_job(
@@ -90,10 +91,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "a worker claims the two-rank job and marks it running",
-        |r| {
-            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
-                && r.claimed_by.is_some()
-        },
+        |r| r.status == jammi_db::catalog::status::JobStatus::Running && r.claimed_by.is_some(),
     )
     .await
     .claimed_by
@@ -101,7 +99,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
 
     // Rank 1 is the first member the coordinator's own listing names; the
     // crash lands once the gang is observed mid-run.
-    let member = harness::gang_members(&session, "fine_tune", &coordinator)
+    let member = harness::gang_members(&session, JobKind::FineTune, &coordinator)
         .await
         .into_iter()
         .next()
@@ -120,7 +118,7 @@ async fn killed_peer_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "the killed peer's job is retired, requeued after the lease and completed by a new gang",
-        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed,
     )
     .await;
     assert_completed_by_a_new_gang(&session, &record, &expected_model).await;
@@ -135,7 +133,7 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
     let source = harness::unique_source_name(TEST_COORDINATOR);
     harness::register_training_source(&session, &source).await;
     let mut fleet = Fleet::spawn(&backends, &result_root, 3);
-    harness::await_fleet_gang_ready(&mut fleet, &session, "fine_tune", 3).await;
+    harness::await_fleet_gang_ready(&mut fleet, &session, JobKind::FineTune, 3).await;
     let (job_id, expected_model) =
         harness::submit_gang_fine_tune(&session, &source, JobSize::Crashable).await;
     let coordinator = harness::await_job(
@@ -144,10 +142,7 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "a worker claims the two-rank job and marks it running",
-        |r| {
-            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
-                && r.claimed_by.is_some()
-        },
+        |r| r.status == jammi_db::catalog::status::JobStatus::Running && r.claimed_by.is_some(),
     )
     .await
     .claimed_by
@@ -166,7 +161,7 @@ async fn killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang() {
         &job_id,
         None,
         "the killed coordinator's job expires its lease, is requeued and completed by a new gang",
-        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed,
     )
     .await;
     assert_ne!(

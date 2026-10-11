@@ -214,6 +214,20 @@ class FailedPrecondition(BackendError):
     """
 
 
+class PermissionDenied(BackendError):
+    """The caller may not act on the thing it names — a write stamped for
+    another tenant than the session's. ``PERMISSION_DENIED`` on the remote
+    transport.
+    """
+
+
+class Unauthenticated(BackendError):
+    """The request carried no credential, or one that did not verify — refused
+    by an authenticating gateway in front of the engine before any read ran.
+    ``UNAUTHENTICATED`` on the remote transport.
+    """
+
+
 class MissingManifest(NotFound):
     """A result table carries no recorded materialization manifest, so
     ``describe_table`` has no definition to return. Refines :class:`NotFound`.

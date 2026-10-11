@@ -112,6 +112,8 @@ fn status_class(code: Code) -> &'static str {
         Code::NotFound => "NotFound",
         Code::AlreadyExists => "AlreadyExists",
         Code::FailedPrecondition => "FailedPrecondition",
+        Code::PermissionDenied => "PermissionDenied",
+        Code::Unauthenticated => "Unauthenticated",
         Code::Unavailable => "Unavailable",
         _ => "BackendError",
     }

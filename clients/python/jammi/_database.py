@@ -97,7 +97,9 @@ from .errors import (
     NotSupportedOnBackend,
     JobCancelled,
     JobFailed,
+    PermissionDenied,
     TrainingError,
+    Unauthenticated,
     Unavailable,
     VersionUnavailable,
 )
@@ -152,6 +154,8 @@ _CODE_CLASS = {
     grpc.StatusCode.UNAVAILABLE: Unavailable,
     grpc.StatusCode.ALREADY_EXISTS: AlreadyExists,
     grpc.StatusCode.FAILED_PRECONDITION: FailedPrecondition,
+    grpc.StatusCode.PERMISSION_DENIED: PermissionDenied,
+    grpc.StatusCode.UNAUTHENTICATED: Unauthenticated,
 }
 
 
@@ -219,14 +223,20 @@ def _flight_to_jammi(exc: "pa.ArrowException") -> JammiError:
     envelope as the Flight error's extra info — the server sends Arrow's status
     trailer for exactly this — and classifies as the typed lane does. A failure
     with no envelope is the transport's own: an unreachable server is
-    :class:`Unavailable`, anything else a :class:`BackendError`."""
+    :class:`Unavailable`, a refused credential :class:`Unauthenticated` or
+    :class:`PermissionDenied`, anything else a :class:`BackendError`."""
     envelope = getattr(exc, "extra_info", None) or None
     if envelope is not None:
         status = error_pb2.RpcStatus.FromString(envelope)
         code = next((c for c in grpc.StatusCode if c.value[0] == status.code), grpc.StatusCode.UNKNOWN)
         return _status_to_jammi(code, status.message or str(exc), envelope)
-    if isinstance(exc, pa.flight.FlightUnavailableError):
-        return _status_to_jammi(grpc.StatusCode.UNAVAILABLE, str(exc), None)
+    for flight_error, code in (
+        (pa.flight.FlightUnavailableError, grpc.StatusCode.UNAVAILABLE),
+        (pa.flight.FlightUnauthenticatedError, grpc.StatusCode.UNAUTHENTICATED),
+        (pa.flight.FlightUnauthorizedError, grpc.StatusCode.PERMISSION_DENIED),
+    ):
+        if isinstance(exc, flight_error):
+            return _status_to_jammi(code, str(exc), None)
     return _status_to_jammi(grpc.StatusCode.UNKNOWN, str(exc), None)
 
 

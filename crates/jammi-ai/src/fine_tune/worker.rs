@@ -8364,7 +8364,7 @@ fn validate_backbone_precision(
     if precision == jammi_numerics::ComputePrecision::BF16 && !device.is_cuda() {
         return Err(JammiError::InvalidArgument {
             argument: "backbone_dtype".into(),
-            reason: "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
+            reason: "bf16 requires a CUDA device; this worker resolved a non-CUDA \
              device, whose matmul does not implement bf16. Use f16 for a reduced-precision \
              backbone on CPU, or f32."
                 .into(),
@@ -9512,7 +9512,7 @@ fn build_encoder_adapters(
         return Err(JammiError::InvalidArgument {
             argument: "target_modules".into(),
             reason: format!(
-                "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
+                "{:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
              (base model '{base_model_id}', model_type '{model_type}'), so this job would \
              train zero parameters and publish an adapter that changes nothing. This \
              tower's own LoRA site names are: {:?} — a selector matches a site name \

@@ -305,6 +305,12 @@ libc = "0.2"
 [profile.release]
 codegen-units = 1
 
+# Incremental compilation off: sccache will not cache a crate built with
+# `-C incremental`, and cargo turns it on for every workspace crate by default,
+# so the workspace's own crates — the expensive ones — never hit the cache,
+# here or in CI, while each build leaves an incremental session directory
+# nothing reclaims. The test profile inherits this.
 [profile.dev]
 debug = "line-tables-only"
+incremental = false
 

@@ -5,9 +5,10 @@
 //! (migration 029) via [`CatalogClient::list_workers`].
 
 use clap::Subcommand;
-use jammi_admin::{CatalogClient, WorkerSummary};
+use jammi_admin::CatalogClient;
 use jammi_db::catalog::instance::DeviceFact;
 use jammi_db::catalog::status::JobKinds;
+use jammi_wire::WorkerSummary;
 
 #[derive(Subcommand)]
 pub enum WorkerAction {

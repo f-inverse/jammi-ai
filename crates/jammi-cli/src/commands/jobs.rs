@@ -9,7 +9,8 @@
 //! from training jobs to every job kind.
 
 use clap::Subcommand;
-use jammi_admin::{CatalogClient, JobSummary};
+use jammi_admin::CatalogClient;
+use jammi_wire::JobSummary;
 
 #[derive(Subcommand)]
 pub enum JobAction {

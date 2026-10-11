@@ -90,8 +90,10 @@ pub use eval_wire::{
 pub use job::{
     device_kind_from_proto, device_kind_to_proto, job_kind_from_proto, job_kind_to_proto,
     job_kinds_from_proto, job_kinds_to_proto, job_phase_from_proto, job_phase_to_proto,
-    job_progress_from_proto, job_progress_to_proto, job_status_from_proto, job_status_to_proto,
-    worker_state_from_proto, worker_state_to_proto,
+    job_progress_from_proto, job_progress_to_proto, job_status_from_proto,
+    job_status_info_from_proto, job_status_to_proto, job_summary_from_proto,
+    worker_state_from_proto, worker_state_to_proto, worker_summary_from_proto, JobStatusInfo,
+    JobSummary, WorkerSummary,
 };
 pub use mutable_table::{
     definition_from_proto, definition_list_from_proto, definition_to_proto, parse_table_id,

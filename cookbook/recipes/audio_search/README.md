@@ -21,7 +21,8 @@ checkpoint works the same way — its `config.json` declares
 `audio_model.audio_encoder.*` and `audio_projection.*` tower keys, and its
 `preprocessor_config.json` holds the feature-extractor geometry. The encoder is
 read from that config, as the image recipe reads OpenCLIP's; change `MODEL` in
-the program to try another.
+the program to try another. A checkpoint directory on disk works the same way, as
+`local:<path>`.
 
 It takes a few minutes on a CPU, most of it the three training steps, and well
 under one on a GPU.

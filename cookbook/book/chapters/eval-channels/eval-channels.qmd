@@ -33,7 +33,7 @@ TENANTS = (str(uuid.uuid4()), str(uuid.uuid4()))
 
 ## The evaluation, written once
 
-Four evaluations and one provenance sequence, over a `Session` of either kind:
+Four evaluations, a search and one provenance sequence, over a `Session` of either kind:
 
 - **`eval_embeddings`** scores the papers' raw embeddings on same-subject
   retrieval, with each query tagged by its **cohort** — the time-split era its
@@ -45,6 +45,7 @@ Four evaluations and one provenance sequence, over a `Session` of either kind:
   classification (accuracy / F1 against a label set) and NER (entity-span
   precision / recall against character-offset gold spans), with a sentiment
   classifier and an entity tagger from the Hugging Face Hub;
+- a **search** whose records carry their provenance;
 - the **channel sequence** registers two provenance channels under one tenant,
   appends columns, and reads the registry from both tenants and from no tenant.
 
@@ -56,7 +57,7 @@ def evaluate(db) -> dict:
     truth = keystone.subject_relevance(db, arxiv)
     era = {pid: name for name, ids in arxiv.split.items() for pid in ids}
     relevant = db.sql(
-        f"SELECT query_id, COUNT(*) AS relevant FROM {truth} GROUP BY query_id"
+        f"SELECT query_id, COUNT(*) AS relevant FROM {truth} GROUP BY query_id ORDER BY query_id"
     ).to_pylist()
     queries = [row["query_id"] for row in relevant]
 
@@ -65,6 +66,7 @@ def evaluate(db) -> dict:
         cohorts={q: {"era": era[q]} for q in queries},
     )
     per_query = db.eval_per_query(retrieval["eval_run_id"])
+    hits = db.search(arxiv.papers, row_key=queries[0], k=3, embedding_table=raw)
     compared = db.eval_compare(
         embedding_tables=[raw, propagated], source=arxiv.papers, ground_truth=truth, k=10,
     )
@@ -100,6 +102,7 @@ def evaluate(db) -> dict:
 
     return {
         "relevant": relevant,
+        "records": hits.select(["_row_id", "retrieved_by", "similarity"]).to_pylist(),
         "retrieval": retrieval, "per_query": per_query, "compared": compared,
         "classification": classification, "ner": ner,
         "channels": {"a": a_channels, "b_before": seen_by_b, "b": b_channels,
@@ -212,7 +215,7 @@ def canonical(value):
         return {k: canonical(v) for k, v in value.items() if k not in MINTED}
     if isinstance(value, list):
         rows = [canonical(v) for v in value]
-        key = next((k for k in ("query_id", "record_id", "channel_id") if rows and
+        key = next((k for k in ("query_id", "record_id", "_row_id", "channel_id") if rows and
                     isinstance(rows[0], dict) and k in rows[0]), None)
         return sorted(rows, key=lambda r: r[key]) if key else rows
     return value
@@ -275,6 +278,31 @@ different columns, no collision with A's. A session bound to no tenant sees only
 the global channels every engine seeds, one per way the engine itself produces
 evidence: `vector` (similarity search), `inference` (a model's output), and
 `bm25` (lexical scoring).
+
+A record carries its provenance. Each row a search returns names, in
+`retrieved_by`, the channels that found it, and carries the columns each of
+them declares; `annotated_by` names the channels that added to it after
+retrieval. A vector search's records name `vector` and carry its one column,
+`similarity`:
+
+```{python}
+vector = next(c for c in channels["unbound"] if c["channel_id"] == "vector")
+print(f"vector declares: {[c['name'] for c in vector['columns']]}")
+for record in local["records"]:
+    print(f"  paper {record['_row_id']}: retrieved_by {record['retrieved_by']}  "
+          f"similarity {record['similarity']:.3f}")
+```
+
+```{python}
+claim("each record names the channel that found it and carries the columns it declares",
+      all(r["retrieved_by"] == ["vector"] and r["similarity"] is not None
+          for r in local["records"])
+      and [c["name"] for c in vector["columns"]] == ["similarity"])
+```
+
+A registered channel's columns join a record the same way, from the process
+that produced it — `merge_channels` in the engine's Rust API — while the
+registry is what every client reads back.
 
 ## Bridge note
 

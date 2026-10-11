@@ -22,7 +22,8 @@ L2-normalized embeddings), downloaded from the Hugging Face Hub on first use
 OpenAI CLIP, other LAION sizes, EVA-CLIP, or one tuned on a domain's imagery,
 such as `patentclip/PatentCLIP_Vit_B` for technical drawings — the encoder is
 read from the checkpoint's `open_clip_config.json`. Change `MODEL` in the
-program to try one.
+program to try one. A checkpoint directory on disk works the same way, as
+`local:<path>`.
 
 ## API surface exercised
 
@@ -30,7 +31,7 @@ program to try one.
 - `Session.encode_query(*, model, query, modality="image")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `Job`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Image triplet schema (fine-tune input)
@@ -46,9 +47,10 @@ tells the loader to read the three columns as encoded images rather than text.
 
 ### Vision-tower LoRA sites
 
-`target_modules` names sites on **this** architecture. The OpenCLIP towers
-offer `in_proj` (fused QKV), `out_proj`, `c_fc` and `c_proj`; `all-linear`
-selects every one. A selector matches a site name exactly or as a suffix of it.
+A fine-tune adapts the tower by default, at its fused QKV projection `in_proj`;
+`target_modules` names other sites on **this** architecture. The OpenCLIP
+towers offer `in_proj`, `out_proj`, `c_fc` and `c_proj`; `all-linear` selects
+every one. A selector matches a site name exactly or as a suffix of it.
 A list matching **nothing** fails the job with a message that echoes what you
 submitted and lists the tower's real names.
 
@@ -84,11 +86,6 @@ output) is handled inside the encoder per the model's `preprocess_cfg`.
 
 The program is [`cookbook/recipes/image_search/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/image_search/example.py); its steps run here in order.
 
-The encoder is an OpenCLIP checkpoint from the Hugging Face Hub, LAION's
-CLIP ViT-B/32, downloaded on first use (about 600 MB) and cached. Any
-OpenCLIP-format model id, or a local directory as `local:<path>`, works the
-same way.
-
 ```{python}
 import json
 import tempfile
@@ -98,7 +95,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
-from jammi.errors import TrainingError
+from jammi.errors import JobFailed
 from jammi_cookbook import fixtures
 
 IMAGE_CORPUS_DIR = fixtures.path("tiny_image_corpus")
@@ -231,12 +228,13 @@ db.add_source("triplets", url=str(home / "image_triplets.parquet"), format="parq
 
 ## Adapt the vision tower
 
-A non-empty `target_modules` puts LoRA inside the vision transformer itself:
-`in_proj` is its fused query-key-value projection and `c_fc` the MLP's first
-linear, so the tower's own representation moves. (The audio recipe shows the
-other mode: an empty list trains a projection head on a frozen tower.) The
-adapted model is registered under the image task, so `search` resolves it as
-an image encoder.
+A fine-tune puts LoRA inside the vision transformer itself — on its fused
+query-key-value projection `in_proj` when it names no sites. Here
+`target_modules` adds `c_fc`, the MLP's first linear, so more of the tower's
+own representation moves. (The audio recipe also shows `encoder="frozen"`,
+which trains a projection head on a frozen tower instead.) The adapted model
+is registered under the image task, so `search` resolves it as an image
+encoder.
 
 ```{python}
 job = db.fine_tune(
@@ -309,7 +307,7 @@ refused = db.fine_tune(
 )
 try:
     refused.wait()
-except TrainingError as error:
+except JobFailed as error:
     message = str(error)
     print(f"refused: {message}")
     assert "q_proj" in message, f"the refusal must echo the submitted selector: {message}"

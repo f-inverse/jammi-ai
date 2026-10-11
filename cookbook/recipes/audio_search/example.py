@@ -4,11 +4,6 @@ Run with `python cookbook/recipes/audio_search/example.py`, or a step at a time
 as a notebook: each `# %%` cell is one step.
 """
 
-# %% [markdown]
-# The encoder is LAION's CLAP (HTSAT audio tower, fused variant) from the
-# Hugging Face Hub, downloaded on first use (about 600 MB) and cached. Any CLAP
-# audio model id, or a local directory as `local:<path>`, works the same way.
-
 # %%
 import json
 import os
@@ -58,7 +53,7 @@ db.add_source("corpus", url=str(home / "corpus.parquet"), format="parquet")
 # L2-normalized.
 
 # %%
-db.generate_embeddings(
+base_table = db.generate_embeddings(
     source="corpus", model=MODEL, columns=["audio"], key="clip_id", modality="audio"
 )
 
@@ -106,7 +101,9 @@ pq.write_table(
 )
 db.add_source("truth", url=str(home / "truth.parquet"), format="parquet")
 
-base_metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
+base_metrics = db.eval_embeddings(
+    source="corpus", ground_truth="truth.public.truth", k=5, embedding_table=base_table
+)
 for key in METRICS:
     value = base_metrics["aggregate"][key]
     assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
@@ -154,7 +151,7 @@ db.add_source("triplets", url=str(home / "audio_triplets.parquet"), format="parq
 #
 # `encoder="frozen"` trains a projection head on top of the frozen audio
 # tower: cheap, and the tower is untouched. Re-embedding the corpus with the
-# tuned model and evaluating again compares the two.
+# tuned model and evaluating that table compares the two.
 
 # %%
 job = db.fine_tune(
@@ -177,14 +174,13 @@ tuned_model = job.output_model_id
 assert tuned_model.startswith("jammi:fine-tuned:"), f"unexpected model_id: {tuned_model}"
 print(f"fine-tuned audio model: {tuned_model}")
 
-db.generate_embeddings(
+tuned_table = db.generate_embeddings(
     source="corpus", model=tuned_model, columns=["audio"], key="clip_id", modality="audio"
 )
-tuned_metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
-for key in METRICS:
-    value = tuned_metrics["aggregate"][key]
-    assert 0.0 <= value <= 1.0, f"tuned {key} out of range: {value}"
-for label, run in (("base ", base_metrics), ("tuned", tuned_metrics)):
+tuned_metrics = db.eval_embeddings(
+    source="corpus", ground_truth="truth.public.truth", k=5, embedding_table=tuned_table
+)
+for label, run in (("base ", base_metrics), ("head ", tuned_metrics)):
     print(f"{label}: " + "  ".join(f"{k}={run['aggregate'][k]:.4f}" for k in METRICS))
 
 # %% [markdown]
@@ -192,8 +188,9 @@ for label, run in (("base ", base_metrics), ("tuned", tuned_metrics)):
 #
 # The same query clip, encoded through the tuned model, must come out
 # different from the base encoding. This checks the vectors, not the metrics
-# above: CLAP already ranks these timbres almost perfectly, so the rankings
-# have little room to move even when the vectors do.
+# above: with four relevant clips per query, precision@5 can reach at most 0.8,
+# and CLAP already ranks these timbres close to that, so a head that moves the
+# vectors a little leaves the rankings where they were.
 
 # %%
 tuned_query_vec = db.encode_query(model=tuned_model, query=query_wav, modality="audio")
@@ -214,9 +211,10 @@ assert max_abs_diff > 1e-4, (
 # blocks' attention `query` and `value` projections when it names no sites.
 # Here `target_modules` names them, plus `linear1`, the audio projection's
 # first linear, on the same triplets. The tower's own representation moves —
-# more capacity for a domain the base checkpoint never saw, at more compute. The adapted model registers under the audio task, and
-# the same query encodes differently through it: an adapter that trained but
-# was dropped at serve time would leave the two vectors identical.
+# more capacity for a domain the base checkpoint never saw, at more compute. The
+# adapted model registers under the audio task, and the same query encodes
+# differently through it — an adapter that trained but was dropped at serve time
+# would leave the two vectors identical — and by more than the head moved it.
 
 # %%
 tower_job = db.fine_tune(
@@ -253,6 +251,19 @@ assert tower_max_abs_diff > 1e-4, (
     f"the adapted query vector equals the base one (max |Δ| = {tower_max_abs_diff:.2e}): "
     "the adapter was trained but is not applied when the model is served"
 )
+assert tower_max_abs_diff > max_abs_diff, (
+    f"adapting the tower moved the query vector less ({tower_max_abs_diff:.4f}) than a "
+    f"head on the frozen tower did ({max_abs_diff:.4f})"
+)
+
+tower_table = db.generate_embeddings(
+    source="corpus", model=tower_model, columns=["audio"], key="clip_id", modality="audio"
+)
+tower_metrics = db.eval_embeddings(
+    source="corpus", ground_truth="truth.public.truth", k=5, embedding_table=tower_table
+)
+for label, run in (("base ", base_metrics), ("head ", tuned_metrics), ("tower", tower_metrics)):
+    print(f"{label}: " + "  ".join(f"{k}={run['aggregate'][k]:.4f}" for k in METRICS))
 
 # %% [markdown]
 # ## A selector that matches nothing is refused

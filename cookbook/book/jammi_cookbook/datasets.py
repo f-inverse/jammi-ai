@@ -1,10 +1,10 @@
 """The book's two graph datasets, at either scale — Air Routes and ogbn-arxiv.
 
 * **Air Routes** (Kelvin R. Lawrence's sample graph from *Practical
-  Gremlin*; permissive, from ``krlawrence/graph``) — 3504 airports, the airport↔airport ``route`` graph
-  and the continent→country→airport ``contains`` hierarchy. Small enough to run
-  whole, so both scales read the committed ``air_routes`` fixture; the scales
-  differ only in the encoder.
+  Gremlin*; permissive, from ``krlawrence/graph``) — 3504 airports, the
+  airport↔airport ``route`` graph and the continent→country→airport
+  ``contains`` hierarchy. Small enough to run whole, so both scales read the
+  committed ``air_routes`` fixture; the scales differ only in the encoder.
 * **ogbn-arxiv** (ODC-BY; Open Graph Benchmark) — ~169k CS papers, ~1.17M
   citation edges, 40 subject classes, title + abstract. ``full`` runs a
   connected ball of the citation graph — 4,000 papers collected breadth-first

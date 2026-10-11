@@ -26,7 +26,8 @@ The model has exactly two genuine isolation layers and one honest caveat:
    lives above it.
 
 The two tenants are an honest, disjoint partition of the papers: every paper
-belongs to exactly one tenant by its subject class. The tenant ids are opaque UUIDs — the
+belongs to exactly one tenant by its subject class, the subjects dealt out so the
+two tenants hold about as many papers each. The tenant ids are opaque UUIDs — the
 engine validates the form, never who the tenant is.
 
 ## The setup — two tenants over one corpus
@@ -39,6 +40,7 @@ bound scope drives both isolation layers (`tenant_scope` is the block-scoped for
 
 ```{python}
 import tempfile
+from collections import Counter
 
 import jammi
 import pyarrow as pa
@@ -58,8 +60,13 @@ papers = db.sql(
     f"SELECT paper_id, title, abstract, subject FROM {arxiv.papers}.public.{arxiv.papers}"
 ).to_pylist()
 subject = {p["paper_id"]: p["subject"] for p in papers}
-subjects = sorted({p["subject"] for p in papers})
-a_subjects = set(subjects[::2])
+# Largest subject first, each to whichever tenant holds fewer papers so far.
+a_subjects, held = set(), {"a": 0, "b": 0}
+for name, count in sorted(Counter(subject.values()).items(), key=lambda kv: (-kv[1], kv[0])):
+    side = "a" if held["a"] <= held["b"] else "b"
+    held[side] += count
+    if side == "a":
+        a_subjects.add(name)
 a_papers = sorted(pid for pid in subject if subject[pid] in a_subjects)
 b_papers = sorted(pid for pid in subject if subject[pid] not in a_subjects)
 

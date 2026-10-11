@@ -130,7 +130,10 @@ print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")
 ```
 
 
-## Bridge note (deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **An edge is a self-`search`.** The derived neighbor graph is self-kNN:
 > kNN-graph construction (monograph Part I) expressed as the engine retrieving,

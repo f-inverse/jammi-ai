@@ -4,13 +4,6 @@ Run with `python cookbook/recipes/cross_modal_search/example.py`, or a step at
 a time as a notebook: each `# %%` cell is one step.
 """
 
-# %% [markdown]
-# An OpenCLIP-format checkpoint carries a vision tower and a text tower that
-# project into one shared space, so a text query encoded by the text tower
-# searches an image index directly: no separate text encoder, no projection
-# bridge. The checkpoint is LAION's CLIP ViT-B/32 from the Hugging Face Hub,
-# downloaded on first use (about 600 MB) and cached.
-
 # %%
 import math
 import tempfile

@@ -135,7 +135,10 @@ scale to see the whole ordering, measured.
 db.close()
 ```
 
-## Bridge note (a signature chapter — deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **Graph-supervised metric learning = contrastive fine-tune over walk-sampled
 > graph edges.** node2vec / DeepWalk's skip-gram over random walks (Grover &

@@ -6,6 +6,159 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+A newcomer read the cookbook end to end, and what it found is fixed where it lives: in the
+engine when the engine was wrong, in the page when the page was. A fine-tune adapts its encoder
+by default, every error names its condition and every caller's mistake names its argument, a
+job has one handle, a typed vocabulary and real progress, and the engine names no platform.
+
+A fine-tune adapts its encoder, and serves the head it trained. A fine-tune that named no
+`target_modules` used to train a projection head over a frozen encoder, which moved retrieval by
+nothing at the cookbook's small scale (precision@10 0.566 → 0.565, where LoRA on the attention's
+query and value projections moved it +0.024). A regression head trained a projection and a
+distribution layer and served the distribution layer alone, and a classification fine-tune
+trained a head serving never loaded.
+
+- **Encoder × head.** `FineTuneConfig.encoder` is `EncoderTraining::Adapted { target_modules,
+  layers_to_transform, rank_pattern }` (the default) or `Frozen`; Python takes
+  `encoder="adapted" | "frozen"` beside `target_modules`. An adapted encoder with no sites named
+  trains its architecture's query/value projections — `Wqkv` on ModernBERT, `in_proj` on
+  OpenCLIP, `q_lin`/`v_lin` on DistilBERT. Classification and regression train a head over
+  either encoder; an embedding task trains one only over a frozen encoder.
+- **One head, trained and served.** A head is its `HeadLayer`s, named by what it outputs
+  (`embedding`, `classes` with their labels, `distribution` with its scaler and form); the
+  trainer builds them and serving rebuilds them from that one definition, so a served output is
+  the trained one. A fine-tuned classifier serves its own class names; image embeddings apply
+  a fine-tuned head too.
+- **Adapters on disk.** `adapter_config.json` is `{"encoder": "frozen", "head": …}` or
+  `{"encoder": "adapted", "adapters": …, "head": …}`; `use_rslora` is required, and an adapter
+  of an id no family writes, or a tower its family does not have, is refused at load.
+
+Every engine error names its condition. `JammiError::Other` is gone, and the string-carrying
+variants carry engine faults only.
+
+- **New conditions.** `InvalidArgument { argument, reason }` names the argument a verb could not
+  act on — a SQL statement or filter that does not plan, a column a source does not hold, an
+  unknown file format, a fine-tuning column that does not fit its task; `ResultTableExists`
+  answers a `CREATE TABLE … AS` over an existing table (`ALREADY_EXISTS`); `Internal` and
+  `AnnIndex` are engine faults; `Remote { class, message }` is an error a peer sent without a
+  typed detail, with the class its status code named.
+- **Classes that follow the cause.** An unregistered base model is `ModelNotFound`; a storage
+  URL, scheme, missing object or refused credential is classified by the storage error itself;
+  an unparseable configuration file is `INVALID_ARGUMENT`; a remote model endpoint that stays
+  unreachable through its retries is `UNAVAILABLE`. A mutable table whose id is taken — by its
+  own tenant or another, since the id is unique across tenants — is `AlreadyExists` naming the
+  id, where it surfaced a raw constraint violation, and an index name declared twice is refused
+  when the definition is built. A missing
+  trigger topic and a missing SQL relation are `NotFound` in process and over the wire, and a
+  Flight SQL error reaches the Python client as the same class as a gRPC one.
+- **No flattened errors.** A typed error raised inside a query plan survives to the caller
+  through the one structural classifier; the server's admission-limit refusals carry their
+  status code alone; a trigger error crosses the wire in its own detail.
+
+Named entities decode by word. NER grouped subword tokens into entities, so a tokenizer that split
+"Hooli" into `Ho`/`##oli` produced two entities of two types; entities are now decoded over the
+tokenizer's words, taking a word's first subtoken's tag, and gold spans are `Span`s (the
+`eval_inference_ner` recipe's F1 0.860 → 0.916).
+
+Evaluation ground truth is called that. `golden_source` is `ground_truth` in every verb, report,
+proto and catalog column (migration 048).
+
+What every path refused is gone: Avro as a file format, the `ListTopics` paging fields the server
+never filled, and the NER fine-tuning scaffolding no producer reached — a fine-tune for the `ner`
+task is refused at submission. `infer` whose key column is also a content column now runs, and a
+JSON-lines source lists `.jsonl` or `.ndjson` through the same path as every other format.
+
+The engine names no platform. The `jammi.v1.lifecycle` package (license, bootstrap, login and
+status rpcs no engine handler served), its `jammi_admin::lifecycle` client and the
+`jammi.platform` plug-in slot of the Python client (with `PlatformNotInstalledError`) are gone; a
+consumer ships its own contract and its own SDK on top of a published Jammi. The server type is
+`jammi_server::runtime::Server`.
+
+Conformal calibration under known structure is one scheme, on every surface.
+
+- **`Calibration`.** `ConformalModel::classification` and `ConformalModel::regression` take a
+  `Calibration` — `Marginal`, `Mondrian { groups }` or `Weighted { weights }` — and serving
+  takes the `TestPoint` it reads: nothing, the row's cohort, or the row's likelihood ratio. The
+  six `_mondrian` / `_weighted` constructors are gone.
+- **Weighted conformal holds each test row's own weight.** The threshold puts the test row's
+  likelihood ratio at `+∞` (Tibshirani et al. 2019), so a row the calibration era
+  under-represents gets a wider set; the weighted constructors held every row to a unit test
+  weight.
+- **A regressor's estimates name its score.** `Estimates::Points` is absolute-residual and
+  `Estimates::Bands` is CQR, and a serving row is an `Estimate` of the same form; `IntervalScore`
+  and the ignored arguments it implied are gone. The context predictor's `ConformalLevers` is
+  `Calibration`.
+- **Python.** `conformalize`, `conformalize_interval` and `conformalize_cqr` take `groups` with
+  `test_groups` (Mondrian) or `weights` with `test_weights` (weighted) on both transports, and
+  the embedded verbs answer on a closed database as the remote ones do.
+
+A job's vocabulary is typed, its progress is real, and it has one handle.
+
+- **Typed on every surface.** A job's status, kind and phase, and a worker's state and device
+  kinds, cross the wire as `jammi.v1.job` enums and reach every client typed — `JobStatusInfo`,
+  `JobSummary` and `WorkerSummary` in `jammi-admin`; `jammi.JobStatus`, `JobKind`, `JobPhase`,
+  `WorkerState` and `JobProgress` in Python, on both transports. A value a job does not have — an
+  output model, an error, a claimant, a worker's label — is absent on the wire and `None` in every
+  client, never an empty string.
+- **Progress is produced.** A running job reports its phase and how far through it is: rows while
+  it assembles a training set or computes a table, optimizer steps while it trains, then
+  publishing, written at every phase change and at most once a second between. `progress()`
+  returns it on both transports (migration 049: `progress_done`/`progress_total`).
+- **One job handle.** `jammi_ai::jobs::JobHandle` is what every submit returns and
+  `InferenceSession::job(id)` attaches; `TrainingJob` is gone. A training job's output model id is
+  the one its submit stamps on its row, which every surface relays; a listing names only a model
+  the job produced, so a failed or cancelled job lists none.
+- **A failed job is `JobFailed`.** Waiting on a job that ended `failed` raises
+  `JammiError::JobFailed { job_id, reason }` — `jammi.JobFailed` in Python, on both transports —
+  carrying the error its executor recorded, verbatim; `TrainingError` is a training computation
+  failing in process. A recorded result that does not decode is a catalog fault on every surface,
+  never an empty `metrics()`.
+- **A fine-tune's metrics name what they hold.** `final_loss` is `best_epoch` and `best_loss`: the
+  epoch whose adapters were published and its value of the monitored loss. A validation loss is
+  scored over small held-out batches, so it is not on the training curve's scale.
+
+A caller's mistake is named as the caller's, on every surface.
+
+- **Request arguments.** About sixty validations — the fine-tune and context-predictor
+  configurations, the graph sampler, propagation readouts, structure encodings, neighbour
+  graphs, lexical indexes, served widths, source formats and `reconcile`'s grace — refuse with
+  `InvalidArgument { argument, reason }`, naming the argument as the verb spells it, where they
+  read "Configuration error: …". `val_loss` without a validation split and
+  `keep_last_n_checkpoints = 0` are the caller's argument too, not training failures.
+- **Every Python failure is in the taxonomy.** The Python client's bad-argument refusals are
+  `InvalidArgument` (it raised plain `ValueError`), and a closed-vocabulary argument is refused
+  with every accepted spelling; the embedded binding's bare `ValueError` / `RuntimeError` are
+  `NotFound` (a missing topic), `InvalidArgument`, `FailedPrecondition` (a closed session or
+  ephemeral session, a re-entered tenant scope) or `BackendError`. A closed remote session
+  raises `FailedPrecondition`, as the embedded one does. `PERMISSION_DENIED` and
+  `UNAUTHENTICATED` raise `jammi.errors.PermissionDenied` and `jammi.errors.Unauthenticated`
+  on both transports and the Flight SQL lane. `search(query=…)` refuses a query that is not a
+  vector of numbers.
+- **A remote tenant scope keeps its prior.** Re-entering a remote `tenant_scope` restored the
+  prior tenant in the middle of the live scope; it is refused, with no side effect, as the
+  embedded one is.
+
+Reports name what they hold.
+
+- **An acceleration report names each op's `kernel`,** the key `kernel_dispatches` counts it
+  under, so the two join without knowing the kernels' names.
+- **A context predictor's metrics name its `held_out_tasks`.**
+- **A batch's `_latency_ms` and the observer's latency are one measurement.**
+- **Both Rust clients decode a job one way.** `DataClient::job_status`, `wait_job` and
+  `list_jobs` return `jammi_wire::JobStatusInfo` / `JobSummary`, the types `jammi-admin`
+  returns, where they returned raw wire messages.
+
+The cookbook teaches with the engine's own numbers. The eval pages show a misclassified review,
+real predictions and the recall ceiling a subject-wide relevant set allows; the
+context-predictor recipe evaluates every task the job held out; the session-lifecycle recipe
+keeps real images in the session and shows the table gone after close; a search record shows
+the provenance channel that found it; the unified-client chapter proves its error parity
+against a live server through public API only; and claims that held only at full scale (the
+fusion comparison, the asymmetric-binary threshold, the ANN cost column) say so.
+
+Workspace crates build without incremental compilation, so sccache caches them, and
+`ci/dev.sh --gc` prunes target artifacts no build has written for a week.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

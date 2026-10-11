@@ -93,7 +93,10 @@ encoder already places most of the 400 papers by subject, and their 1,577
 citations have little to add: the delta sits within noise of zero. What
 propagation buys depends on what the graph knows that the encoder does not.
 
-## Bridge note (a signature chapter — deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **Propagation = one low-pass graph filter = one SGC/APPNP layer = the
 > vector-agg over neighbours.** One equation, three names, one

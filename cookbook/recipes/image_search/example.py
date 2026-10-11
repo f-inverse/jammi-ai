@@ -4,12 +4,6 @@ Run with `python cookbook/recipes/image_search/example.py`, or a step at a time
 as a notebook: each `# %%` cell is one step.
 """
 
-# %% [markdown]
-# The encoder is an OpenCLIP checkpoint from the Hugging Face Hub, LAION's
-# CLIP ViT-B/32, downloaded on first use (about 600 MB) and cached. Any
-# OpenCLIP-format model id, or a local directory as `local:<path>`, works the
-# same way.
-
 # %%
 import json
 import tempfile

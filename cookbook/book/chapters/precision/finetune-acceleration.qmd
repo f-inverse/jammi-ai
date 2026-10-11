@@ -118,10 +118,12 @@ else:
 ## The counters agree with the report
 
 The report is the decision; the job's metrics count what the kernels then did —
-for every fused operation, how many calls ran fused, ran eager, or were declined.
-An operation the report says held never fell back to its eager composition, and
-FlashAttention's counter shows it ran the attention exactly when the report says it
-held:
+for every fused kernel, how many calls ran fused, ran eager, or were declined.
+Each reported operation names the `kernel` it dispatches through, the key its
+counter is under (two operations can share one: LoRA's low-rank update and its
+dropout run in one fused kernel). An operation the report says held never fell
+back to its eager composition, and FlashAttention's counter shows it ran the
+attention exactly when the report says it held:
 
 ```{python}
 dispatches = job.metrics()["kernel_dispatches"]
@@ -129,11 +131,14 @@ for key, count in sorted(dispatches.items()):
     print(f"  {key:<26} fused {count['fused']:>5}   eager {count['eager']:>5}   "
           f"declined {count['declined']:>5}")
 
-held = [op for op, v in report["ops"].items() if v["holds"] and f"{op}_fused" in dispatches]
+held = {op: v["kernel"] for op, v in report["ops"].items() if v["holds"]}
+claim("every held operation's kernel is counted",
+      all(kernel in dispatches for kernel in held.values()),
+      ", ".join(f"{op} → {kernel}" for op, kernel in held.items()))
 claim("no held operation fell back to eager",
-      all(dispatches[f"{op}_fused"]["eager"] == 0 for op in held), ", ".join(held))
+      all(dispatches[kernel]["eager"] == 0 for kernel in held.values()), ", ".join(held))
 claim("the held operations ran fused",
-      sum(dispatches[f"{op}_fused"]["fused"] for op in held) > 0)
+      all(dispatches[kernel]["fused"] > 0 for kernel in held.values()))
 flash_runs = dispatches["attention_block_flash"]["fused"]
 claim("FlashAttention ran exactly when the report says it held",
       (flash_runs > 0) == report["flash"]["holds"], f"{flash_runs} fused calls")

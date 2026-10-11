@@ -18,7 +18,8 @@ L2-normalized embeddings), downloaded from the Hugging Face Hub on first use
 OpenAI CLIP, other LAION sizes, EVA-CLIP, or one tuned on a domain's imagery,
 such as `patentclip/PatentCLIP_Vit_B` for technical drawings — the encoder is
 read from the checkpoint's `open_clip_config.json`. Change `MODEL` in the
-program to try one.
+program to try one. A checkpoint directory on disk works the same way, as
+`local:<path>`.
 
 ## API surface exercised
 

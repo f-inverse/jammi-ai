@@ -62,7 +62,9 @@ assignees_url = assignees_path.as_uri()
 # join. The second runs the model inside the query:
 # `annotate(model, task, relation, key_column, content_column)` embeds every
 # paper, and the statement joins each vector back to its paper and its
-# organisation and keeps the papers from US organisations.
+# organisation and keeps the papers from US organisations. A row's `_row_id` is
+# its key as text, whatever the key's type, so the join casts the papers'
+# integer `id` to match.
 
 # %%
 ENRICHED = """

@@ -11,8 +11,8 @@ transport-agnostic `Session` (`file://` -> an in-process `EmbeddedBackend`, dire
 one behavioural contract, so a program written against the contract runs against either; and
 the leaky-abstraction principle [@spolsky2002leaky] — where the two transports genuinely
 diverge, the seam says so out loud (a typed capability, a finite cap), it does not paper over
-it. · **Checked:** measurement (the shared verb vocabulary, every capability boolean, every
-raised class, and the receive-cap edge, each measured live).
+it. · **Checked:** measurement (the shared verb vocabulary, every capability boolean, and
+the raised class on both transports, against a live server, each measured live).
 
 `jammi-ai` (import `jammi`) is the **base**: one lean Python package that speaks to a Jammi engine, local
 or remote. Out of the box it carries the remote arm — `connect("grpc://…")` over the
@@ -123,12 +123,7 @@ Protocol names. We read the Protocol's member list off the Protocol itself and a
 backends are complete against it: the parity is measured member-for-member, not asserted.
 
 ```{python}
-attrs = getattr(Session, "__protocol_attrs__", None)
-if attrs is None:  # <3.12 fallback
-    from typing import _get_protocol_attrs
-
-    attrs = _get_protocol_attrs(Session)
-verbs = sorted(a for a in attrs if not a.startswith("_"))
+verbs = sorted(name for name in vars(Session) if not name.startswith("_"))
 
 emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
 rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
@@ -154,17 +149,13 @@ per-query `audit` log, an `ephemeral_session` storage context, `preload_model` �
 they only mean something in-process. The remote client carries the one that only means
 something across a channel: an opaque per-connection `session_id`.
 
-`close()` is deliberately NOT on that list, and the reason is worth reading. Releasing on
-drop (RAII) is not enough for the embedded arm: under the engine's `unix-excl` catalog seam
-the catalog file is held for as long as any connection in the process has it open, and
-`sqlx` returns pooled connections from a background task, so a dropped handle releases
-nothing at any bounded moment. Releasing it is an **awaited event**, and `close()` is where
-the engine awaits it (`crates/jammi-db/src/catalog/backend_sqlite.rs`). Both transports
-carry `close()` — the remote arm closing a channel, the embedded arm releasing the catalog
-file — so it is no divergence, and a flag every backend sets is a predicate that never
-discriminates. **A member belongs in this enum only while it diverges.** [The segmented-ANN chapter](../segmented-ann/segmented-ann.qmd)'s
-producer is a consumer that needs it: it hands the artifact directory over before reading
-it with stdlib `sqlite3`.
+`close()` is deliberately NOT on that list. Both transports carry it — the remote arm closes
+its channels, the embedded arm releases its catalog directory, returning only once another
+process can open it — so it is no divergence, and a flag every backend sets is a predicate
+that never discriminates. **A member belongs in this enum only while it diverges.**
+[The segmented-ANN chapter](../segmented-ann/segmented-ann.qmd)'s producer is a consumer
+that needs the release: it hands the artifact directory over before reading it with stdlib
+`sqlite3`.
 
 `supports(Capability.X)` answers "does *this* backend carry that feature?" — so a program
 that must run on either transport asks first, rather than guessing and catching. The two
@@ -244,59 +235,36 @@ assert issubclass(InvalidArgument, JammiError) and issubclass(BackendError, Jamm
 
 The sharp test is two-sided parity: a *bad argument* must surface as the **same**
 `InvalidArgument` class whether the embedded engine rejected it in-process or a server
-rejected it over the wire. We provoke both under one `except JammiError` clause. The
-embedded side rejects a malformed tenant id in-process. The remote side receives a server
-`INVALID_ARGUMENT` status — injected at the transport boundary exactly as a live server's
-status would arrive (the same hermetic technique the engine's own conformance suite uses),
-so the verb still routes through the real client mapping without a socket being dialed.
+rejected it over the wire. We provoke both under one `except JammiError` clause: an empty
+channel id, refused in process and by a real `jammi-server` (`jammi.testing.LiveServer`
+starts one on ports the kernel assigns). The [error taxonomy](../error-taxonomy/error-taxonomy.qmd)
+chapter measures every condition this way.
 
 ```{python}
-import grpc
+import uuid
+
+from jammi.testing import LiveServer
 
 
-class _FakeRpcError(grpc.RpcError):
-    """A grpc.RpcError carrying a chosen status code, as a server would set it."""
-    def __init__(self, code, details):
-        self._code, self._details = code, details
-    def code(self):
-        return self._code
-    def details(self):
-        return self._details
+def bad_argument(db) -> JammiError:
+    """The error one bad argument raises, caught by one clause whatever the transport."""
+    with db.tenant_scope(str(uuid.uuid4())):
+        try:
+            db.register_channel("", priority=1, columns=[("x", "Utf8")])
+        except JammiError as exc:
+            return exc
+    raise AssertionError("an empty channel id must be refused")
 
 
-class _RaisingStub:
-    """A transport stub whose every verb raises a fixed status — the wire hop,
-    stubbed, so no server socket is opened."""
-    def __init__(self, err):
-        self._err = err
-    def __getattr__(self, _name):
-        def _raise(*_a, **_k):
-            raise self._err
-        return _raise
+emb_exc = bad_argument(embedded)
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as served:
+    rem_exc = bad_argument(served)
 
-
-caught = []
-
-# Embedded transport — the in-process engine rejects a malformed tenant id.
-try:
-    embedded.set_tenant("not-a-uuid")
-except JammiError as exc:
-    caught.append(("embedded", exc))
-
-# Remote transport — a server INVALID_ARGUMENT status, mapped by the client.
-remote._catalog = _RaisingStub(_FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, "bad arg"))
-try:
-    remote.list_sources()
-except JammiError as exc:  # the SAME clause catches the remote side
-    caught.append(("remote", exc))
-
-for where, exc in caught:
+for where, exc in (("embedded", emb_exc), ("remote", rem_exc)):
     print(f"{where:<9} -> {type(exc).__name__:<16} "
           f"JammiError={isinstance(exc, JammiError)} ValueError={isinstance(exc, ValueError)}")
 
-(_, emb_exc), (_, rem_exc) = caught
 assert type(emb_exc) is type(rem_exc) is InvalidArgument, "same class on both transports"
-assert len(caught) == 2, "one `except JammiError` caught both transports"
 ```
 
 Both transports, one clause, one class. The develop→deploy substitution holds for the
@@ -306,84 +274,15 @@ error-handling path, not only the happy path.
 
 There is one place the two transports genuinely differ in what they can *return*. The
 embedded engine hands a result back in-process — a Python object, unbounded by any wire
-budget. The remote transport carries every result as a gRPC message, and gRPC caps the
-receive size. The client raises that cap off gRPC's stock 4 MB default to a generous but
-**finite** 64 MiB, sized for a realistic unary result table while still bounding a
-pathological one. The honest thing is that this bound is *finite and named*, not infinite
-and hidden: a result exceeding it does not silently truncate — it raises `BackendError`,
-mapped from gRPC's `RESOURCE_EXHAUSTED`.
+budget. The remote transport carries a verb's result as one gRPC message, and the client caps
+what it will receive at a generous but **finite** 64 MiB, sized for a realistic result table
+while still bounding a pathological one. A result past the cap does not silently truncate:
+it raises `BackendError`, from gRPC's `RESOURCE_EXHAUSTED`. SQL is the exception: `sql`
+streams its result over Flight SQL batch by batch, so no single message carries the whole
+table.
 
-```{python}
-from jammi._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
-
-print(f"remote receive cap (production default): "
-      f"{MAX_RECEIVE_MESSAGE_LENGTH:,} bytes = {MAX_RECEIVE_MESSAGE_LENGTH // (1024*1024)} MiB")
-print(f"embedded in-process return:              unbounded (no wire message)")
-assert MAX_RECEIVE_MESSAGE_LENGTH == 64 * 1024 * 1024
-```
-
-We exercise the mechanism for real. A 64 MiB payload is impractical to move inside the book's
-CPU harness, so the *reject* arm is shown at a scaled-down configured cap — the mechanism is
-the channel's receive cap whatever its value — while the *generous* arm runs at the real
-64 MiB production default. A minimal in-process gRPC server returns a 256 KiB payload; a
-channel whose cap is 64 KiB rejects it with a real `RESOURCE_EXHAUSTED`, which the real
-client mapping turns into `BackendError`; a channel at the production 64 MiB returns it whole.
-
-```{python}
-import concurrent.futures
-
-_ECHO = "/jammi.probe.Echo/Get"
-PAYLOAD_BYTES = 256 * 1024  # the result a server returns
-DEMO_CAP_BYTES = 64 * 1024  # a scaled-down receive cap that refuses it
-
-
-def echo_server(payload):
-    def handler(_req, _ctx):
-        return payload
-    rpc = grpc.unary_unary_rpc_method_handler(
-        handler, request_deserializer=lambda b: b, response_serializer=lambda b: b)
-    generic = grpc.method_handlers_generic_handler("jammi.probe.Echo", {"Get": rpc})
-    server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=2), handlers=[generic])
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    return server, port
-
-
-def receive_at_cap(port, cap):
-    channel = grpc.insecure_channel(
-        f"127.0.0.1:{port}", options=[("grpc.max_receive_message_length", cap)])
-    stub = channel.unary_unary(
-        _ECHO, request_serializer=lambda b: b, response_deserializer=lambda b: b)
-    try:
-        return len(stub(b"go")), None
-    except grpc.RpcError as exc:
-        return None, exc
-    finally:
-        channel.close()
-
-
-payload = b"x" * PAYLOAD_BYTES
-server, port = echo_server(payload)
-try:
-    generous_bytes, generous_err = receive_at_cap(port, MAX_RECEIVE_MESSAGE_LENGTH)
-    capped_bytes, capped_err = receive_at_cap(port, DEMO_CAP_BYTES)
-finally:
-    server.stop(0)
-
-mapped = _rpc_to_jammi(capped_err)
-print(f"payload:                    {len(payload):,} bytes")
-print(f"channel @ 64 MiB (prod):    returned {generous_bytes:,} bytes  (mirrors embedded)")
-print(f"channel @ {DEMO_CAP_BYTES // 1024} KiB (demo cap):  grpc {capped_err.code().name} "
-      f"-> {type(mapped).__name__}")
-
-assert generous_err is None and generous_bytes == len(payload)
-assert capped_err.code() is grpc.StatusCode.RESOURCE_EXHAUSTED
-assert type(mapped) is BackendError and isinstance(mapped, JammiError)
-```
-
-The same payload the capped channel refused, the embedded engine returns in-process — no
-message, no cap. We build a same-scale result and read it back through the embedded `Session`
-to show the unbounded counterpart directly.
+The embedded counterpart is unbounded — a same-scale result read back through the embedded
+`Session` arrives whole, in process:
 
 ```{python}
 import pyarrow as pa
@@ -397,9 +296,7 @@ with tempfile.TemporaryDirectory() as d:
     got = embedded.sql("SELECT id FROM big.public.big")
 
 print(f"embedded returned:          {got.num_rows:,} rows = {got.nbytes:,} bytes in-process")
-print(f"  exceeds the {DEMO_CAP_BYTES // 1024} KiB remote cap: {got.nbytes > DEMO_CAP_BYTES}")
 assert got.num_rows == 40_000 and got.nbytes == 40_000 * 4
-assert got.nbytes > DEMO_CAP_BYTES
 ```
 
 Both sessions' work is done, so they are closed. A remote session's `close()` releases its
@@ -420,8 +317,6 @@ print(f"  capability sets complementary ({len(emb_live)} capabilities):       "
       f"{all(emb_live[k] != rem_live[k] for k in emb_live)}")
 print(f"  bad argument -> same class on both transports:          "
       f"{type(emb_exc).__name__ == type(rem_exc).__name__ == 'InvalidArgument'}")
-print(f"  remote receive cap finite (64 MiB) + loud on exceed:    {type(mapped).__name__}")
-print(f"  embedded returns the same-scale payload unbounded:      {got.nbytes > DEMO_CAP_BYTES}")
 ```
 
 The substitution the whole book leans on — write once against `Session`, run in-process or

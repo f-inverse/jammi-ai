@@ -27,11 +27,10 @@ HNSW graph also carries per-node link overhead that has nothing to do with how t
 themselves are stored, and that overhead does not shrink with `storage_precision` at all. The
 aggressive quantization also means the retrieve stage's own ranking is far noisier than
 `int8`'s — so `binary` needs its own, much wider default oversample to let the exact-`f32`
-rescore recover the answer at all. This chapter measures both halves of that trade honestly: the
-vector payload really does shrink 32×, the *whole graph file* shrinks by a real but smaller
-factor once link overhead is counted, and the default oversample of `32` really is load-bearing,
-not a conservative buffer — turn it down towards `1` and recall collapses, because the retrieve
-stage no longer offers the rescore stage enough real candidates to recover from.
+rescore recover the answer at all. This chapter measures both halves of that trade: the vector
+payload shrinks 32×, the whole graph file by a smaller factor once link overhead is counted,
+and the default oversample of `32` is load-bearing — turn it down towards `1` and recall
+collapses, because the retrieve stage no longer offers the rescore enough real candidates.
 
 ## The corpus, the oracle, and the tables
 
@@ -207,22 +206,12 @@ default gives — reachable from `search`'s own keywords at `binary` precision t
 
 ## Bridge note
 
-> **The biggest quantization step needs the widest recovery, and rescore is what makes that
-> honest.** HNSW [@malkov2020hnsw] gives approximate search its speed by navigating a proximity
-> graph instead of scanning every vector; `binary` pushes the accuracy-for-memory trade
-> [@johnson2021billion] to its most aggressive point on this axis — one packed sign bit per
-> dimension, ranked by Hamming distance, a **vector payload** a full 32× smaller than `f32`'s.
-> Measured here: that 32× is real for the payload, but the *whole graph file* shrinks by a
-> smaller, still-real factor, because a fixed per-node link-overhead cost (the topology HNSW
-> itself needs, independent of how each node's vector is stored) does not shrink with
-> `storage_precision` — so "binary is 32× smaller" is a claim about the vectors inside the
-> graph, not the graph file a deployment actually keeps memory-resident. And the raw,
-> un-rescored Hamming ranking really is close to useless on its own — but the engine never
-> ships that number, because `needs_rescore()` is unconditional for `binary`. What the
-> deployment default buys is not "32× cheaper, free" — it is "a much smaller vector payload
-> inside the same graph topology, with recall recovered by a mandatory exact rescore at an
-> oversample wide enough to still find the true neighbours in the coarse candidate set,"
-> measured here at the engine's own default of `32` where an untouched deployment lands exactly
-> there, not at the shared `4` every other precision uses. Both the deployment-default
-> `storage_precision = "binary"` and the per-request `oversample` override are reachable from the
-> same public `jammi.connect` / `search` surface every other chapter in this book writes against.
+> **The biggest quantization step needs the widest recovery.** HNSW [@malkov2020hnsw] searches
+> by navigating a proximity graph instead of scanning every vector; `binary` pushes the
+> accuracy-for-memory trade [@johnson2021billion] to its most aggressive point — one packed
+> sign bit per dimension, ranked by Hamming distance, a vector payload 32× smaller than
+> `f32`'s. The graph file shrinks by less, because its per-node links do not shrink with
+> `storage_precision`. The Hamming ranking alone is close to useless, so a `binary` search
+> always rescores against the exact vectors, and its default oversample of `32` is what keeps
+> the true neighbours in the candidate set the rescore sees. `storage_precision` in the
+> engine's configuration and `oversample` on `search` are the two knobs.

@@ -343,7 +343,10 @@ doctrine puts it.
 db.close()
 ```
 
-## Bridge note (a signature chapter — deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **A prediction is a context-conditioned posterior; honest coverage needs the
 > consumer to own the cohort.** The context predictor is a Neural Process

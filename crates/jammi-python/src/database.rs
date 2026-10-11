@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_arrow::{PySchema, PyTable};
@@ -19,7 +18,7 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
-use jammi_db::trigger::{Offset, Predicate};
+use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
@@ -817,20 +816,14 @@ impl PyDatabase {
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
-            })?;
-        let (batches, _schema) = batch.into_inner();
+            .ok_or_else(|| to_pyerr(TriggerError::TopicNotFound(topic.to_string())))?;
+        let (batches, schema) = batch.into_inner();
         // The publisher accepts one RecordBatch per call; concatenate the
         // streamed chunks so a multi-chunk pyarrow.Table publishes as one
         // logical event.
-        let concatenated = if batches.len() == 1 {
-            batches
-                .into_iter()
-                .next()
-                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("publish batch was empty"))?
+        let concatenated = if let [single] = batches.as_slice() {
+            single.clone()
         } else {
-            let schema = batches[0].schema();
             arrow::compute::concat_batches(&schema, batches.iter())
                 .map_err(|e| to_pyerr(datafusion::error::DataFusionError::from(e)))?
         };
@@ -866,19 +859,19 @@ impl PyDatabase {
             (true, bound) => bound,
             (false, Some(bound)) => Some(bound),
             (false, None) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "a collect that follows the live tail (replay_only=False) needs \
-                     max_batches: the tail never ends on its own",
-                ))
+                return Err(to_pyerr(JammiError::InvalidArgument {
+                    argument: "max_batches".into(),
+                    reason: "a collect that follows the live tail (replay_only=False) needs \
+                             one: the tail never ends on its own"
+                        .into(),
+                }))
             }
         };
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
-            })?;
+            .ok_or_else(|| to_pyerr(TriggerError::TopicNotFound(topic.to_string())))?;
         let predicate = Predicate::from_sql(
             self.session.context(),
             Arc::clone(&topic_def.schema),
@@ -1229,7 +1222,7 @@ impl PyDatabase {
                 Ok(())
             }
             None if if_exists => Ok(()),
-            None => Err(PyValueError::new_err(format!("topic '{name}' not found"))),
+            None => Err(to_pyerr(TriggerError::TopicNotFound(name.to_string()))),
         }
     }
 
@@ -1824,16 +1817,16 @@ pub struct PyTenantScope {
 impl PyTenantScope {
     fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
         let this = slf.borrow(py);
-        let mut slot = this
-            .prior
-            .lock()
-            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?;
+        let mut slot = this.prior.lock().map_err(|_| {
+            crate::error::client_error("BackendError", "tenant scope lock poisoned".into())
+        })?;
         // One scope object enters once: a second `__enter__` would clobber the
         // captured prior and lose it on exit. Nesting uses a fresh object per
         // `with`, matching the remote generator's raise-on-reenter semantics.
         if slot.is_some() {
-            return Err(PyValueError::new_err(
-                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`",
+            return Err(crate::error::client_error(
+                "FailedPrecondition",
+                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`".into(),
             ));
         }
         *slot = Some(this.session.tenant());
@@ -1853,7 +1846,9 @@ impl PyTenantScope {
         let prior = self
             .prior
             .lock()
-            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?
+            .map_err(|_| {
+                crate::error::client_error("BackendError", "tenant scope lock poisoned".into())
+            })?
             .take();
         // `Some(Some(t))` restores the prior tenant, `Some(None)` restores the
         // unscoped state, and `None` (never entered) is a no-op — collapsing the
@@ -1894,9 +1889,10 @@ fn edge_gather_from_kwargs(
         Some("in") => EdgeDirection::In,
         Some("undirected") => EdgeDirection::Undirected,
         Some(o) => {
-            return Err(PyValueError::new_err(format!(
-                "edge_direction must be 'out', 'in', or 'undirected' (got '{o}')"
-            )))
+            return Err(to_pyerr(JammiError::InvalidArgument {
+                argument: "edge_direction".into(),
+                reason: format!("must be one of ['in', 'out', 'undirected'] (got '{o}')"),
+            }))
         }
     };
     let mut gather = EdgeGather::new(EdgeSourceRef::Registered {

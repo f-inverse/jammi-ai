@@ -252,7 +252,7 @@ def test_tenant_scope_reuse_is_rejected(tmp_path):
     scope = db.tenant_scope(TENANT_B)
     with scope:
         assert db.tenant() == TENANT_B
-        with pytest.raises(ValueError):
+        with pytest.raises(jammi.errors.FailedPrecondition):
             scope.__enter__()
         # The failed re-entry changed nothing.
         assert db.tenant() == TENANT_B

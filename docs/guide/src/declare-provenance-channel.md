@@ -177,28 +177,28 @@ for batch in &merged {
 
 ### Python
 
-From the SQL surface, the declared columns show up in any query that touches the result table — Python sees them as plain Arrow columns:
+A channel's columns are contributed where the batches are produced, in
+process, through `merge_channels`. From Python, the registry is what you read
+back: `list_channels()` names each channel visible to the session with its
+priority and declared columns.
 
 ```python
-table = db.sql(
-    "SELECT _row_id, similarity, ranker, rank_score FROM results LIMIT 3"
-)
-for row in table.to_pylist():
-    print(row["ranker"], row["rank_score"])
+scored_by = next(c for c in db.list_channels() if c["channel_id"] == "scored_by")
+print([(c["name"], c["data_type"]) for c in scored_by["columns"]])
 ```
 
 ## What you cannot do
 
 The channel declaration is append-only. Once `scored_by` ships with `ranker: Utf8`, you cannot:
 
-- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict { … })`, whose message is `"channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32"`. From Python, the same call raises `RuntimeError` carrying the identical message:
+- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict { … })`, whose message is `"channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32"`. From Python, the same call raises `jammi.errors.FailedPrecondition` carrying the identical message:
 
   ```python
   db.add_channel_columns("scored_by", columns=[("ranker", "Int32")])
-  # RuntimeError: channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32
+  # FailedPrecondition: channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32
   ```
 
-- Add a second column with the same name — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnAlreadyDeclared { … })`, whose message is `"channel 'scored_by': column 'ranker' already declared"`.
+- Add a second column with the same name — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnAlreadyDeclared { … })`, whose message is `"channel 'scored_by': column 'ranker' already declared"` (`jammi.errors.AlreadyExists` from Python).
 - Drop `ranker` from the channel — there is no `drop_column` method by design.
 
 If a column needs to change shape, declare a new column under a new name and migrate consumers. This preserves byte-for-byte readability of any backing table or downstream artifact that already references the original column.

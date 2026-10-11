@@ -13,6 +13,7 @@ the transport itself stay with the consumer that owns the channel.
 
 from __future__ import annotations
 
+import numbers
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
 
 import pyarrow as pa
@@ -1507,7 +1508,12 @@ def build_search_request(
     request = embedding_pb2.SearchRequest(source_id=source, k=k, select=list(select or []))
     _set_search_method(request.method, oversample=oversample, exact=exact)
     if query is not None:
-        request.query_vector.CopyFrom(embedding_pb2.QueryVector(values=list(query)))
+        values = [] if isinstance(query, (str, bytes)) else list(query)
+        if not values or not all(isinstance(v, numbers.Real) for v in values):
+            raise InvalidArgument(
+                "query must be a non-empty vector of numbers; encode text with encode_query"
+            )
+        request.query_vector.CopyFrom(embedding_pb2.QueryVector(values=values))
     else:
         request.row_key = row_key
     if filter is not None:

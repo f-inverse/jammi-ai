@@ -18,8 +18,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import grpc
 import pyarrow as pa
@@ -843,6 +842,33 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     raise BackendError("JobStatusResponse carried no terminal result")
 
 
+class _TenantScope:
+    """A remote connection's tenant for one ``with`` block — the remote peer of
+    the embedded engine's tenant scope, with the same entry rules."""
+
+    _UNENTERED = object()
+
+    def __init__(self, db: "RemoteDatabase", tenant_id: str) -> None:
+        self._db = db
+        self._tenant_id = tenant_id
+        self._prior: Any = self._UNENTERED
+
+    def __enter__(self) -> "RemoteDatabase":
+        if self._prior is not self._UNENTERED:
+            raise FailedPrecondition(
+                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`"
+            )
+        self._prior = self._db.tenant()
+        self._db.set_tenant(self._tenant_id)
+        return self._db
+
+    def __exit__(self, *_exc: Any) -> bool:
+        prior, self._prior = self._prior, self._UNENTERED
+        if prior is not self._UNENTERED:
+            self._db.set_tenant(prior or "")
+        return False
+
+
 class RemoteJob:
     """Handle to a remote job (training or compute), polled over `JobService`.
 
@@ -1202,8 +1228,7 @@ class RemoteDatabase:
             catalog_pb2.SetTenantRequest(tenant=catalog_pb2.Tenant(id=tenant_id)),
         )
 
-    @contextmanager
-    def tenant_scope(self, tenant_id: str) -> Iterator["RemoteDatabase"]:
+    def tenant_scope(self, tenant_id: str) -> "_TenantScope":
         """Scope this connection to ``tenant_id`` for the duration of a ``with``
         block, restoring the prior tenant on exit.
 
@@ -1216,17 +1241,14 @@ class RemoteDatabase:
 
         Nesting restores correctly — after an inner ``with db.tenant_scope("b")``
         block exits, the outer ``"a"`` scope is back in effect. The remote tenant
-        lives server-side (keyed by this session id); the client captures the
-        prior tenant locally via `CatalogService.GetTenant` on entry and rebinds
-        it (or clears, if the prior scope was unscoped) on exit, rather than
-        blindly clearing to unscoped.
+        lives server-side (keyed by this session id); the scope captures the
+        prior tenant via `CatalogService.GetTenant` on entry and rebinds it (or
+        clears, if the prior scope was unscoped) on exit. One scope object is
+        entered once at a time, as the embedded one is: a second ``__enter__``
+        raises :class:`~jammi.errors.FailedPrecondition` and leaves the live
+        scope untouched, and an exit of a scope never entered does nothing.
         """
-        prior = self.tenant()
-        self.set_tenant(tenant_id)
-        try:
-            yield self
-        finally:
-            self.set_tenant(prior or "")
+        return _TenantScope(self, tenant_id)
 
     def tenant(self) -> Optional[str]:
         """The tenant currently bound to this connection, or ``None``.

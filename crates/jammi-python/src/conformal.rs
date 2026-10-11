@@ -2,7 +2,6 @@
 //! the engine's [`ConformalModel`]. They hold no session, so they are module
 //! functions of `jammi_native`, not methods of a database.
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use jammi_ai::predict::{Calibration, ClassScore, ConformalModel, Estimate, Estimates, TestPoint};
@@ -95,9 +94,10 @@ pub(crate) fn conformalize_cqr(
     scheme: SchemeArgs,
 ) -> PyResult<Vec<(f64, f64)>> {
     if test_lower.len() != test_upper.len() {
-        return Err(PyValueError::new_err(
-            "cqr conformal: 'test_lower' and 'test_upper' must have equal length",
-        ));
+        return Err(to_pyerr(JammiError::InvalidArgument {
+            argument: "test_upper".into(),
+            reason: "must have one bound per test_lower bound".into(),
+        }));
     }
     let scheme = Scheme::new(scheme, test_lower.len())?;
     let model = ConformalModel::regression(
@@ -214,8 +214,9 @@ fn parse_class_score(score: &str, (lambda, k_reg): (f64, usize)) -> PyResult<Cla
         "lac" => Ok(ClassScore::Lac),
         "aps" => Ok(ClassScore::Aps),
         "raps" => Ok(ClassScore::Raps { lambda, k_reg }),
-        other => Err(PyValueError::new_err(format!(
-            "unknown classification conformal score '{other}', expected 'lac', 'aps', or 'raps'"
-        ))),
+        other => Err(to_pyerr(JammiError::InvalidArgument {
+            argument: "score".into(),
+            reason: format!("must be one of ['aps', 'lac', 'raps'] (got '{other}')"),
+        })),
     }
 }

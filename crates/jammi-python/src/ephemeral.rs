@@ -9,7 +9,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyErr;
 use pyo3_arrow::{PySchema, PyTable};
@@ -64,10 +63,13 @@ impl PyEphemeralSession {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("ephemeral session lock poisoned"))?;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("ephemeral session is already closed"))?;
+            .map_err(|_| client_error("BackendError", "ephemeral session lock poisoned".into()))?;
+        let session = guard.as_mut().ok_or_else(|| {
+            client_error(
+                "FailedPrecondition",
+                "ephemeral session is already closed".into(),
+            )
+        })?;
         f(session).map_err(ephemeral_err)
     }
 }
@@ -108,16 +110,11 @@ impl PyEphemeralSession {
     #[pyo3(signature = (name, *, batch))]
     fn insert(&self, name: &str, batch: PyTable) -> PyResult<u64> {
         let (batches, schema) = batch.into_inner();
-        let concatenated = if batches.len() == 1 {
-            batches
-                .into_iter()
-                .next()
-                .ok_or_else(|| PyValueError::new_err("insert batch was empty"))?
-        } else if batches.is_empty() {
-            return Ok(0);
-        } else {
-            arrow::compute::concat_batches(&schema, batches.iter())
-                .map_err(|e| PyRuntimeError::new_err(format!("concat insert batches: {e}")))?
+        let concatenated = match batches.as_slice() {
+            [] => return Ok(0),
+            [single] => single.clone(),
+            _ => arrow::compute::concat_batches(&schema, batches.iter())
+                .map_err(|e| client_error("BackendError", format!("concat insert batches: {e}")))?,
         };
         let rt = Arc::clone(&self.runtime);
         self.with_session(|s| crate::released(&rt, s.insert(name, concatenated)))
@@ -151,10 +148,9 @@ impl PyEphemeralSession {
     /// `closed` lifecycle event. Idempotent — closing twice is a no-op.
     fn close(&self) -> PyResult<()> {
         let taken = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("ephemeral session lock poisoned"))?;
+            let mut guard = self.inner.lock().map_err(|_| {
+                client_error("BackendError", "ephemeral session lock poisoned".into())
+            })?;
             guard.take()
         };
         match taken {

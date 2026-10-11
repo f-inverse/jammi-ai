@@ -55,8 +55,8 @@ impl Catalog {
                     Ok(())
                 })
             })
-            .await?;
-        Ok(())
+            .await
+            .map_err(|e| registration_error(e, &def.id))
     }
 
     /// Look up a mutable table by id, scoped to the catalog's current tenant.
@@ -328,6 +328,17 @@ pub(crate) struct MutableRowPayload {
     backend_kind: String,
     order_column: Option<String>,
     indexes: Vec<MutableIndexDef>,
+}
+
+/// What registering `id` failing with `e` means. A built definition's only
+/// unique key in the catalog is its table id (its builder refuses an index
+/// name declared twice), so a constraint violation is that id being taken —
+/// by any tenant, since a mutable table's id is unique across tenants.
+pub(crate) fn registration_error(e: BackendError, id: &MutableTableId) -> MutableTableError {
+    match e {
+        BackendError::Constraint { .. } => MutableTableError::AlreadyExists(id.clone()),
+        other => MutableTableError::Backend(other),
+    }
 }
 
 impl MutableRowPayload {

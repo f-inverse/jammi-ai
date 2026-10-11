@@ -197,6 +197,21 @@ impl MutableTableDefinitionBuilder {
             }
         }
 
+        // An index name is the second half of the `mutable_table_indexes`
+        // key, so with each declared once a built definition's only unique
+        // key in the catalog is its table id.
+        let mut index_names = std::collections::HashSet::new();
+        if let Some(dup) = self
+            .indexes
+            .iter()
+            .find(|idx| !index_names.insert(idx.name.as_str()))
+        {
+            return Err(MutableTableError::Schema(format!(
+                "index name '{}' is declared more than once",
+                dup.name
+            )));
+        }
+
         if let Some(ref col) = self.order_column {
             let field = self.schema.field_with_name(col).map_err(|_| {
                 MutableTableError::Schema(format!("order_column '{col}' not in schema"))
@@ -303,6 +318,28 @@ mod tests {
             .map(|(name, ty)| Field::new(*name, ty.clone(), false))
             .collect();
         Arc::new(Schema::new(fields))
+    }
+
+    #[test]
+    fn an_index_name_declared_twice_is_refused() {
+        let index = |name: &str, column: &str| MutableIndexDef {
+            name: name.into(),
+            columns: vec![column.into()],
+            unique: false,
+        };
+        let err = MutableTableDefinitionBuilder::new(
+            MutableTableId::new("widgets").unwrap(),
+            schema_with(&[("id", DataType::Int64), ("name", DataType::Utf8)]),
+        )
+        .primary_key(vec!["id".into()])
+        .index(index("by_name", "name"))
+        .index(index("by_name", "id"))
+        .build()
+        .expect_err("a second index under one name must be refused");
+        assert!(
+            matches!(&err, MutableTableError::Schema(msg) if msg.contains("'by_name'")),
+            "{err:?}"
+        );
     }
 
     #[test]

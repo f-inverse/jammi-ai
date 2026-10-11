@@ -785,12 +785,9 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .expect("remote create_mutable_table");
     assert_eq!(id.as_str(), "patents_dim");
 
-    // A second create of the same id fails the same way on both transports: the
-    // backing-store unique constraint trips, surfacing
-    // `MutableTable(Backend(Constraint { .. }))`. This exercises the *nested*
-    // engine-owned `BackendError` reconstruction — the remote transport must
-    // rebuild the inner `Backend(Constraint)` faithfully, never folding the
-    // outer `MutableTable` to `Other`.
+    // A second create of the same id fails the same way on both transports:
+    // `MutableTable(AlreadyExists(id))`, the nested variant rebuilt with its
+    // id over the wire, never folded to `Remote`.
     let local_dup = local
         .create_mutable_table(patents_dim_definition())
         .await
@@ -800,21 +797,14 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .create_mutable_table(patents_dim_definition())
         .await
         .expect_err("remote re-create must fail");
-    match (&local_dup, &remote_dup) {
-        (
-            JammiError::MutableTable(MutableTableError::Backend(local_b)),
-            JammiError::MutableTable(MutableTableError::Backend(remote_b)),
-        ) => assert_eq!(
-            local_b.to_string(),
-            remote_b.to_string(),
-            "the nested Backend error crosses the wire intact"
-        ),
-        (_, JammiError::Remote { .. }) => {
-            panic!(
-                "REGRESSION: the nested MutableTable(Backend) error folded to Remote over the wire"
-            )
-        }
-        other => panic!("remote did not reconstruct MutableTable(Backend) faithfully: {other:?}"),
+    for (transport, err) in [("local", &local_dup), ("remote", &remote_dup)] {
+        assert!(
+            matches!(
+                err,
+                JammiError::MutableTable(MutableTableError::AlreadyExists(taken)) if *taken == id
+            ),
+            "{transport} re-create: {err:?}"
+        );
     }
 
     // The remote drops it; afterwards the local session can recreate it,

@@ -31,6 +31,7 @@ import {
   type AssembleContextResponse,
   type SubmitJobResponse,
   type JobStatusResponse,
+  JobStatus,
   type CreateMutableTableResponse,
   type DescribeTableResponse,
   type RegisterTopicResponse,
@@ -105,7 +106,7 @@ async function verbSurface(c: JammiClient): Promise<void> {
       name: "default.events",
       schema: new Uint8Array(),
     });
-    await c.catalog.listTopics({ pageSize: 10 });
+    await c.catalog.listTopics({});
     await c.catalog.dropTopic({ topicId: topic.topicId, ifExists: true });
 
     // ── EmbeddingService: generate, encode, search ────────────────────────
@@ -202,7 +203,7 @@ async function verbSurface(c: JammiClient): Promise<void> {
       baseModel: "local:/m",
     });
     const status: JobStatusResponse = await c.job.jobStatus({ jobId: ft.jobId });
-    expectTypeOf(status.status).toBeString();
+    expectTypeOf(status.status).toEqualTypeOf<JobStatus>();
     for await (const event of c.job.waitJob({ jobId: ft.jobId })) {
       expectTypeOf(event.event.case).toEqualTypeOf<"progress" | "done" | undefined>();
     }

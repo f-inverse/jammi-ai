@@ -200,19 +200,22 @@ impl PredictiveHead {
     fn validate(&self) -> Result<()> {
         if let PredictiveHead::Quantile { levels } = self {
             if levels.is_empty() {
-                return Err(JammiError::Config(
-                    "Quantile head requires at least one level".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "a quantile head needs at least one level".into(),
+                });
             }
             if levels.iter().any(|&q| !(0.0..1.0).contains(&q)) {
-                return Err(JammiError::Config(
-                    "Quantile levels must lie strictly in (0, 1)".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "must lie strictly in (0, 1)".into(),
+                });
             }
             if levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::Config(
-                    "Quantile levels must be strictly ascending".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "must be strictly ascending".into(),
+                });
             }
         }
         Ok(())
@@ -290,30 +293,41 @@ impl ContextPredictorTrainConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         self.head.validate()?;
         if self.context_k == 0 {
-            return Err(JammiError::Config("context_k must be at least 1".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "context_k".into(),
+                reason: "must be at least 1".into(),
+            });
         }
         if self.epochs == 0 {
-            return Err(JammiError::Config("epochs must be at least 1".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "epochs".into(),
+                reason: "must be at least 1".into(),
+            });
         }
         if !(0.0..1.0).contains(&self.test_task_fraction) || self.test_task_fraction <= 0.0 {
-            return Err(JammiError::Config(
-                "test_task_fraction must lie strictly in (0, 1)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "test_task_fraction".into(),
+                reason: "must lie strictly in (0, 1)".into(),
+            });
         }
         if self.min_task_count < 2 {
-            return Err(JammiError::Config(
-                "min_task_count must be at least 2 (one task each for train and test)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "min_task_count".into(),
+                reason: "must be at least 2 (one task each for train and test)".into(),
+            });
         }
         if matches!(
             self.architecture,
             ContextArchitecture::AttnCnp | ContextArchitecture::Tnp
         ) && (self.num_heads == 0 || !self.hidden_dim.is_multiple_of(self.num_heads))
         {
-            return Err(JammiError::Config(format!(
-                "num_heads ({}) must be non-zero and divide hidden_dim ({})",
-                self.num_heads, self.hidden_dim
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "num_heads".into(),
+                reason: format!(
+                    "must be non-zero and divide hidden_dim ({}), got {}",
+                    self.hidden_dim, self.num_heads
+                ),
+            });
         }
         Ok(())
     }
@@ -355,6 +369,9 @@ pub struct ContextPredictorMetrics {
     /// The objective over the held-out episodes at the same points; empty
     /// when the split held out no task.
     pub held_out_scores: Vec<f64>,
+    /// The tasks the split held out — the ones a reader evaluates the
+    /// published predictor on as unseen.
+    pub held_out_tasks: Vec<String>,
 }
 
 /// The objective over both episode sets as training moves the predictor.
@@ -412,6 +429,8 @@ pub struct SampledEpisodes {
     pub test: Vec<EpisodeBatch>,
     /// Distinct task count the meta-dataset carried (train + test).
     pub task_count: usize,
+    /// The held-out test tasks, by name: unseen at training time.
+    pub held_out_tasks: Vec<String>,
     /// The target standardiser reduced from the train tasks' outcomes — the one
     /// transform that z-scores both ends of an episode and de-standardises the
     /// served head. Engine-internal: a consumer reads the episodes, never the
@@ -558,6 +577,7 @@ impl InferenceSession {
             train,
             test,
             task_count,
+            held_out_tasks: test_tasks,
             scaler,
         })
     }
@@ -788,6 +808,7 @@ impl InferenceSession {
             step_seconds: report.step_seconds,
             train_scores: curve.train,
             held_out_scores: curve.held_out,
+            held_out_tasks: sampled.held_out_tasks.clone(),
         };
 
         self.persist_predictor(spec, &table, &sampled.scaler, &varmap, &metrics)

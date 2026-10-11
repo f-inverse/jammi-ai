@@ -8362,12 +8362,13 @@ fn validate_backbone_precision(
     device: &candle_core::Device,
 ) -> Result<()> {
     if precision == jammi_numerics::ComputePrecision::BF16 && !device.is_cuda() {
-        return Err(JammiError::Config(
-            "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
+        return Err(JammiError::InvalidArgument {
+            argument: "backbone_dtype".into(),
+            reason: "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
              device, whose matmul does not implement bf16. Use f16 for a reduced-precision \
              backbone on CPU, or f32."
                 .into(),
-        ));
+        });
     }
     Ok(())
 }
@@ -8859,9 +8860,12 @@ fn probe_acceleration(
                 } else {
                     reason_from_probe_window(&window, registry_key)
                 };
+                // `kernel` is the dispatch registry key the op admits under —
+                // the key `kernel_dispatches` counts it by — so a reader joins
+                // the two without knowing the kernels' own names.
                 ops.insert(
                     report_key.to_string(),
-                    serde_json::json!({"holds": holds, "reason": reason}),
+                    serde_json::json!({"holds": holds, "reason": reason, "kernel": registry_key}),
                 );
             }
         }
@@ -9160,16 +9164,18 @@ fn build_encoder_adapters(
         .and_then(|v| v.as_str())
         .unwrap_or("<absent>");
 
-    let family = EncoderFamily::from_config(&model_config).ok_or_else(|| {
-        JammiError::Config(format!(
-            "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
+    let family =
+        EncoderFamily::from_config(&model_config).ok_or_else(|| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!(
+                "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
              (base model '{base_model_id}'); supported: bert, roberta, camembert, \
              xlm-roberta, distilbert, modernbert, an OpenCLIP checkpoint \
              (open_clip_config.json with model_cfg), or an HF-CLAP audio checkpoint \
              (clap_audio_model). `encoder=\"frozen\"` trains a head over any \
              backbone instead."
-        ))
-    })?;
+            ),
+        })?;
     let EncoderTraining::Adapted {
         target_modules,
         layers_to_transform,
@@ -9503,24 +9509,27 @@ fn build_encoder_adapters(
             Some(layers) => format!(" restricted to layers {layers:?}"),
             None => String::new(),
         };
-        return Err(JammiError::Config(format!(
-            "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
+        return Err(JammiError::InvalidArgument {
+            argument: "target_modules".into(),
+            reason: format!(
+                "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
              (base model '{base_model_id}', model_type '{model_type}'), so this job would \
              train zero parameters and publish an adapter that changes nothing. This \
              tower's own LoRA site names are: {:?} — a selector matches a site name \
              exactly or as a suffix of it (so 'query' selects 'attention.self.query' on a \
              BERT-family tower, whose sites are named by their full dotted checkpoint \
              path), and 'all-linear' selects every site.{}",
-            target_modules,
-            family.adapter_model_type(),
-            encoder.lora_site_names(),
-            if restriction.is_empty() {
-                ""
-            } else {
-                " If the selectors are right for this architecture, check \
+                target_modules,
+                family.adapter_model_type(),
+                encoder.lora_site_names(),
+                if restriction.is_empty() {
+                    ""
+                } else {
+                    " If the selectors are right for this architecture, check \
                  layers_to_transform for an out-of-range or off-by-one layer index."
-            },
-        )));
+                },
+            ),
+        });
     }
 
     Ok((encoder, adapter_cfg))
@@ -10230,8 +10239,8 @@ mod tests {
             "error must name a usable alternative: {msg}"
         );
         assert!(
-            matches!(err, JammiError::Config(_)),
-            "a refusal of the job's own configuration, got {err:?}"
+            matches!(&err, JammiError::InvalidArgument { argument, .. } if argument == "backbone_dtype"),
+            "a refusal of the job's own argument, got {err:?}"
         );
     }
 

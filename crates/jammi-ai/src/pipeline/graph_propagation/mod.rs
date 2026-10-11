@@ -283,9 +283,10 @@ pub(crate) fn check_alpha(alpha: f64) -> Result<()> {
     if (0.0..=1.0).contains(&alpha) {
         Ok(())
     } else {
-        Err(JammiError::Config(format!(
-            "a propagation's teleport probability must lie in [0, 1], got {alpha}"
-        )))
+        Err(JammiError::InvalidArgument {
+            argument: "alpha".into(),
+            reason: format!("a propagation's teleport probability must lie in [0, 1], got {alpha}"),
+        })
     }
 }
 
@@ -731,11 +732,14 @@ impl InferenceSession {
             previous.reclaim().await;
         }
         if summary.rows == 0 {
-            return Err(JammiError::Config(format!(
+            return Err(JammiError::InvalidArgument {
+                argument: "edge_source".into(),
+                reason: format!(
                 "{}: the graph has no node to embed — the edge relation and the node set it is \
                  read against share no key",
                 table.source_id
-            )));
+            ),
+            });
         }
         building
             .finish(
@@ -954,7 +958,10 @@ mod tests {
             assert!(check_alpha(alpha).is_ok());
         }
         for alpha in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
-            assert!(matches!(check_alpha(alpha), Err(JammiError::Config(_))));
+            assert!(matches!(
+                check_alpha(alpha),
+                Err(JammiError::InvalidArgument { .. })
+            ));
         }
     }
 

@@ -5586,9 +5586,10 @@ fn matryoshka_sum(
     let mut total: Option<Tensor> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::Config(format!(
-                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: format!("entry {dim} exceeds the embedding width {full_dim}"),
+            });
         }
         let truncated: Vec<Tensor> = embeddings
             .iter()
@@ -5631,9 +5632,10 @@ fn matryoshka_sum_per_example(
     let mut total: Option<Vec<f64>> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::Config(format!(
-                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: format!("entry {dim} exceeds the embedding width {full_dim}"),
+            });
         }
         let truncated: Vec<Tensor> = embeddings
             .iter()
@@ -6332,7 +6334,7 @@ mod tests {
         let objective = |dims: Vec<Tensor>| mnrl_loss(&dims[0], &dims[1], None, 20.0, true);
         let err = matryoshka_sum(&[8], &[&anchor, &positive], &objective).unwrap_err();
         assert!(
-            matches!(err, JammiError::Config(ref m) if m.contains("exceeds the embedding width")),
+            matches!(err, JammiError::InvalidArgument { ref argument, ref reason } if argument == "matryoshka_dims" && reason.contains("exceeds the embedding width")),
             "expected an oversized-dim error, got {err:?}"
         );
     }

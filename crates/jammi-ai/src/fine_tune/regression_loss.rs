@@ -388,9 +388,10 @@ pub(crate) fn pinball_loss(input: &Tensor, target: &Tensor, levels: &[f64]) -> R
         )));
     }
     if levels.is_empty() {
-        return Err(JammiError::Config(
-            "pinball loss requires at least one quantile level".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "quantile_levels".into(),
+            reason: "the pinball loss needs at least one level".into(),
+        });
     }
 
     let mut total: Option<Tensor> = None;

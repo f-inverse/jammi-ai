@@ -785,10 +785,13 @@ impl TrainingDataLoader {
                 positives,
                 negatives,
             }) => Ok((anchors.clone(), positives.clone(), Some(negatives.clone()))),
-            LoaderData::Rows(_) => Err(JammiError::Config(format!(
-                "GradCache applies only to in-batch-negative formats (pairs/triplet), not {:?}",
-                self.format()
-            ))),
+            LoaderData::Rows(_) => Err(JammiError::InvalidArgument {
+                argument: "cached".into(),
+                reason: format!(
+                    "GradCache applies only to in-batch-negative formats (pairs/triplet), not {:?}",
+                    self.format()
+                ),
+            }),
             LoaderData::Precomputed(_) => Err(JammiError::Internal(
                 "GradCache requires text rows, not precomputed batches".into(),
             )),

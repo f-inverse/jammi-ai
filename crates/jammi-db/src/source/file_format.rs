@@ -110,10 +110,13 @@ pub async fn create_listing_table(
 ) -> Result<(Arc<dyn TableProvider>, Option<String>)> {
     if let Some(ext) = file_extension {
         if ext.is_empty() || !ext.starts_with('.') {
-            return Err(JammiError::Config(format!(
-                "file_extension override '{ext}' must be non-empty and start with '.' (e.g. \
+            return Err(JammiError::InvalidArgument {
+                argument: "file_extension".into(),
+                reason: format!(
+                    "file_extension override '{ext}' must be non-empty and start with '.' (e.g. \
                  '.jsonl')"
-            )));
+                ),
+            });
         }
     }
 

@@ -191,12 +191,22 @@ impl SourceRegistry {
         let connection = &definition.connection;
         match &definition.source_type {
             SourceType::File => {
-                let format = connection.format.as_ref().ok_or_else(|| {
-                    JammiError::Config(format!("File source '{source_id}' requires a format"))
-                })?;
-                let raw_url = connection.url.as_deref().ok_or_else(|| {
-                    JammiError::Config(format!("File source '{source_id}' requires a URL"))
-                })?;
+                let format =
+                    connection
+                        .format
+                        .as_ref()
+                        .ok_or_else(|| JammiError::InvalidArgument {
+                            argument: "format".into(),
+                            reason: format!("File source '{source_id}' requires a format"),
+                        })?;
+                let raw_url =
+                    connection
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| JammiError::InvalidArgument {
+                            argument: "url".into(),
+                            reason: format!("File source '{source_id}' requires a URL"),
+                        })?;
                 let url = StorageUrl::parse(raw_url)?;
                 let (table, resolved_extension) = file_format::create_listing_table(
                     &self.storage,

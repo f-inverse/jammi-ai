@@ -589,36 +589,54 @@ impl FineTuneConfig {
         use jammi_db::error::JammiError;
 
         if self.lora_rank == 0 {
-            return Err(JammiError::Config("lora_rank must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_rank".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if let Warmup::Fraction(fraction) = self.warmup {
             if !(0.0..1.0).contains(&fraction) {
-                return Err(JammiError::Config(format!(
-                    "warmup fraction must be in [0, 1), got {fraction}"
-                )));
+                return Err(JammiError::InvalidArgument {
+                    argument: "warmup_fraction".into(),
+                    reason: format!("must be in [0, 1), got {fraction}"),
+                });
             }
         }
         if self.lora_alpha <= 0.0 {
-            return Err(JammiError::Config("lora_alpha must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_alpha".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if !(0.0..1.0).contains(&self.lora_dropout) {
-            return Err(JammiError::Config(
-                "lora_dropout must be in [0.0, 1.0)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_dropout".into(),
+                reason: "must be in [0.0, 1.0)".into(),
+            });
         }
         if self.learning_rate <= 0.0 {
-            return Err(JammiError::Config("learning_rate must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "learning_rate".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.epochs == 0 {
-            return Err(JammiError::Config("epochs must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "epochs".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.batch_size == 0 {
-            return Err(JammiError::Config("batch_size must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "batch_size".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.gradient_accumulation_steps == 0 {
-            return Err(JammiError::Config(
-                "gradient_accumulation_steps must be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "gradient_accumulation_steps".into(),
+                reason: "must be > 0".into(),
+            });
         }
         // Domain-validity at the edge: a NaN `max_grad_norm` compares `false`
         // against everything, so it would pass a `<= 0.0` "disabled" check
@@ -626,20 +644,22 @@ impl FineTuneConfig {
         // of non-finite tuning parameter. `0.0` (disable) and any finite
         // value stay legal.
         if !self.max_grad_norm.is_finite() {
-            return Err(JammiError::Config(format!(
-                "max_grad_norm must be finite, got {}",
-                self.max_grad_norm
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "max_grad_norm".into(),
+                reason: format!("must be finite, got {}", self.max_grad_norm),
+            });
         }
         if !(0.0..1.0).contains(&self.validation_fraction) {
-            return Err(JammiError::Config(
-                "validation_fraction must be in [0.0, 1.0)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "validation_fraction".into(),
+                reason: "must be in [0.0, 1.0)".into(),
+            });
         }
         if self.early_stopping_patience == 0 {
-            return Err(JammiError::Config(
-                "early_stopping_patience must be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "early_stopping_patience".into(),
+                reason: "must be > 0".into(),
+            });
         }
         // Monitoring a metric that will never be measured. Refused rather than
         // coerced to TrainLoss: the caller asked for two things that cannot both
@@ -650,56 +670,64 @@ impl FineTuneConfig {
         if self.validation_fraction == 0.0
             && self.early_stopping_metric == EarlyStoppingMetric::ValLoss
         {
-            return Err(JammiError::FineTune(
-                "early_stopping_metric=val_loss requires validation_fraction > 0; \
-                 set early_stopping_metric=train_loss to train on the whole \
-                 dataset, or raise validation_fraction to hold out a split"
+            return Err(JammiError::InvalidArgument {
+                argument: "early_stopping_metric".into(),
+                reason: "val_loss requires validation_fraction > 0; set \
+                         early_stopping_metric=train_loss to train on the whole dataset, or \
+                         raise validation_fraction to hold out a split"
                     .into(),
-            ));
+            });
         }
         if self.hard_negatives.mine {
             if self.hard_negatives.k == 0 {
-                return Err(JammiError::Config(
-                    "hard_negatives.k must be > 0 when mining is enabled".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "hard_negative_k".into(),
+                    reason: "must be > 0 when mining is enabled".into(),
+                });
             }
             if self.hard_negatives.refresh_every == 0 {
-                return Err(JammiError::Config(
-                    "hard_negatives.refresh_every must be > 0 when mining is enabled".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "hard_negative_refresh_every".into(),
+                    reason: "must be > 0 when mining is enabled".into(),
+                });
             }
         }
         if self.matryoshka_dims.contains(&0) {
-            return Err(JammiError::Config(
-                "matryoshka_dims entries must all be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: "entries must all be > 0".into(),
+            });
         }
         if let Some(RegressionLoss::BetaNll { beta }) = self.regression_loss {
             if !(0.0..=1.0).contains(&beta) {
-                return Err(JammiError::Config(
-                    "regression_loss BetaNll beta must be in [0.0, 1.0]".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "regression_beta".into(),
+                    reason: "must be in [0.0, 1.0]".into(),
+                });
             }
         }
         if matches!(self.regression_loss, Some(RegressionLoss::Pinball)) {
             if self.quantile_levels.is_empty() {
-                return Err(JammiError::Config(
-                    "Pinball regression loss requires at least one quantile level".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "the pinball loss needs at least one level".into(),
+                });
             }
             if self
                 .quantile_levels
                 .iter()
                 .any(|&q| !(0.0..1.0).contains(&q) || q <= 0.0)
             {
-                return Err(JammiError::Config(
-                    "quantile_levels must lie strictly in (0, 1)".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "must lie strictly in (0, 1)".into(),
+                });
             }
             if self.quantile_levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::Config(
-                    "quantile_levels must be strictly ascending".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "must be strictly ascending".into(),
+                });
             }
         }
         // 0 is ambiguous; omit the field to keep all. A caller that means "no
@@ -707,12 +735,13 @@ impl FineTuneConfig {
         // artifact is unconditional and unaffected either way) — refuse rather
         // than silently reinterpret it.
         if self.keep_last_n_checkpoints == Some(0) {
-            return Err(JammiError::FineTune(
-                "keep_last_n_checkpoints=0 is ambiguous; omit the field to disable per-epoch \
-                 checkpointing entirely (the default), or set it to a value >= 1 to enable it \
-                 and retain a rolling window (>= epochs retains every epoch)"
+            return Err(JammiError::InvalidArgument {
+                argument: "keep_last_n_checkpoints".into(),
+                reason: "0 is ambiguous; omit the field to disable per-epoch checkpointing \
+                         entirely (the default), or set it to a value >= 1 to enable it and \
+                         retain a rolling window (>= epochs retains every epoch)"
                     .into(),
-            ));
+            });
         }
         Ok(())
     }

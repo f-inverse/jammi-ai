@@ -59,9 +59,12 @@ pub(crate) fn served_width(
     match dimensions {
         None => Ok(native),
         Some(width) if (1..=native).contains(&width) => Ok(width),
-        Some(width) => Err(JammiError::Config(format!(
+        Some(width) => Err(JammiError::InvalidArgument {
+            argument: "dimensions".into(),
+            reason: format!(
             "cannot serve {width} dimensions of '{model_id}', whose embeddings are {native} wide"
-        ))),
+        ),
+        }),
     }
 }
 

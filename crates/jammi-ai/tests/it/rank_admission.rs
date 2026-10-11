@@ -606,7 +606,7 @@ async fn an_invalid_context_predictor_config_is_refused_through_the_real_edge() 
         .await
         .expect_err("an invalid predictor config must be refused, never enqueued");
     assert!(
-        matches!(error, JammiError::Config(_)),
+        matches!(&error, JammiError::InvalidArgument { argument, .. } if argument == "context_k"),
         "an invalid configuration value is the caller's to fix, got {error:?}"
     );
     assert!(

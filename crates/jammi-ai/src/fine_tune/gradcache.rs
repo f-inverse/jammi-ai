@@ -59,7 +59,7 @@ pub fn gradcache_backward(
     trainable_vars: &[Var],
 ) -> Result<GradStore> {
     if chunk_size == 0 {
-        return Err(JammiError::Config(
+        return Err(JammiError::Internal(
             "gradcache chunk_size must be > 0".into(),
         ));
     }

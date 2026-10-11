@@ -221,18 +221,24 @@ impl SourceDefinition {
                     ..Default::default()
                 },
             }),
-            (Some(source_type), Some(format)) => Err(crate::error::JammiError::Config(format!(
-                "a {source_type:?} source is a database, not a file: it takes no format \
+            (Some(source_type), Some(format)) => Err(crate::error::JammiError::InvalidArgument {
+                argument: "format".into(),
+                reason: format!(
+                    "a {source_type:?} source is a database, not a file: it takes no format \
                  (got `{format}`)"
-            ))),
+                ),
+            }),
             (None, Some(format)) => Ok(Self {
                 source_type: SourceType::File,
                 connection: SourceConnection::parse(url, format)?,
             }),
-            (None, None) => Err(crate::error::JammiError::Config(format!(
-                "`{url}` names a file, which needs a format (parquet, csv, json, jsonl); a \
+            (None, None) => Err(crate::error::JammiError::InvalidArgument {
+                argument: "format".into(),
+                reason: format!(
+                    "`{url}` names a file, which needs a format (parquet, csv, json, jsonl); a \
                  database source is a `postgres://` or `mysql://` URL"
-            ))),
+                ),
+            }),
         }
     }
 }

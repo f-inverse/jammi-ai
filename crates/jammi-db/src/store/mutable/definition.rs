@@ -284,6 +284,18 @@ pub enum MutableTableError {
 }
 
 impl MutableTableError {
+    /// What inserting `id`'s catalog row failing with `e` means. A built
+    /// definition's only unique key in the catalog is its table id (its
+    /// builder refuses an index name declared twice), so a constraint
+    /// violation is that id being taken — by any tenant, since a mutable
+    /// table's id is unique across tenants.
+    pub(crate) fn from_insert(e: BackendError, id: &MutableTableId) -> Self {
+        match e {
+            BackendError::Constraint { .. } => Self::AlreadyExists(id.clone()),
+            other => Self::Backend(other),
+        }
+    }
+
     /// The condition this error reports ([`crate::error::ErrorClass`]): a
     /// missing table is the `if_exists` no-op signal and an id collision is
     /// distinct from a fault, so neither collapses onto `Internal`.

@@ -9,9 +9,7 @@ use futures::Stream;
 use tokio::sync::Semaphore;
 
 use crate::catalog::backend::{BackendError, Transaction, TxOptions};
-use crate::catalog::mutable_repo::{
-    delete_mutable_table_rows, registration_error, MutableRowPayload,
-};
+use crate::catalog::mutable_repo::{delete_mutable_table_rows, MutableRowPayload};
 use crate::catalog::Catalog;
 use crate::store::mutable::definition::{
     MutableTableDefinition, MutableTableError, MutableTableId,
@@ -93,7 +91,7 @@ impl MutableTableRegistry {
                 })
             })
             .await
-            .map_err(|e| registration_error(e, &def.id))?;
+            .map_err(|e| MutableTableError::from_insert(e, &def.id))?;
 
         Ok(Arc::new(MutableTableProvider::new(
             def,

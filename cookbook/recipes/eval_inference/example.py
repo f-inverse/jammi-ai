@@ -27,7 +27,7 @@ db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
 # %%
 db.add_source("reviews", url=str(fixtures.path("tiny_reviews.parquet")), format="parquet")
-db.add_source("golden", url=str(fixtures.path("tiny_review_labels.csv")), format="csv")
+db.add_source("truth", url=str(fixtures.path("tiny_review_labels.csv")), format="csv")
 
 # %% [markdown]
 # ## Run the classifier and score it
@@ -42,22 +42,23 @@ metrics = db.eval_inference(
     source="reviews",
     columns=["text"],
     task="classification",
-    golden_source="golden.public.tiny_review_labels",
+    ground_truth="truth.public.tiny_review_labels",
     label_column="label",
 )
 
 aggregate = metrics["aggregate"]
 assert aggregate["task"] == "classification", aggregate["task"]
-for key in ("accuracy", "f1"):
-    assert 0.0 <= aggregate[key] <= 1.0, f"{key} out of range: {aggregate[key]}"
 print(f"accuracy:  {aggregate['accuracy']:.4f}")
 print(f"macro_f1:  {aggregate['f1']:.4f}")
+assert aggregate["accuracy"] > 0.5, "half the reviews are each sentiment, so a coin scores 0.5"
 
 # %% [markdown]
 # ## Read the breakdowns
 #
 # `aggregate["per_class"]` scores each label on its own; `per_record` holds one
-# aligned prediction and gold label per row.
+# aligned prediction and gold label per row, so the reviews the model got wrong
+# can be read. A review that reports relief in negative words is the kind of
+# text a sentiment model trips on.
 
 # %%
 per_class = aggregate.get("per_class", {})
@@ -69,14 +70,24 @@ for label, stats in per_class.items():
     )
 
 per_record = metrics["per_record"]
-assert len(per_record) > 0, "per_record must carry one entry per aligned row"
-print(f"{len(per_record)} rows scored; the first: {per_record[0]}")
+assert len(per_record) == 24, "one aligned prediction per review"
+texts = {
+    str(row["id"]): row["text"]
+    for row in db.sql("SELECT id, text FROM reviews.public.tiny_reviews").to_pylist()
+}
+misses = [r for r in per_record if r["predicted"] != r["gold"]]
+for miss in misses:
+    print(f"missed {miss['record_id']}: {texts[miss['record_id']]!r}")
+    print(f"  predicted {miss['predicted']}, gold {miss['gold']}")
+assert len(misses) == round((1 - aggregate["accuracy"]) * len(per_record))
 
 # %% [markdown]
 # ## The predictions alone
 #
 # Without gold labels, `infer` runs the model over a source and returns one
-# row per source row, keyed by `key`, with the model's outputs as columns.
+# row per source row, keyed by `key` (as text, in `_row_id`): the label, the
+# probability the model gave it, and every label's score. They are the labels
+# `eval_inference` scored.
 
 # %%
 predictions = db.infer(
@@ -87,7 +98,12 @@ predictions = db.infer(
     key="id",
 )
 assert predictions.num_rows == 24, predictions.num_rows
-print(f"{predictions.num_rows} rows, columns {predictions.column_names}")
+rows = predictions.select(["_row_id", "label", "confidence"]).to_pylist()
+for row in rows[:4]:
+    print(f"{row['label']:<9} {row['confidence']:.3f}  {texts[row['_row_id']]!r}")
+scored = {r["record_id"]: r["predicted"] for r in per_record}
+assert all(row["label"] == scored[row["_row_id"]] for row in rows)
+assert all(row["confidence"] >= 0.5 for row in rows), "a two-label top choice holds at least half"
 
 # %%
 db.close()

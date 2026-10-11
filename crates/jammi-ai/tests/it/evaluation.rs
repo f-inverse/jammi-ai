@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use jammi_ai::eval::golden::{ensure_column, RelevanceJudgment};
+use jammi_ai::eval::ground_truth::{ensure_column, RelevanceJudgment};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::SearchMethod;
 use jammi_datafusion::ModelTask;
@@ -169,14 +169,14 @@ fn classification_metrics_known_inputs() {
 
 // ─── ROUGE-L ────────────────────────────────────────────────────────────────
 //
-// ─── Golden dataset schema validation ────────────────────────────────────────
+// ─── Ground-truth dataset schema validation ────────────────────────────────────────
 //
 // Guards that user-facing error messages name the offending column and type.
 // This is a user experience guardrail — silent wrong-type acceptance would
 // produce confusing metric results downstream.
 
 #[test]
-fn golden_schema_validation() {
+fn truth_schema_validation() {
     let schema = Schema::new(vec![
         Field::new("query_id", DataType::Utf8, false),
         Field::new("query_text", DataType::Utf8, false),
@@ -290,7 +290,7 @@ async fn catalog_eval_run_crud_and_latest() {
             eval_type: "embedding".into(),
             model_id: Some("model-a::1".into()),
             source_id: "src".into(),
-            golden_source: "golden".into(),
+            ground_truth: "truth".into(),
             k: Some(10),
             metrics_json: r#"{"recall_at_k": 0.5}"#.into(),
             status: "completed".into(),
@@ -304,7 +304,7 @@ async fn catalog_eval_run_crud_and_latest() {
             eval_type: "embedding".into(),
             model_id: Some("model-a::1".into()),
             source_id: "src".into(),
-            golden_source: "golden".into(),
+            ground_truth: "truth".into(),
             k: Some(10),
             metrics_json: r#"{"recall_at_k": 0.8}"#.into(),
             status: "completed".into(),
@@ -327,22 +327,22 @@ async fn catalog_eval_run_crud_and_latest() {
 // ─── End-to-end: eval_embeddings pipeline with tiny_bert ─────────────────────
 //
 // Runs the full pipeline: register source → generate
-// embeddings → register golden → eval_embeddings → check metrics + catalog.
+// embeddings → register truth → eval_embeddings → check metrics + catalog.
 // Uses tiny_bert (32-dim, local) so no network access needed.
 
 fn tiny_bert_model() -> String {
     "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
-async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String, TempDir) {
+async fn session_with_embeddings_and_truth() -> (Arc<InferenceSession>, String, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
-    embeddings_and_golden(config, dir).await
+    embeddings_and_truth(config, dir).await
 }
 
-/// The patents embedded with `tiny_bert` under `config`, and the golden
+/// The patents embedded with `tiny_bert` under `config`, and the truth
 /// relevance set, in a session over `dir`.
-async fn embeddings_and_golden(
+async fn embeddings_and_truth(
     config: JammiConfig,
     dir: TempDir,
 ) -> (Arc<InferenceSession>, String, TempDir) {
@@ -377,13 +377,13 @@ async fn embeddings_and_golden(
         .0;
     let table_name = record.table_name.clone();
 
-    // Register golden relevance dataset
+    // Register ground-truth relevance dataset
     session
         .add_source(
-            "golden_rel",
+            "truth_rel",
             SourceType::File,
             SourceConnection {
-                url: Some(common::fixture_url("golden_relevance.csv")),
+                url: Some(common::fixture_url("relevance.csv")),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -395,17 +395,12 @@ async fn embeddings_and_golden(
 }
 
 /// The four aggregate scores of `table`'s evaluation against the patents'
-/// golden set, ranked by `method`.
+/// ground truth, ranked by `method`.
 async fn scores(session: &InferenceSession, table: &str, method: SearchMethod) -> [f64; 4] {
     let report = session
         .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
             method,
-            ..common::retrieval_eval(
-                "patents",
-                Some(table),
-                "golden_rel.public.golden_relevance",
-                10,
-            )
+            ..common::retrieval_eval("patents", Some(table), "truth_rel.public.relevance", 10)
         })
         .await
         .unwrap();
@@ -423,8 +418,8 @@ async fn an_exact_evaluation_measures_the_embedding_not_the_index() {
     let mut config = common::test_config(dir.path());
     config.embedding.ann.storage_precision = StoragePrecision::Binary;
     config.embedding.ann.oversample = Some(1);
-    let (binary, binary_table, _binary_dir) = embeddings_and_golden(config, dir).await;
-    let (full, full_table, _full_dir) = session_with_embeddings_and_golden().await;
+    let (binary, binary_table, _binary_dir) = embeddings_and_truth(config, dir).await;
+    let (full, full_table, _full_dir) = session_with_embeddings_and_truth().await;
 
     let exact_binary = scores(&binary, &binary_table, SearchMethod::Exact).await;
     let exact_full = scores(&full, &full_table, SearchMethod::Exact).await;
@@ -442,14 +437,14 @@ async fn an_exact_evaluation_measures_the_embedding_not_the_index() {
 
 #[tokio::test]
 async fn eval_embeddings_end_to_end() {
-    let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
+    let (session, table_name, _dir) = session_with_embeddings_and_truth().await;
 
     // eval_embeddings returns retrieval metrics
     let metrics = session
         .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -461,14 +456,14 @@ async fn eval_embeddings_end_to_end() {
     }
 
     // Per-query arrays returned alongside the aggregate; the join key is
-    // the golden source's `query_id` and every record carries finite metrics.
+    // the ground-truth source's `query_id` and every record carries finite metrics.
     assert!(
         !metrics.per_query.is_empty(),
-        "per_query must carry one record per golden-set query"
+        "per_query must carry one record per ground-truth query"
     );
     assert!(
         !metrics.per_query[0].query_id.is_empty(),
-        "per_query records must carry the golden-set query_id"
+        "per_query records must carry the ground-truth query_id"
     );
     assert!(
         metrics
@@ -481,13 +476,13 @@ async fn eval_embeddings_end_to_end() {
         "every per_query record must carry finite metrics"
     );
 
-    // The eval run is recorded in catalog with golden_source and k
+    // The eval run is recorded in catalog with ground_truth and k
     let runs = session.catalog().list_eval_runs().await.unwrap();
     assert!(!runs.is_empty(), "Eval run should be recorded");
     let run = &runs[0];
     assert_eq!(run.eval_type, "embedding");
     assert!(!run.metrics_json.is_empty());
-    assert!(!run.golden_source.is_empty());
+    assert!(!run.ground_truth.is_empty());
     assert_eq!(run.k, Some(10));
     assert_eq!(run.status, "completed");
 
@@ -512,12 +507,12 @@ async fn eval_embeddings_end_to_end() {
 // ─── End-to-end: calibration eval is not model-scoped ────────────────────────
 //
 // A calibration eval scores a held-out predictive distribution supplied in the
-// golden source — never a registered model — so it loads no model and records
+// ground-truth source — never a registered model — so it loads no model and records
 // no `models` row. The recorded `eval_runs` row must therefore carry a NULL
 // `model_id`; forcing a synthetic id into the `NOT NULL REFERENCES
 // models(model_id)` column made the insert fail the foreign key at runtime,
 // so no calibration run could be recorded at all. This exercises the full
-// runner path against a real CSV golden and asserts the run persists with no
+// runner path against a real CSV truth and asserts the run persists with no
 // model scope and the per-record scores land in `_jammi_eval_per_query`.
 
 #[tokio::test]
@@ -528,11 +523,11 @@ async fn eval_calibration_records_run_without_model_scope() {
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
-    // A Gaussian calibration golden: per-record predictive (mean, sd) paired
+    // Gaussian calibration ground truth: per-record predictive (mean, sd) paired
     // with the realised outcome. No model is named or loaded anywhere here.
-    let golden_path = dir.path().join("calibration_golden.csv");
+    let truth_path = dir.path().join("calibration_outcomes.csv");
     std::fs::write(
-        &golden_path,
+        &truth_path,
         "record_id,mean,sd,outcome\n\
          r0,0.0,1.0,0.2\n\
          r1,1.0,0.5,1.1\n\
@@ -543,10 +538,10 @@ async fn eval_calibration_records_run_without_model_scope() {
 
     session
         .add_source(
-            "cal_golden",
+            "cal_truth",
             SourceType::File,
             SourceConnection {
-                url: Some(format!("file://{}", golden_path.to_str().unwrap())),
+                url: Some(format!("file://{}", truth_path.to_str().unwrap())),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -556,8 +551,8 @@ async fn eval_calibration_records_run_without_model_scope() {
 
     let report = session
         .eval_calibration(
-            "cal_golden",
-            "cal_golden.public.calibration_golden",
+            "cal_truth",
+            "cal_truth.public.calibration_outcomes",
             EvalCalibrationShape::Gaussian,
             &Default::default(),
         )
@@ -590,17 +585,17 @@ async fn eval_calibration_records_run_without_model_scope() {
     assert_eq!(per_record.len(), 4, "one row per held-out prediction");
 }
 
-// ─── Multi-part hyphenated golden reference resolves verbatim ────────────────
+// ─── Multi-part hyphenated truth reference resolves verbatim ────────────────
 //
-// A golden source whose name carries a hyphen produces a multi-part relation
-// reference (`"cal-golden-2024".public."calibration-golden"`). Each dotted
+// A ground-truth source whose name carries a hyphen produces a multi-part relation
+// reference (`"cal-truth-2024".public."calibration-truth"`). Each dotted
 // part must be quoted independently — quoting the whole string as one
 // identifier (literal dots) would fail to resolve, and leaving it raw would
 // parse the hyphen as subtraction. The runner must scope the eval against the
 // correct relation and record the run.
 
 #[tokio::test]
-async fn eval_calibration_resolves_multipart_hyphenated_golden() {
+async fn eval_calibration_resolves_multipart_hyphenated_truth() {
     use jammi_ai::eval::EvalCalibrationShape;
 
     let dir = TempDir::new().unwrap();
@@ -610,9 +605,9 @@ async fn eval_calibration_resolves_multipart_hyphenated_golden() {
     // The on-disk file is named with a hyphen so the registered table name is
     // hyphenated too: the relation becomes a multi-part ref with hyphens in
     // both the source and the table part.
-    let golden_path = dir.path().join("calibration-golden.csv");
+    let truth_path = dir.path().join("calibration-truth.csv");
     std::fs::write(
-        &golden_path,
+        &truth_path,
         "record_id,mean,sd,outcome\n\
          r0,0.0,1.0,0.2\n\
          r1,1.0,0.5,1.1\n\
@@ -622,10 +617,10 @@ async fn eval_calibration_resolves_multipart_hyphenated_golden() {
 
     session
         .add_source(
-            "cal-golden-2024",
+            "cal-truth-2024",
             SourceType::File,
             SourceConnection {
-                url: Some(format!("file://{}", golden_path.to_str().unwrap())),
+                url: Some(format!("file://{}", truth_path.to_str().unwrap())),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -637,13 +632,13 @@ async fn eval_calibration_resolves_multipart_hyphenated_golden() {
     // each part. A raw or whole-string quote here would fail to resolve.
     let report = session
         .eval_calibration(
-            "cal-golden-2024",
-            "cal-golden-2024.public.calibration-golden",
+            "cal-truth-2024",
+            "cal-truth-2024.public.calibration-truth",
             EvalCalibrationShape::Gaussian,
             &Default::default(),
         )
         .await
-        .expect("multi-part hyphenated golden reference must resolve verbatim");
+        .expect("multi-part hyphenated truth reference must resolve verbatim");
 
     let per_record = session
         .catalog()
@@ -663,7 +658,7 @@ async fn eval_calibration_resolves_multipart_hyphenated_golden() {
 async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
     use std::collections::{BTreeMap, HashMap};
 
-    let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
+    let (session, table_name, _dir) = session_with_embeddings_and_truth().await;
 
     // Tag query `q1` with an opaque cohort; other queries carry none.
     let mut cohorts: HashMap<String, BTreeMap<String, String>> = HashMap::new();
@@ -678,7 +673,7 @@ async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
             ..common::retrieval_eval(
                 "patents",
                 Some(&table_name),
-                "golden_rel.public.golden_relevance",
+                "truth_rel.public.relevance",
                 10,
             )
         })
@@ -688,7 +683,7 @@ async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
     // The report surfaces the run id that keys the persisted per-query rows.
     assert!(!report.eval_run_id.is_empty());
 
-    // One persisted per-query row per golden-set query.
+    // One persisted per-query row per ground-truth query.
     let persisted = session.eval_per_query(&report.eval_run_id).await.unwrap();
     assert_eq!(
         persisted.len(),
@@ -748,13 +743,13 @@ async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
 
 #[tokio::test]
 async fn eval_compare_self_comparison_has_zero_deltas() {
-    let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
+    let (session, table_name, _dir) = session_with_embeddings_and_truth().await;
 
     let comparison = session
         .eval_compare(common::compare_eval(
             &[table_name.clone(), table_name.clone()],
             "patents",
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -793,13 +788,13 @@ async fn eval_compare_self_comparison_has_zero_deltas() {
 
 #[tokio::test]
 async fn eval_embeddings_is_deterministic() {
-    let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
+    let (session, table_name, _dir) = session_with_embeddings_and_truth().await;
 
     let m1 = session
         .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -809,7 +804,7 @@ async fn eval_embeddings_is_deterministic() {
         .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -852,10 +847,10 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
 
     session
         .add_source(
-            "golden_rel",
+            "truth_rel",
             SourceType::File,
             SourceConnection {
-                url: Some(common::fixture_url("golden_relevance.csv")),
+                url: Some(common::fixture_url("relevance.csv")),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -895,7 +890,7 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
         .eval_compare(common::compare_eval(
             &[rec1.table_name.clone(), rec2.table_name.clone()],
             "patents",
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -977,13 +972,13 @@ async fn eval_image_embeddings_end_to_end() {
         .0;
     let table_name = record.table_name.clone();
 
-    // Register golden image relevance dataset
+    // Register the image relevance judgments
     session
         .add_source(
-            "golden_img",
+            "truth_img",
             SourceType::File,
             SourceConnection {
-                url: Some(common::fixture_url("golden_image_relevance.parquet")),
+                url: Some(common::fixture_url("image_relevance.parquet")),
                 format: Some(FileFormat::Parquet),
                 ..Default::default()
             },
@@ -996,7 +991,7 @@ async fn eval_image_embeddings_end_to_end() {
         .eval_embeddings(common::retrieval_eval(
             "figures",
             Some(&table_name),
-            "golden_img.public.golden_image_relevance",
+            "truth_img.public.image_relevance",
             5,
         ))
         .await
@@ -1013,7 +1008,7 @@ async fn eval_image_embeddings_end_to_end() {
 
 // ─── The query encoder of a derived embedding table ─────────────────────────
 //
-// A golden's text queries are encoded by the model that produced the evaluated
+// A truth's text queries are encoded by the model that produced the evaluated
 // table's vector space. A propagated table mixes its input table's vectors in
 // that table's space, so it is evaluated through its input's encoder; a
 // structure-embedding table's vectors come from graph shape alone, so no text
@@ -1030,7 +1025,7 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
     use jammi_db::store::CachePolicy;
     use std::collections::HashMap;
 
-    let (session, base, _dir) = session_with_embeddings_and_golden().await;
+    let (session, base, _dir) = session_with_embeddings_and_truth().await;
     let graph = session
         .build_neighbor_graph(
             "patents",
@@ -1063,7 +1058,7 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
         .eval_compare(common::compare_eval(
             &[base.clone(), propagated.table_name.clone()],
             "patents",
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
@@ -1084,7 +1079,7 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
             ..common::retrieval_eval(
                 "patents",
                 Some(&structure.table_name),
-                "golden_rel.public.golden_relevance",
+                "truth_rel.public.relevance",
                 10,
             )
         })
@@ -1120,10 +1115,10 @@ async fn a_base_model_resolves_for_every_tenant_that_uses_it() {
         // The sticky binding a client session uses: the first tenant's load
         // is the cold one, the second's is a warm hit on the same model.
         session.bind_tenant(tenant);
-        let (patents, golden) = (format!("patents_{i}"), format!("golden_{i}"));
+        let (patents, truth) = (format!("patents_{i}"), format!("truth_{i}"));
         for (name, file, format) in [
             (&patents, "patents.parquet", FileFormat::Parquet),
-            (&golden, "golden_relevance.csv", FileFormat::Csv),
+            (&truth, "relevance.csv", FileFormat::Csv),
         ] {
             session
                 .add_source(
@@ -1154,7 +1149,7 @@ async fn a_base_model_resolves_for_every_tenant_that_uses_it() {
             .eval_embeddings(common::retrieval_eval(
                 &patents,
                 Some(&table.table_name),
-                &format!("{golden}.public.golden_relevance"),
+                &format!("{truth}.public.relevance"),
                 10,
             ))
             .await;

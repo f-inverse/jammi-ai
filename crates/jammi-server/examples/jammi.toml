@@ -1,10 +1,11 @@
-# Sample configuration for the OSS `jammi-server`.
+# Sample configuration for `jammi-server`.
 #
-# The OSS server is single-tenant — the deployer's network is the
-# auth boundary. Run one server per tenant, or front it with a
-# reverse proxy that enforces tenancy at the HTTP layer.
+# The server authenticates no one: the deployer's network is the auth
+# boundary. A client binds its session's tenant with the `jammi-session-id`
+# header; a deployment that must prove who the caller is fronts the server
+# with an authenticating proxy, or composes its own `TenantResolver`.
 #
-# Persisted state lives under `artifact_dir`. The OSS image's
+# Persisted state lives under `artifact_dir`. The image's
 # Dockerfile declares `/var/lib/jammi` as a volume; mount a named
 # Docker volume (so distroless's nonroot uid 65532 gets ownership)
 # or `chown 65532:65532` your bind-mount host directory.

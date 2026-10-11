@@ -11,7 +11,7 @@
 //! pins three independent facts:
 //!
 //! 1. **Identity** — the saved adapter is
-//!    [`SavedAdapter::EncoderAdapters`](jammi_ai::fine_tune::target::SavedAdapter)
+//!    [`SavedAdapter::Adapted`](jammi_ai::fine_tune::target::SavedAdapter)
 //!    with the architecture id and the `tower` this base/task pair implies.
 //!    A run that coerced the checkpoint to BERT, or that forgot which tower it
 //!    adapted, fails here.
@@ -97,10 +97,10 @@ fn triplet_columns() -> Vec<String> {
     ]
 }
 
-/// A short encoder-adapters config: `target_modules` non-empty is what selects
-/// the encoder-adapters arm at all. Two epochs over a handful of tiny rows is
-/// enough for a non-zero LoRA delta at this learning rate; the point of these
-/// tests is the routing and the round-trip, never convergence.
+/// A short adapted-encoder config at `target_modules`. Two epochs over a
+/// handful of tiny rows is enough for a non-zero LoRA delta at this learning
+/// rate; the point of these tests is the routing and the round-trip, never
+/// convergence.
 fn tower_config(target_modules: &[&str], epochs: usize, learning_rate: f64) -> FineTuneConfig {
     FineTuneConfig {
         epochs,
@@ -111,7 +111,9 @@ fn tower_config(target_modules: &[&str], epochs: usize, learning_rate: f64) -> F
         lr_schedule: LrSchedule::Constant,
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
-        target_modules: target_modules.iter().map(|s| s.to_string()).collect(),
+        encoder: jammi_ai::fine_tune::EncoderTraining::adapted(
+            target_modules.iter().map(|s| s.to_string()).collect(),
+        ),
         ..Default::default()
     }
 }
@@ -135,21 +137,18 @@ async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> Pa
 }
 
 /// Read a published bundle's `adapter_config.json` and assert it is an
-/// encoder-adapters record naming `model_type` and `tower`; return the parsed
+/// adapted-encoder record naming `model_type` and `tower`; return the parsed
 /// config so the reference build below can reuse the EXACT LoRA geometry the
 /// run trained with (rank, alpha, targets, rank pattern) rather than a
 /// hand-written guess that could silently differ.
 fn expect_encoder_adapter(dir: &Path, model_type: &str, tower: Tower) -> AdapterConfig {
     let raw = std::fs::read_to_string(dir.join("adapter_config.json"))
-        .expect("a published encoder-adapters bundle carries adapter_config.json");
+        .expect("a published adapted-encoder bundle carries adapter_config.json");
     let saved: SavedAdapter = serde_json::from_str(&raw).expect("adapter_config.json parses");
-    let cfg = match saved {
-        SavedAdapter::EncoderAdapters(cfg) => *cfg,
-        SavedAdapter::ProjectionHead(_) => panic!(
-            "a run with non-empty target_modules must save an EncoderAdapters adapter, \
-             got a projection head: {raw}"
-        ),
-    };
+    let cfg = saved
+        .adapters()
+        .cloned()
+        .unwrap_or_else(|| panic!("an adapted-encoder run must save encoder adapters: {raw}"));
     assert_eq!(
         cfg.model_type, model_type,
         "the adapter must record the base ARCHITECTURE family's canonical id"
@@ -316,12 +315,12 @@ async fn open_clip_text_tower_adapter_trains_and_serves() {
         .expect("the text-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "open_clip", Tower::Text);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "open_clip text");
@@ -427,7 +426,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         .expect("the text-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves warm");
     assert_differs(
@@ -443,7 +442,7 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_text_query(job.model_id(), PROBE)
+        .encode_text_query(job.output_model_id().unwrap(), PROBE)
         .await
         .expect("the fine-tuned OpenCLIP text model resolves and serves cold");
 
@@ -462,13 +461,13 @@ async fn open_clip_text_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "open_clip text",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::text_serve(base_model.clone(), PROBE),
-        serve_tuned: &common::text_serve(job.model_id().to_string(), PROBE),
+        serve_tuned: &common::text_serve(job.output_model_id().unwrap().to_string(), PROBE),
     })
     .await;
 }
@@ -610,8 +609,8 @@ fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
 /// `&self.float_outputs[0]` read, `job.wait()` still returns an `Err` (the
 /// all-zero placeholder trains the head into a NaN loss within a few steps,
 /// tripping the trainer's own divergence guard), but its message is the
-/// divergence guard's ("Training diverged: loss was NaN or >100 for 3
-/// consecutive batches"), not the corrupt row's own decode failure.
+/// divergence guard's ("training diverged: the loss was NaN or above
+/// 100 for 3 consecutive batches"), not the corrupt row's own decode failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_training_it() {
     let dir = TempDir::new().unwrap();
@@ -643,8 +642,12 @@ async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_traini
             &triplet_columns(),
             FineTuneMethod::Lora,
             ModelTask::ImageEmbedding,
-            // Empty target_modules -> ProjectionHead route -> project_frozen_embedding.
-            Some(tower_config(&[], 2, 5e-3)),
+            // A frozen encoder: the base model's own front end decodes the
+            // group (`frozen_pooled`).
+            Some(FineTuneConfig {
+                encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
+                ..tower_config(&[], 2, 5e-3)
+            }),
         )
         .await
         .unwrap();
@@ -708,12 +711,12 @@ async fn open_clip_vision_tower_adapter_trains_and_serves() {
         .expect("the vision-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "open_clip", Tower::Vision);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "open_clip vision");
@@ -807,7 +810,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
         .expect("the vision-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves warm");
     assert_differs(
@@ -822,7 +825,7 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_image_query(job.model_id(), &probe_bytes)
+        .encode_image_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned OpenCLIP vision model resolves and serves cold");
 
@@ -842,13 +845,16 @@ async fn open_clip_vision_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "open_clip vision",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::image_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        serve_tuned: &common::image_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::image_serve(
+            job.output_model_id().unwrap().to_string(),
+            Arc::clone(&probe_bytes),
+        ),
     })
     .await;
 }
@@ -910,12 +916,12 @@ async fn clap_audio_tower_adapter_trains_and_serves() {
         .expect("the audio-tower fine-tune completes");
 
     // (1) Identity.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let cfg = expect_encoder_adapter(&adapter_dir, "clap_audio_model", Tower::Audio);
 
     // (2) Non-vacuity.
     let tuned_embedding = session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves");
     assert_differs(&base_embedding, &tuned_embedding, "clap audio");
@@ -1003,7 +1009,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
         .expect("the audio-tower fine-tune completes");
 
     let warm_embedding = session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves warm");
     assert_differs(
@@ -1018,7 +1024,7 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
             .unwrap(),
     );
     let cold_embedding = cold_session
-        .encode_audio_query(job.model_id(), &probe_bytes)
+        .encode_audio_query(job.output_model_id().unwrap(), &probe_bytes)
         .await
         .expect("the fine-tuned CLAP audio model resolves and serves cold");
 
@@ -1038,13 +1044,16 @@ async fn clap_audio_tower_adapter_serves_cold_after_restart() {
         session_root: dir.path(),
         warm_session: &session,
         cold_session: &cold_session,
-        model_id: job.model_id(),
+        model_id: job.output_model_id().unwrap(),
         label: "clap audio",
         v_base: &base_embedding,
         v_warm: &warm_embedding,
         v_cold: &cold_embedding,
         serve_base: &common::audio_serve(base_model.clone(), Arc::clone(&probe_bytes)),
-        serve_tuned: &common::audio_serve(job.model_id().to_string(), Arc::clone(&probe_bytes)),
+        serve_tuned: &common::audio_serve(
+            job.output_model_id().unwrap().to_string(),
+            Arc::clone(&probe_bytes),
+        ),
     })
     .await;
 }
@@ -1143,7 +1152,7 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
 ///   changes no loaded byte; an equality that would also hold if BOTH sides
 ///   silently failed is ruled out by the two `expect`s, either of which fires
 ///   first on a refusal).
-/// * TRAINING — the job completes and publishes an encoder-adapters bundle
+/// * TRAINING — the job completes and publishes an adapted-encoder bundle
 ///   recording the `bert` architecture. A run that trained a projection head
 ///   instead, or that recorded some other architecture, fails here.
 #[tokio::test(flavor = "multi_thread")]
@@ -1231,26 +1240,23 @@ async fn an_absent_model_type_trains_and_serves_as_bert() {
         .await
         .expect("a checkpoint that declares no model_type fine-tunes as BERT");
 
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let adapter_dir = adapter_dir_for_model(&session, job.output_model_id().unwrap()).await;
     let raw = std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
-        .expect("a published encoder-adapters bundle carries adapter_config.json");
+        .expect("a published adapted-encoder bundle carries adapter_config.json");
     let saved: SavedAdapter = serde_json::from_str(&raw).expect("adapter_config.json parses");
-    match saved {
-        // A single-tower text family records no `tower` (its adapter has
-        // exactly one place to install); the architecture id is the assertion.
-        SavedAdapter::EncoderAdapters(cfg) => assert_eq!(
-            cfg.model_type, "bert",
-            "the adapter must record the family the ONE predicate resolved, got: {raw}"
-        ),
-        SavedAdapter::ProjectionHead(_) => panic!(
-            "a run with non-empty target_modules must save an EncoderAdapters adapter, \
-             got a projection head: {raw}"
-        ),
-    }
+    // A single-tower text family records no `tower` (its adapter has exactly
+    // one place to install); the architecture id is the assertion.
+    let cfg = saved
+        .adapters()
+        .unwrap_or_else(|| panic!("an adapted-encoder run must save encoder adapters: {raw}"));
+    assert_eq!(
+        cfg.model_type, "bert",
+        "the adapter must record the family the ONE predicate resolved, got: {raw}"
+    );
 }
 
 /// (b). The OpenCLIP checkpoint has no audio tower; an `audio_embedding`
-/// encoder-adapters job over it is a `(family, task)` refusal, not a silently
+/// adapted-encoder job over it is a `(family, task)` refusal, not a silently
 /// mis-routed text or vision build.
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_base_with_audio_task_refuses() {
@@ -1319,13 +1325,16 @@ async fn cross_family_adapter_refuses_at_load() {
     std::fs::write(
         adapter_dir.join("adapter_config.json"),
         serde_json::to_string(&serde_json::json!({
-            "adapter_type": "encoder_adapters",
-            "model_type": "clap_audio_model",
-            "lora_rank": 4,
-            "lora_alpha": 8.0,
-            "use_rslora": false,
-            "target_modules": ["query", "value"],
-            "tower": "audio",
+            "encoder": "adapted",
+            "adapters": {
+                "model_type": "clap_audio_model",
+                "lora_rank": 4,
+                "lora_alpha": 8.0,
+                "use_rslora": false,
+                "target_modules": ["query", "value"],
+                "tower": "audio",
+            },
+            "head": null,
         }))
         .unwrap(),
     )

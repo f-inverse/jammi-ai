@@ -52,6 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_db::catalog::status::JobKind;
 use jammi_db::TenantId;
 use jammi_wire::proto::gang::{rank_event, AbortReason, RankControl, RankEvent};
 
@@ -191,7 +192,7 @@ pub(crate) async fn submit_and_claim(
     catalog
         .submit_job(SubmitJobParams {
             job_id,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec,
             model_ref: None,
@@ -202,7 +203,7 @@ pub(crate) async fn submit_and_claim(
         .await
         .unwrap();
     let claimed = catalog
-        .claim_next(coordinator_instance_id, &["fine_tune"], lease)
+        .claim_next(coordinator_instance_id, &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("must claim the only queued job");
@@ -240,7 +241,7 @@ async fn submit_and_claim_for_tenant(
                     .catalog()
                     .submit_job(SubmitJobParams {
                         job_id: &job_id,
-                        kind: "fine_tune",
+                        kind: JobKind::FineTune,
                         execution: JobExecution::Queued,
                         spec: &spec,
                         model_ref: None,
@@ -256,7 +257,7 @@ async fn submit_and_claim_for_tenant(
     let claimed = server
         .engine
         .catalog()
-        .claim_next(coordinator_instance_id, &["fine_tune"], lease)
+        .claim_next(coordinator_instance_id, &[JobKind::FineTune], lease)
         .await
         .unwrap()
         .expect("must claim the only queued job");

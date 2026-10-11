@@ -21,6 +21,7 @@ with no worker, another runs the worker.
 
 ```{python}
 import tempfile
+import time
 from pathlib import Path
 
 import jammi
@@ -52,7 +53,9 @@ def submit(db):
 ## Submit work no one claims
 
 With `[worker] enabled = false`, this process only submits: its jobs stay
-queued. A handle reads a job's `kind`, `status()` and `progress()`.
+queued. A handle reads a job's `kind`, `status()` and `progress()` — `None`
+until an executor reports any. The model a fine-tune will register is named
+from submission on.
 
 ```{python}
 db = jammi.connect(engine, config=str(no_worker))
@@ -60,8 +63,9 @@ db.add_source("training", url=str(fixtures.path("tiny_pairs.csv")), format="csv"
 
 by_handle, by_id, kept = submit(db), submit(db), submit(db)
 print(f"{by_handle.job_id}: kind={by_handle.kind} status={by_handle.status()}")
-print(f"progress: {by_handle.progress()}")
-assert by_handle.status() == "queued"
+print(f"progress: {by_handle.progress()}; will register {by_handle.output_model_id}")
+assert by_handle.status() is jammi.JobStatus.QUEUED
+assert by_handle.progress() is None
 ```
 
 ## Cancel
@@ -95,9 +99,11 @@ db.close()
 ## Pick the job up from another process
 
 Opened with a worker, the engine claims the job left queued. `job(id)`
-attaches to it by id, and `wait()` returns once the worker has run it; the
-finished job reports its metrics, the acceleration it ran with, and the
-model it produced.
+attaches to it by id. While it runs, `progress()` names its phase and how far
+through it is: rows while it assembles its training set, optimizer steps
+while it trains, then publishing. `wait()` returns once the worker has run
+it; the finished job reports its metrics, the acceleration it ran with, and
+the model it produced.
 
 ```{python}
 db = jammi.connect(engine, config=str(with_worker))
@@ -105,11 +111,23 @@ for worker in db.list_workers():
     print(f"worker {worker['label'] or worker['instance_id']}: {worker['state']}")
 
 job = db.job(kept.job_id)
+phases = []
+while not job.status().is_terminal:
+    progress = job.progress()
+    if progress is not None and (not phases or phases[-1].phase is not progress.phase):
+        phases.append(progress)
+    time.sleep(0.05)
+for progress in phases:
+    print(f"  {progress.phase}: {progress.done} of {progress.total}")
 job.wait()
+assert job.progress().phase is jammi.JobPhase.PUBLISHING, "the last phase a fine-tune reports"
 print(f"{job.job_id}: {job.status()} → {job.output_model_id}")
-print(f"metrics: {job.metrics()}")
-print(f"acceleration: {job.acceleration_report()}")
-assert job.status() == "completed"
+metrics = job.metrics()
+print(f"kept epoch {metrics['best_epoch']} of {len(metrics['train_loss_curve'])}: "
+      f"{metrics['early_stopping_metric']} {metrics['best_loss']:.4f} after {metrics['total_steps']} steps")
+acceleration = job.acceleration_report()
+print(f"ran on {acceleration['device']} in {acceleration['dtype']} ({acceleration['state']})")
+assert job.status() is jammi.JobStatus.COMPLETED
 ```
 
 ## Clean up finished jobs

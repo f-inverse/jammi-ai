@@ -31,6 +31,7 @@ use jammi_ai::{
     Jammi, Modality, PerQueryAudit, QueryInput, SearchQuery, SearchRequest, Session, Target,
 };
 use jammi_client::DataClient;
+use jammi_db::catalog::status::JobKind;
 use jammi_db::error::{IndexKind, JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
@@ -625,7 +626,7 @@ async fn remote_reconcile_reports_like_local() {
             catalog
                 .submit_job(SubmitJobParams {
                     job_id: &job_id,
-                    kind: "fine_tune",
+                    kind: JobKind::FineTune,
                     // Inline: claimed once, by id, right here — never by a
                     // worker loop polling the queue.
                     execution: jammi_db::catalog::status::JobExecution::Inline,

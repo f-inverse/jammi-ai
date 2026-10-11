@@ -30,7 +30,6 @@ fn main() {
         proto_root.join("jammi/v1/training.proto"),
         proto_root.join("jammi/v1/job.proto"),
         proto_root.join("jammi/v1/audit.proto"),
-        proto_root.join("jammi/v1/lifecycle.proto"),
         proto_root.join("jammi/v1/peer.proto"),
         proto_root.join("jammi/v1/gang.proto"),
     ];

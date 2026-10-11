@@ -52,9 +52,10 @@ pub async fn run(
     job_attempt: Option<JobAttempt<'_>>,
 ) -> Result<ResultTableRecord> {
     if params.columns.is_empty() {
-        return Err(JammiError::Config(
-            "build_lexical_index requires at least one text column".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: "names no text column to index".into(),
+        });
     }
     let relation = source_relation(source_id, &session.find_table_name(source_id).await?);
     let text = params

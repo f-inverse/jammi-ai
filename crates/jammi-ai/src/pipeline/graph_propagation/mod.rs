@@ -283,9 +283,10 @@ pub(crate) fn check_alpha(alpha: f64) -> Result<()> {
     if (0.0..=1.0).contains(&alpha) {
         Ok(())
     } else {
-        Err(JammiError::Config(format!(
-            "a propagation's teleport probability must lie in [0, 1], got {alpha}"
-        )))
+        Err(JammiError::InvalidArgument {
+            argument: "alpha".into(),
+            reason: format!("a propagation's teleport probability must lie in [0, 1], got {alpha}"),
+        })
     }
 }
 
@@ -406,7 +407,7 @@ impl InferenceSession {
                     })?;
                 Ok((record, cache_outcome))
             }
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Other(format!(
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Internal(format!(
                 "{verb}: run_now returned a training JobResult for a compute spec"
             ))),
         }
@@ -444,7 +445,7 @@ impl InferenceSession {
         let dimensions = table
             .dimensions()
             .ok_or_else(|| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "propagate_embeddings: embedding table '{}' carries no dimensions",
                     table.table_name
                 ))
@@ -640,7 +641,7 @@ impl InferenceSession {
         let plan = relation
             .create_physical_plan()
             .await
-            .map_err(|e| JammiError::Other(format!("graph propagation: adjacency plan: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("graph propagation: adjacency plan")))?;
         self.write_working_table(ctx, source_id, plan, Some(adjacency_order()))
             .await
     }
@@ -731,11 +732,14 @@ impl InferenceSession {
             previous.reclaim().await;
         }
         if summary.rows == 0 {
-            return Err(JammiError::Config(format!(
+            return Err(JammiError::InvalidArgument {
+                argument: "edge_source".into(),
+                reason: format!(
                 "{}: the graph has no node to embed — the edge relation and the node set it is \
                  read against share no key",
                 table.source_id
-            )));
+            ),
+            });
         }
         building
             .finish(
@@ -753,8 +757,8 @@ impl InferenceSession {
     /// Resolve the input anchor for the edge relation a propagation reads — the
     /// second input alongside the embedding table. A `NeighborGraph` edge source
     /// is an immutable result table, pinned by its content digest
-    /// (`ResultDigest`); a `Registered` external source has no version surface in
-    /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
+    /// (`ResultDigest`); a `Registered` external source has no version surface,
+    /// so it is anchored as `UnpinnedAtInstant` — honest about the
     /// reproducibility gap rather than fabricating a pin.
     ///
     /// Resolves through [`jammi_db::store::ResultStore::pin_current_version`]
@@ -797,7 +801,9 @@ impl InferenceSession {
         let held = ctx
             .sql(&format!("SELECT * FROM {relation} LIMIT 0"))
             .await
-            .map_err(|e| JammiError::Other(format!("source '{source_id}': schema read: {e}")))?;
+            .map_err(|e| {
+                JammiError::from(e.context(format!("source '{source_id}': schema read")))
+            })?;
         match columns
             .into_iter()
             .find(|column| held.schema().field_with_unqualified_name(column).is_err())
@@ -826,7 +832,9 @@ impl InferenceSession {
         ctx: &QueryContext,
         edge_source: &EdgeSourceRef,
     ) -> Result<(DataFrame, bool)> {
-        let scan_error = |e| JammiError::Other(format!("propagate: edge scan: {e}"));
+        let scan_error = |e: datafusion::error::DataFusionError| {
+            JammiError::from(e.context("propagate: edge scan"))
+        };
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
                 // neighbor_graph tables register as the bare literal
@@ -950,7 +958,10 @@ mod tests {
             assert!(check_alpha(alpha).is_ok());
         }
         for alpha in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
-            assert!(matches!(check_alpha(alpha), Err(JammiError::Config(_))));
+            assert!(matches!(
+                check_alpha(alpha),
+                Err(JammiError::InvalidArgument { .. })
+            ));
         }
     }
 

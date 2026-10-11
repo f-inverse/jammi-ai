@@ -249,20 +249,28 @@ impl StructureRequest {
     }
 
     /// The depth the weights ask for, `weights.len() − 1`. Refuses
-    /// ([`JammiError::Config`]) no weights at all, and a depth past
+    /// ([`JammiError::InvalidArgument`]) no weights at all, and a depth past
     /// [`Self::hop_cap`] — a weight cannot be clamped away silently.
     pub fn hops(&self) -> Result<usize> {
-        let hops = self.weights.len().checked_sub(1).ok_or_else(|| {
-            JammiError::Config(
-                "a structure encoding needs at least one readout weight (the seed block's)".into(),
-            )
-        })?;
+        let hops =
+            self.weights
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "weights".into(),
+                    reason:
+                        "a structure encoding needs at least one readout weight (the seed block's)"
+                            .into(),
+                })?;
         if hops > self.hop_cap {
-            return Err(JammiError::Config(format!(
-                "a structure encoding of {hops} hops ({} weights) exceeds its hop cap of {}",
-                self.weights.len(),
-                self.hop_cap
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "weights".into(),
+                reason: format!(
+                    "a structure encoding of {hops} hops ({} weights) exceeds its hop cap of {}",
+                    self.weights.len(),
+                    self.hop_cap
+                ),
+            });
         }
         Ok(hops)
     }
@@ -395,9 +403,15 @@ mod tests {
     #[test]
     fn no_weights_and_a_depth_past_the_cap_are_refused() {
         let none = request().with_weights(Vec::<f64>::new());
-        assert!(matches!(none.hops(), Err(JammiError::Config(_))));
+        assert!(matches!(
+            none.hops(),
+            Err(JammiError::InvalidArgument { .. })
+        ));
         let deep = request().with_weights(vec![1.0; DEFAULT_STRUCTURE_HOP_CAP + 2]);
-        assert!(matches!(deep.hops(), Err(JammiError::Config(_))));
+        assert!(matches!(
+            deep.hops(),
+            Err(JammiError::InvalidArgument { .. })
+        ));
         let allowed = deep.with_hop_cap(DEFAULT_STRUCTURE_HOP_CAP + 1);
         assert_eq!(allowed.hops().unwrap(), DEFAULT_STRUCTURE_HOP_CAP + 1);
     }

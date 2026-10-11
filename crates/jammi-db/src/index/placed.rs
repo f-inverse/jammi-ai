@@ -157,7 +157,7 @@ impl PlacedIndex {
             segments: sources,
         } = sources;
         if sources.is_empty() {
-            return Err(JammiError::Other(
+            return Err(JammiError::Internal(
                 "PlacedIndex requires at least one segment".into(),
             ));
         }
@@ -171,7 +171,7 @@ impl PlacedIndex {
                 match source {
                     SegmentSource::Local(id, segment_version, index) => {
                         if index.storage_precision() != precision {
-                            return Err(JammiError::Other(format!(
+                            return Err(JammiError::Internal(format!(
                                 "PlacedIndex: segment {} loaded at {:?} but table '{table_name}' \
                                  is {precision:?} — mixed-precision segment sets are unsearchable \
                                  (distances are not comparable)",
@@ -214,7 +214,7 @@ impl PlacedIndex {
                 .collect();
             let index = SegmentedIndex::new_masked(segments, mask)?;
             if index.storage_precision() != precision {
-                return Err(JammiError::Other(format!(
+                return Err(JammiError::Internal(format!(
                     "PlacedIndex: segment set loaded at {:?} but table '{table_name}' is \
                      {precision:?}",
                     index.storage_precision(),
@@ -530,7 +530,7 @@ impl PlacedIndex {
                 .iter()
                 .find(|g| g.segments.iter().any(|s| s.segment_id == segment))
                 .ok_or_else(|| {
-                    JammiError::Other(format!(
+                    JammiError::Internal(format!(
                         "placed search: survivor from segment {} of table '{}' belongs to no \
                          placement group",
                         segment.0, self.table_name
@@ -577,7 +577,7 @@ impl PlacedIndex {
                             .iter()
                             .find(|s| s.segment_id == *segment)
                             .ok_or_else(|| {
-                                JammiError::Other(format!(
+                                JammiError::Internal(format!(
                                     "placed search: rescore group names segment {} of table \
                                      '{}' outside its owner group",
                                     segment.0, self.table_name
@@ -667,7 +667,7 @@ impl PlacedIndex {
     /// error budget — so this is `Other` (gRPC `Internal`), naming the
     /// owner, the segment, and the owner's own message.
     fn caller_fault(&self, e: &PeerError) -> JammiError {
-        JammiError::Other(format!(
+        JammiError::Internal(format!(
             "table '{}': owner {} refused segment {} as invalid — this coordinator built a \
              malformed request: {}",
             self.table_name, e.owner, e.segment.0, e.message

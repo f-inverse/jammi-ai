@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
+use jammi_db::catalog::jobs_repo::{JobProgress, ProgressReporter};
+use jammi_db::catalog::status::JobPhase;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
@@ -33,7 +35,7 @@ use super::resume::{
     RESUME_STATE_SCHEMA_VERSION,
 };
 use super::role::RunnerRole;
-use super::target::TrainingTarget;
+use super::target::{HeadOutput, TrainingTarget};
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::LoadedModel;
 use jammi_datafusion::ModelTask;
@@ -55,7 +57,7 @@ fn per_micro_batch_host_read_count() -> u64 {
     PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Test-only call counter for `encode_texts`'s `EncoderAdapters` branch
+/// Test-only call counter for `encode_texts`'s `AdaptedEncoder` branch
 /// reaching [`tokenize_and_bucket`] — in training AND evaluation mode.
 /// Padding is deliberately output-invariant, so a caller cannot tell from
 /// `encode_texts`'s pooled `[rows, hidden]` output whether a batch was
@@ -302,7 +304,7 @@ struct EpochBoundary<'a> {
 /// `artifact_path` in the same compare-and-set that flips the job to
 /// `completed`. The directory is a tempdir the result owns, so it is cleaned up
 /// when the worker drops the result after publishing. The run metrics it
-/// computed (final loss, step count, timestamps) are returned here so the
+/// computed (best loss, step count, timestamps) are returned here so the
 /// worker records them in that same compare-and-set.
 #[derive(Debug)]
 pub struct TrainingResult {
@@ -311,18 +313,16 @@ pub struct TrainingResult {
     /// worker reads the adapter files from here to publish them; the tempdir is
     /// removed on drop.
     pub artifact_dir: tempfile::TempDir,
-    /// Best validation loss achieved.
-    pub final_loss: f64,
     /// Total optimizer steps taken.
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
     /// The wall spent in the media front end during TRAINING, on the
-    /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
-    /// text task and for a `ProjectionHead` target of any modality — see
+    /// `AdaptedEncoder` target ONLY. `Duration::ZERO` by construction for a
+    /// text task and for a `FrozenEncoder` target of any modality — see
     /// below for why the latter is never measured, not merely small.
     ///
-    /// Declared boundary (`EncoderAdapters` only): the wall around the
+    /// Declared boundary (`AdaptedEncoder` only): the wall around the
     /// `image_encoder_input` / `audio_encoder_input` calls inside
     /// `TrainingLoop::encode_media` — decode + preprocess INCLUDING the
     /// device tensor build (H2D upload) that `preprocess_image_batch` /
@@ -332,14 +332,14 @@ pub struct TrainingResult {
     /// is true (eval passes through `evaluate_held_out` are excluded, so
     /// this is a subset of the trainer's training wall).
     ///
-    /// A `ProjectionHead` target's media encode
-    /// (`TrainingLoop::project_frozen_embedding`) never advances this field,
+    /// A `FrozenEncoder` target's media encode
+    /// (`TrainingLoop::frozen_pooled`) never advances this field,
     /// on any modality: that path has no seam between decode/preprocess and
     /// the frozen base's tower forward — they are one combined call — so
     /// there is no front-end-only quantity to time there. Charging the
     /// combined call to a field documented as front-end-only would give it a
     /// SECOND, incompatible meaning: a consumer computing
-    /// `residual = wall − front_end − busy` on a `ProjectionHead` job would
+    /// `residual = wall − front_end − busy` on a `FrozenEncoder` job would
     /// double-subtract the tower forward and land on a large negative
     /// "residual" mislabelled as overlap. Reporting zero here is honest;
     /// reporting the mixed number would not be.
@@ -389,6 +389,28 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
         LrSchedule::LinearDecay => base_lr * (1.0 - progress),
     };
     lr.max(0.0)
+}
+
+/// Read a scalar loss back to the host. `to_scalar::<f32>` refuses any other
+/// dtype, so a reduced-precision loss is upcast first (a no-op on `f32`).
+fn host_loss(loss: &Tensor, what: &str) -> Result<f64> {
+    loss.to_dtype(DType::F32)
+        .and_then(|loss| loss.to_scalar::<f32>())
+        .map(f64::from)
+        .map_err(|e| JammiError::FineTune(format!("{what} loss scalar: {e}")))
+}
+
+/// The mean of a validation pass's per-batch losses. A pass that scored no
+/// batch has no loss: a fabricated measurement is indistinguishable from a
+/// real one downstream — it would select the published checkpoint, stop the
+/// run early, and be reported as the run's best loss — so it is refused.
+fn mean_val_loss(total: f64, batches: usize) -> Result<f64> {
+    match batches {
+        0 => Err(JammiError::FineTune(
+            "internal: a validation pass scored no batch".into(),
+        )),
+        n => Ok(total / n as f64),
+    }
 }
 
 /// The learning rate a run's optimizer steps are APPLIED at.
@@ -485,6 +507,11 @@ impl LastStepHorizon {
             horizon,
             overshoot_armed: true,
         }
+    }
+
+    /// The run's optimizer-step count.
+    fn total(&self) -> usize {
+        self.horizon
     }
 
     /// Whether optimizer step `step` (1-based) must force the non-finite
@@ -773,7 +800,7 @@ pub fn rank_dropout_seed(base_seed: u64, rank: u32) -> u64 {
 pub struct TrainingLoop {
     target: TrainingTarget,
     /// Provides the tokenizer for both target variants, plus the frozen
-    /// forward path consumed by [`TrainingTarget::ProjectionHead`]. `None`
+    /// forward path consumed by [`TrainingTarget::FrozenEncoder`]. `None`
     /// is only valid when the data loader yields pre-built tensor batches
     /// (`is_precomputed()` is `true`) — used by trainer-internals tests.
     base_model: Option<Arc<LoadedModel>>,
@@ -803,7 +830,7 @@ pub struct TrainingLoop {
     ///
     /// `true` at [`TrainingLoopBuilder::build`] is ENFORCED, not assumed: a
     /// target does not necessarily start in training mode
-    /// (`TrainingTarget::EncoderAdapters`'s `ModernBert` body is built with
+    /// (`TrainingTarget::AdaptedEncoder`'s `ModernBert` body is built with
     /// `training: false`; only the injected `LoraLinear` adapters start
     /// `true`). `build` calls [`TrainingLoop::set_training`]`(true)` on the
     /// freshly assembled loop before returning it, which recurses through the
@@ -817,10 +844,16 @@ pub struct TrainingLoop {
     divergence_count: usize,
     /// Fixed, dataset-level target standardiser for the regression path, derived
     /// once from all training targets at the start of [`Self::run`]. `None` until
-    /// the run computes it (and for every non-regression target). It maps each
-    /// regression loss into a z-space the zero-initialised head can reach, while
-    /// the head itself stays in raw space — so serving needs no de-standardisation.
+    /// the run computes it (and for every non-regression target). The head
+    /// trains against z-scored targets, a space its zero-initialised layers
+    /// can reach; serving de-standardises the head's output with this scaler,
+    /// persisted in the head's [`HeadOutput::Distribution`].
     target_scaler: Option<TargetScaler>,
+    /// A classification run's labels in class-index order, read off the
+    /// training source at the start of [`Self::run`]; `None` for every other
+    /// task. Persisted in the head's [`HeadOutput::Classes`], where serving
+    /// names each output column by them.
+    class_labels: Option<Vec<String>>,
     /// The task this run trains for. It is the DISCRIMINATOR for the media
     /// paths: a `MediaTriplet` chunk carries three binary columns whose
     /// modality the columns themselves cannot express (an encoded WAV and an
@@ -841,6 +874,9 @@ pub struct TrainingLoop {
     /// run trains but leaves nothing to resume from (used by trainer-internal
     /// tests that drive the loop without a worker/store).
     artifact_store: Option<Arc<ArtifactStore>>,
+    /// Where the loop reports the optimizer steps it has taken: the job's
+    /// row, for the rank that holds the job. `None` reports nothing.
+    progress: Option<ProgressReporter>,
     /// The job's tenant-pinned catalog: every checkpoint this loop stages is
     /// a `model_artifacts` row written through it BEFORE its bytes, owned by
     /// its bound tenant — which is also the first prefix segment the bytes
@@ -926,6 +962,7 @@ pub struct TrainingLoopBuilder {
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
+    progress: Option<ProgressReporter>,
     resume: Option<RestoredCheckpoint>,
     /// See [`Self::epoch_limit`].
     epoch_limit: Option<usize>,
@@ -961,6 +998,7 @@ impl TrainingLoopBuilder {
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
+            progress: None,
             resume: None,
             epoch_limit: None,
             applied_learning_rate: AppliedLearningRate::default(),
@@ -995,6 +1033,13 @@ impl TrainingLoopBuilder {
     /// trainer-internal test).
     pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Report the optimizer steps the loop takes onto the job's row — set by
+    /// the worker for the rank that holds the job.
+    pub fn progress(mut self, reporter: ProgressReporter) -> Self {
+        self.progress = Some(reporter);
         self
     }
 
@@ -1054,7 +1099,7 @@ impl TrainingLoopBuilder {
     }
 
     /// Set the base model. Required for text-data training (supplies the
-    /// tokenizer and, for `ProjectionHead` targets, the frozen forward
+    /// tokenizer and, for `FrozenEncoder` targets, the frozen forward
     /// pass).
     pub fn base_model(mut self, model: Arc<LoadedModel>) -> Self {
         self.base_model = Some(model);
@@ -1144,10 +1189,12 @@ impl TrainingLoopBuilder {
             training_mode: false,
             divergence_count: 0,
             target_scaler: None,
+            class_labels: None,
             task: self.task,
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
+            progress: self.progress,
             catalog,
             resume: self.resume,
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
@@ -1162,7 +1209,7 @@ impl TrainingLoopBuilder {
         };
         // Enforce, not assume, that a freshly built loop starts in training
         // mode (see `training_mode`'s own doc). This recurses through the WHOLE target via
-        // `TrainingTarget::set_training`, so an `EncoderAdapters` target's
+        // `TrainingTarget::set_training`, so an `AdaptedEncoder` target's
         // encoder body (constructed `training: false` — only its injected
         // LoRA adapters start `true`) is switched into training mode here
         // too, not just the mirror.
@@ -1190,7 +1237,7 @@ impl TrainingLoopBuilder {
 /// varied held-out split, and the padded positions are fully masked either
 /// way (`encode_texts_output_is_bucket_invariant_at_the_real_call_site`).
 ///
-/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
+/// Factored out of `TrainingLoop::encode_texts`'s `AdaptedEncoder` branch
 /// so a unit test, and a caller reproducing a pass's batches, drive the
 /// PRODUCTION tokenize-and-pad step directly without duplicating the
 /// decision.
@@ -1369,6 +1416,7 @@ impl TrainingLoop {
             Streamed(Box<super::source::StreamedSet>),
         }
 
+        self.class_labels = source.class_labels().map(<[String]>::to_vec);
         let mut source = match source {
             TrainingSource::Resident(loader) => {
                 let (train_loader, val_loader) = loader.split(self.config.validation_fraction);
@@ -1682,6 +1730,7 @@ impl TrainingLoop {
             }
             None => Resumed::default(),
         };
+        self.report_steps(global_step, total_optimizer_steps)?;
         // The history's curves grow one row per epoch run, pushed from exactly
         // what `tracing::info!("Epoch complete", ...)` below emits for the
         // GPU-capability suite's own `loss_capture` tracing layer to read back
@@ -1859,6 +1908,7 @@ impl TrainingLoop {
                         epoch_loss += loss_val;
                         batch_count += 1;
                         global_step += 1;
+                        self.report_steps(global_step, last_step_horizon.total())?;
                         let stepped_at = Instant::now();
                         step_walls.push((stepped_at - last_step_at).as_secs_f64());
                         last_step_at = stepped_at;
@@ -2048,6 +2098,7 @@ impl TrainingLoop {
                     is_last_step,
                 )?;
                 global_step += 1;
+                self.report_steps(global_step, last_step_horizon.total())?;
                 // The epoch's last step: its wall closes the series, and the
                 // next epoch's step span starts the mark afresh.
                 step_walls.push(last_step_at.elapsed().as_secs_f64());
@@ -2254,7 +2305,7 @@ impl TrainingLoop {
 
         // A run whose history holds no epoch — none trained here, none
         // carried in from a resume — has no result to finalize.
-        let Some((_, final_loss)) = history.best else {
+        let Some((best_epoch, best_loss)) = history.best else {
             return Err(JammiError::FineTune(format!(
                 "the run trained no epoch: epochs {start_epoch}..{end_epoch}, and no history \
                  was resumed"
@@ -2271,13 +2322,9 @@ impl TrainingLoop {
         // Save the final adapter — both target variants persist their
         // trainable weights alongside a `SavedAdapter` metadata JSON.
         let final_weights = self.target.named_trainable_weights()?;
-        // The form is persisted exactly when the scaler is — both are the
-        // regression head's de-standardisation state. A non-regression head has
-        // no scaler and no form, so its adapter config round-trips unchanged.
-        let regression_form = self.target_scaler.map(|_| self.regression_form());
         let saved = self
             .target
-            .saved_adapter(&self.config, self.target_scaler, regression_form);
+            .saved_adapter(&self.config, self.head_output())?;
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
         self.phase_wall.checkpoints += final_adapter_started.elapsed();
@@ -2311,8 +2358,14 @@ impl TrainingLoop {
                     .collect(),
             )
         };
+        // `best_epoch`/`best_loss` name the epoch whose weights were restored
+        // above — the published adapter — and its value of the monitored
+        // loss (`early_stopping_metric`). A validation loss is scored over
+        // small held-out batches with fewer in-batch negatives than a
+        // training batch, so it is not on the train curve's scale.
         let mut metrics = serde_json::json!({
-            "final_loss": final_loss,
+            "best_epoch": best_epoch,
+            "best_loss": best_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
             "started_at": started_at,
@@ -2340,7 +2393,6 @@ impl TrainingLoop {
 
         Ok(TrainingResult {
             artifact_dir: artifact_tmp,
-            final_loss,
             total_steps: global_step,
             metrics_json,
             media_front_end_wall: self.media_front_end_wall.get(),
@@ -2542,6 +2594,20 @@ impl TrainingLoop {
     /// re-encode keeps peak activation memory at one chunk regardless of the
     /// pool size; the gradient equals the single-pass one (pinned by the
     /// gradient-equivalence test in the `gradcache` module).
+    /// Report `steps` optimizer steps taken of `total` onto the job's row,
+    /// when this loop reports for the job.
+    fn report_steps(&mut self, steps: usize, total: usize) -> Result<()> {
+        let Some(reporter) = self.progress.as_mut() else {
+            return Ok(());
+        };
+        let progress = JobProgress {
+            phase: JobPhase::Training,
+            done: Some(steps as u64),
+            total: Some(total as u64),
+        };
+        tokio::runtime::Handle::current().block_on(reporter.report(&self.catalog, progress))
+    }
+
     fn run_gradcache_epoch(
         &mut self,
         train_loader: &TrainingDataLoader,
@@ -2623,16 +2689,7 @@ impl TrainingLoop {
                 None => None,
             };
             let loss = mnrl_loss(&a_rep, &p_rep, neg_rep.as_ref(), scale, true)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("GradCache loss dtype: {e}")))?
-            };
-            let loss_val = loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("GradCache loss scalar: {e}")))?
-                as f64;
+            let loss_val = host_loss(&loss, "GradCache")?;
             Ok((grads, loss_val))
         })();
 
@@ -2667,14 +2724,14 @@ impl TrainingLoop {
         Ok(loss_val)
     }
 
-    /// Encode a slice of texts into a `[batch, hidden]` embedding tensor,
+    /// Encode a slice of texts into a `[batch, hidden]` embedding tensor:
+    /// the encoder's pooled output, through the head's `projection` when the
+    /// target trains a head ([`Self::project`]). The pooled output is
     /// dispatched on the active [`TrainingTarget`]:
     ///
-    /// - `ProjectionHead`: run the texts through the frozen base model to
-    ///   produce pooled embeddings, then project through the head's first
-    ///   LoRA layer (shared with the audio path via
-    ///   [`Self::project_frozen_embedding`]).
-    /// - `EncoderAdapters`: tokenize the texts via the base model's tokenizer,
+    /// - `FrozenEncoder`: run the texts through the frozen base model
+    ///   (shared with the media path via [`Self::frozen_pooled`]).
+    /// - `AdaptedEncoder`: tokenize the texts via the base model's tokenizer,
     ///   then forward through the LoRA-injected encoder directly (the encoder
     ///   does its own pooling and normalisation).
     fn encode_texts(&self, texts: &[String]) -> Result<Tensor> {
@@ -2694,23 +2751,26 @@ impl TrainingLoop {
         // the counts vector).
         if texts.is_empty() {
             let hidden = match &self.target {
-                TrainingTarget::ProjectionHead { .. } => base.description().embedding_dim(),
-                TrainingTarget::EncoderAdapters(state) => state.encoder.hidden_size(),
+                TrainingTarget::FrozenEncoder { .. } => base.description().embedding_dim(),
+                TrainingTarget::AdaptedEncoder(state) => state.encoder.hidden_size(),
             };
             return Tensor::zeros((0, hidden), DType::F32, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("encode_texts: empty batch: {e}")));
         }
-        match &self.target {
-            TrainingTarget::ProjectionHead { .. } => {
+        let pooled = match &self.target {
+            TrainingTarget::FrozenEncoder { .. } => {
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                 let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
-                self.project_frozen_embedding(base, arr, ModelTask::TextEmbedding)
+                self.frozen_pooled(base, arr, ModelTask::TextEmbedding)?
             }
-            TrainingTarget::EncoderAdapters(state) => {
+            TrainingTarget::AdaptedEncoder(state) => {
                 let encoder = &state.encoder;
                 let tokenizer = base
                     .tokenizer()
-                    .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?;
+                    .ok_or_else(|| JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: "No tokenizer in base model".into(),
+                    })?;
 
                 // `AnyEncoder::max_seq_length` refuses on a media tower
                 // (no token-sequence capacity exists there, and every
@@ -2755,18 +2815,19 @@ impl TrainingLoop {
                 self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward(&input_ids, &attention_mask)
-                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))?
             }
-        }
+        };
+        self.project(pooled)
     }
 
-    /// How many encoder forwards this loop has run on an `EncoderAdapters`
+    /// How many encoder forwards this loop has run on an `AdaptedEncoder`
     /// target, over its whole life: every training step's joined forward
     /// AND every validation or held-out forward — the multiplier a fused-
     /// kernel profile's positive-proof equation (`fused + eager == calls x
     /// forwards`, `jammi_encoders::FusibleSiteCensus`) needs, since every
     /// forward takes the same admission decisions whatever the mode. `0`
-    /// on a `ProjectionHead` target, whose frozen base model serves through
+    /// on a `FrozenEncoder` target, whose frozen base model serves through
     /// the inference backend.
     pub fn encoder_forwards(&self) -> u64 {
         self.encoder_forwards.get()
@@ -2782,11 +2843,12 @@ impl TrainingLoop {
     /// that submits images under `task=audio_embedding` gets a typed decode
     /// refusal rather than a confidently wrong spectrogram.
     ///
-    /// Two targets, one shape:
-    /// - `ProjectionHead`: the frozen base model owns the whole front end
+    /// Two targets, one shape — the pooled output, through the head's
+    /// `projection` when the target trains a head ([`Self::project`]):
+    /// - `FrozenEncoder`: the frozen base model owns the whole front end
     ///   (decode → resample → log-mel / pad-resize-normalize → tower
-    ///   forward), and the head projects its pooled output. Unchanged.
-    /// - `EncoderAdapters`: the LoRA-wrapped tower is forwarded DIRECTLY, so
+    ///   forward).
+    /// - `AdaptedEncoder`: the LoRA-wrapped tower is forwarded DIRECTLY, so
     ///   this method owns the front end — the SAME `audio_preprocess` /
     ///   `image_preprocess` functions the serving path
     ///   (`CandleModel::forward_audio_embedding` /
@@ -2798,22 +2860,22 @@ impl TrainingLoop {
             .base_model
             .as_ref()
             .ok_or_else(|| JammiError::FineTune("encode_media requires a base model".into()))?;
-        match &self.target {
-            TrainingTarget::ProjectionHead { .. } => {
+        let pooled = match &self.target {
+            TrainingTarget::FrozenEncoder { .. } => {
                 let refs: Vec<&[u8]> = items.iter().map(|c| c.as_slice()).collect();
                 let arr = Arc::new(BinaryArray::from(refs)) as ArrayRef;
                 // The frozen base owns decode/preprocess AND the tower
                 // forward as one combined call here, with no seam between
-                // them to time separately — unlike the `EncoderAdapters` arm
+                // them to time separately — unlike the `AdaptedEncoder` arm
                 // below, whose decode/preprocess call is genuinely disjoint
                 // from its tower forward. Timing this combined call would
                 // mix "front end" and "forward" under the one field
                 // `media_front_end_wall` documents as front-end-only, which
                 // is worse than reporting nothing: NOT accumulated here (see
                 // that field's own doc).
-                self.project_frozen_embedding(base, arr, self.task)
+                self.frozen_pooled(base, arr, self.task)?
             }
-            TrainingTarget::EncoderAdapters(state) => {
+            TrainingTarget::AdaptedEncoder(state) => {
                 let encoder = &state.encoder;
                 let started = Instant::now();
                 let input = match self.task {
@@ -2831,9 +2893,10 @@ impl TrainingLoop {
                 self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward_input(&input.as_input())
-                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))?
             }
-        }
+        };
+        self.project(pooled)
     }
 
     /// Add `elapsed` to `self.media_front_end_wall` — but only while this
@@ -2885,7 +2948,7 @@ impl TrainingLoop {
 
         let frontend = base.backend_model()?.audio_frontend().ok_or_else(|| {
             JammiError::FineTune(
-                "Encoder-adapters audio training requires the base model's CLAP \
+                "Adapted-encoder audio training requires the base model's CLAP \
                  feature-extractor geometry (preprocessor_config.json); the loaded base \
                  model carries none"
                     .into(),
@@ -2894,11 +2957,12 @@ impl TrainingLoop {
 
         // Serving's guard, applied at the training edge too: the
         // feature-extractor's mel-filter count IS the tower's input contract.
-        let num_mel_bins = encoder.num_mel_bins().map_err(|e| {
-            JammiError::FineTune(format!(
-                "Audio training needs the tower's num_mel_bins: {e}"
-            ))
-        })?;
+        let num_mel_bins = encoder
+            .num_mel_bins()
+            .map_err(|e| JammiError::InvalidArgument {
+                argument: "base_model".into(),
+                reason: format!("Audio training needs the tower's num_mel_bins: {e}"),
+            })?;
         if frontend.n_mels != num_mel_bins {
             return Err(JammiError::FineTune(format!(
                 "Audio feature-extractor feature_size ({}) does not match the tower's \
@@ -2942,8 +3006,9 @@ impl TrainingLoop {
     ) -> Result<jammi_encoders::OwnedEncoderInput> {
         use crate::inference::image_preprocess;
 
-        let geometry = |what: &str, e: jammi_encoders::EncoderError| {
-            JammiError::FineTune(format!("Image training needs the tower's {what}: {e}"))
+        let geometry = |what: &str, e: jammi_encoders::EncoderError| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!("Image training needs the tower's {what}: {e}"),
         };
         let side = encoder
             .image_size()
@@ -3008,41 +3073,57 @@ impl TrainingLoop {
     /// layer. Shared by the text, image and audio projection-head paths — the
     /// only difference between modalities is the Arrow array type and the
     /// `ModelTask`, both supplied by the caller.
-    fn project_frozen_embedding(
+    fn frozen_pooled(
         &self,
         base: &Arc<LoadedModel>,
         content: ArrayRef,
         task: ModelTask,
     ) -> Result<Tensor> {
-        let head = match &self.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            TrainingTarget::EncoderAdapters(_) => {
-                return Err(JammiError::FineTune(
-                    "project_frozen_embedding is only valid for a projection-head target".into(),
-                ))
-            }
-        };
         let output = base
             .backend_model()?
             .forward(&[content], task)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
         // A corrupt training item is a refusal, not a row to skip: reject the
         // whole group on the lowest-index failed row rather than silently
-        // training the projection head on the all-zero placeholder the
-        // backend substitutes for a decode/preprocess failure. Called BEFORE
-        // reading `shapes[0]` below, so an empty-`shapes` producer is refused
-        // by `all_rows_or_err` itself, not an index-out-of-bounds panic on
+        // training the head on the all-zero placeholder the backend
+        // substitutes for a decode/preprocess failure. Called BEFORE reading
+        // `shapes[0]` below, so an empty-`shapes` producer is refused by
+        // `all_rows_or_err` itself, not an index-out-of-bounds panic on
         // `shapes[0]`.
         let flat = output
             .all_rows_or_err()
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
         let (n, dim) = output.shapes[0];
-        let raw = Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
-            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
-        head.layers[0]
-            .1
-            .forward(&raw)
-            .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
+        Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
+            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))
+    }
+
+    /// The head's `projection` over a pooled output — the embedding an
+    /// embedding task trains and the head's task layer reads — or the pooled
+    /// output itself for a target that trains no head. Serving folds the same
+    /// layers in the same order (`crate::model::backend::candle::ServedHead`).
+    fn project(&self, pooled: Tensor) -> Result<Tensor> {
+        match self.target.head() {
+            Some(head) => head.layers[0]
+                .1
+                .forward(&pooled)
+                .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}"))),
+            None => Ok(pooled),
+        }
+    }
+
+    /// The head's task layer — a classifier's or a distribution head's — over
+    /// projected embeddings; `what` names the task in the refusal a target
+    /// without one gets.
+    fn task_layer(&self, embeddings: &Tensor, what: &str) -> Result<Tensor> {
+        let (_, layer) = self
+            .target
+            .head()
+            .and_then(|head| head.layers.get(1))
+            .ok_or_else(|| JammiError::FineTune(format!("this target trains no {what} head")))?;
+        layer
+            .forward(embeddings)
+            .map_err(|e| JammiError::FineTune(format!("LoRA {what} head: {e}")))
     }
 
     /// Encode a text chunk into a `TrainingBatch` ready for loss computation.
@@ -3166,11 +3247,6 @@ impl TrainingLoop {
                     labels: labels_tensor,
                 })
             }
-            TextChunk::Ner { .. } => Err(JammiError::FineTune(
-                "NER fine-tuning is not yet available. \
-                 Token-level training requires sequence-level encoding."
-                    .into(),
-            )),
             TextChunk::Regression { texts, targets } => {
                 let proj = encode(texts)?;
                 // Score in standardized (z) space: the head emits its RAW z-output
@@ -3197,6 +3273,23 @@ impl TrainingLoop {
                     target: target_tensor,
                 })
             }
+        }
+    }
+
+    /// What this run's head outputs mean: its classes for a classification
+    /// run, its distribution's de-standardisation for a regression run, an
+    /// embedding otherwise. A run is one task, so at most one of
+    /// `class_labels` and `target_scaler` is set.
+    fn head_output(&self) -> HeadOutput {
+        match (&self.class_labels, self.target_scaler) {
+            (Some(labels), _) => HeadOutput::Classes {
+                labels: labels.clone(),
+            },
+            (None, Some(scaler)) => HeadOutput::Distribution {
+                scaler,
+                form: self.regression_form(),
+            },
+            (None, None) => HeadOutput::Embedding,
         }
     }
 
@@ -3227,8 +3320,8 @@ impl TrainingLoop {
     /// Apply the distributional regression head to projected embeddings,
     /// producing the head's RAW `(batch, k)` z-space output — the parameter the
     /// LoRA layer actually learns, with **no** de-standardisation. Mirrors
-    /// [`Self::classify`]: only a `ProjectionHead` target with a second (head)
-    /// layer can regress.
+    /// [`Self::classify`]: the head's `distribution` layer, over either
+    /// encoder.
     ///
     /// The training loss scores this z-output directly against a z-scored target
     /// (`embed_chunk` z-scores the target via [`TargetScaler::standardize_value`]),
@@ -3238,18 +3331,7 @@ impl TrainingLoop {
     /// affine and the inference adapter's σ scaling — so this method is the single
     /// raw-head forward shared by training, determinism, and resume.
     fn head_forward(&self, embeddings: &Tensor) -> Result<Tensor> {
-        match &self.target {
-            TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
-                .1
-                .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}"))),
-            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
-                "No regression head in projection target".into(),
-            )),
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Regression with encoder adapters is not supported".into(),
-            )),
-        }
+        self.task_layer(embeddings, "regression")
     }
 
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level
@@ -3513,9 +3595,14 @@ impl TrainingLoop {
         if diverged {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
-                return Err(JammiError::FineTune(
-                    "Training diverged: loss was NaN or >100 for 3 consecutive batches".into(),
-                ));
+                // The step size the caller chose is what moves a run past a
+                // finite loss, so the refusal is the caller's to change.
+                return Err(JammiError::InvalidArgument {
+                    argument: "learning_rate".into(),
+                    reason: "training diverged: the loss was NaN or above 100 for 3 consecutive \
+                             batches"
+                        .into(),
+                });
             }
             return Ok(());
         }
@@ -3578,6 +3665,7 @@ impl TrainingLoop {
             *epoch.grads_pending = false;
 
             *epoch.global_step += 1;
+            self.report_steps(*epoch.global_step, ctx.last_step_horizon.total())?;
             let stepped_at = Instant::now();
             epoch
                 .step_walls
@@ -3650,10 +3738,6 @@ impl TrainingLoop {
             super::data::TrainingBatch::Classification { logits, labels } => {
                 self.cross_entropy_loss(logits, labels)
             }
-            super::data::TrainingBatch::Ner {
-                hidden_states,
-                labels,
-            } => self.ner_loss(hidden_states, labels),
             super::data::TrainingBatch::Regression { input, target } => {
                 self.regression_loss(input, target)
             }
@@ -3685,10 +3769,7 @@ impl TrainingLoop {
     /// variant's own doc). `Regression` gathers `input` — already `Self::
     /// head_forward`'s output (`Self::encode_chunk`'s `Regression` arm runs
     /// it before this function ever sees the batch) — and the targets, the
-    /// SAME rule, not a special case. `Ner` stays refused, exactly
-    /// as [`Self::compute_loss`] itself refuses it; this function never
-    /// reaches a `Ner` batch in production (`Self::encode_chunk` never
-    /// builds one).
+    /// SAME rule, not a special case.
     ///
     /// **Why this closes the W× gradient hazard.** [`super::collective::
     /// Collective::all_gather`]'s own contract: only the calling rank's own
@@ -3761,7 +3842,6 @@ impl TrainingLoop {
                 let target = rank_ctx.all_gather(call, target, counts)?;
                 self.compute_loss(&TrainingBatch::Regression { input, target })
             }
-            TrainingBatch::Ner { .. } => self.compute_loss(batch),
         }
     }
 
@@ -3797,12 +3877,10 @@ impl TrainingLoop {
     /// log-sum-exp ordering ([`pairwise_ordering_loss`]) — there is no row
     /// `i` whose loss is independent of every other row, so inventing a
     /// per-row split would not be a decomposition of the real objective, it
-    /// would be a different number scored under a different name. `Ner`
-    /// (token-level; this seam has not chosen a per-example convention for
-    /// it) and `Regression` (the distributional head — a different
-    /// objective family) are typed refusals for
-    /// the same reason: a fabricated decomposition is worse than an honest
-    /// refusal.
+    /// would be a different number scored under a different name.
+    /// `Regression` (the distributional head — a different objective family)
+    /// is a typed refusal for the same reason: a fabricated decomposition is
+    /// worse than an honest refusal.
     fn compute_loss_per_example(&self, batch: &super::data::TrainingBatch) -> Result<Vec<f64>> {
         match batch {
             super::data::TrainingBatch::Pairs { anchors, positives } => self
@@ -3868,11 +3946,6 @@ impl TrainingLoop {
             super::data::TrainingBatch::Classification { logits, labels } => {
                 cross_entropy_per_row(logits, labels)
             }
-            super::data::TrainingBatch::Ner { .. } => Err(JammiError::FineTune(
-                "evaluate_held_out: NER's natural unit is a token, not a held-out example — \
-                 this seam does not define a per-example convention for NER in v1."
-                    .into(),
-            )),
             super::data::TrainingBatch::Regression { .. } => Err(JammiError::FineTune(
                 "evaluate_held_out: Regression trains a different distributional-head \
                  objective family; this seam defines no per-example held-out decomposition \
@@ -3957,115 +4030,16 @@ impl TrainingLoop {
         matryoshka_sum_per_example(&self.config.matryoshka_dims, embeddings, objective)
     }
 
-    /// Apply the classification head to projected embeddings.
-    ///
-    /// Only the `ProjectionHead` target supports classification training,
-    /// and only when the head was built with both a projection and a
-    /// classifier layer (i.e. `head.layers.len() > 1`).
+    /// Apply the classification head to projected embeddings: the head's
+    /// `classifier` layer, over either encoder.
     fn classify(&self, embeddings: &Tensor) -> Result<Tensor> {
-        match &self.target {
-            TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
-                .1
-                .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA classifier: {e}"))),
-            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
-                "No classification head in projection target".into(),
-            )),
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Classification with encoder adapters is not supported".into(),
-            )),
-        }
+        self.task_layer(embeddings, "classification")
     }
 
     /// Cross-entropy loss for classification.
     fn cross_entropy_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         candle_nn::loss::cross_entropy(logits, labels)
             .map_err(|e| JammiError::FineTune(format!("Cross-entropy loss: {e}")))
-    }
-
-    /// Token-level cross-entropy loss for NER with `ignore_index=-100`
-    /// semantics: positions whose original label is `-100` contribute
-    /// **nothing** to the loss value or the gradient, and the mean is taken
-    /// over the non-ignored positions only (not `batch * seq_len`). This
-    /// matches PyTorch's `torch.nn.CrossEntropyLoss(ignore_index=-100)`
-    /// under the default `reduction="mean"`, whose docs specify that the
-    /// mean divides by the count of targets that are *not* `ignore_index`
-    /// (<https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html>).
-    ///
-    /// Candle's `cross_entropy` has no `ignore_index` argument, so this
-    /// gathers the non-ignored rows with [`Tensor::index_select`] *before*
-    /// calling it, rather than clamping `-100` to a valid class and masking
-    /// the loss value afterwards. That distinction matters for the
-    /// gradient, not just the value: because the ignored rows never enter
-    /// the cross-entropy computation graph, candle's `index_select`
-    /// backward (`grads.or_insert` zero-fills the full-shape gradient, then
-    /// `index_add`s only into the selected rows — see
-    /// `candle_core::backprop`) leaves the ignored rows' gradient at an
-    /// *exact* `0.0`. A "compute-then-multiply-by-zero-mask" formulation
-    /// would only get a value of `0.0` for those rows in the forward pass;
-    /// the backward pass would still evaluate (and could still overflow to
-    /// `inf`/`NaN`) the per-row cross-entropy term before the zero multiply,
-    /// which is not exactness, only smallness.
-    ///
-    /// If every position in the batch is ignored, this returns a `0.0`
-    /// scalar loss (no rows to select, hence no gradient contribution),
-    /// matching PyTorch's handling of an all-`ignore_index` batch under
-    /// `reduction="mean"` (returning `0` rather than propagating a `0/0`
-    /// `NaN`).
-    fn ner_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, num_labels) = logits
-            .dims3()
-            .map_err(|e| JammiError::FineTune(format!("NER logits dims: {e}")))?;
-
-        // Flatten to (batch*seq_len, num_labels) and (batch*seq_len,)
-        let flat_logits = logits
-            .reshape((batch * seq_len, num_labels))
-            .map_err(|e| JammiError::FineTune(format!("NER flatten logits: {e}")))?;
-        let flat_labels = labels
-            .reshape(batch * seq_len)
-            .map_err(|e| JammiError::FineTune(format!("NER flatten labels: {e}")))?;
-
-        // Read labels to the host to build the keep-list: -100 marks a
-        // position to exclude entirely, per ignore_index=-100 semantics.
-        let label_values = flat_labels
-            .to_dtype(candle_core::DType::I64)
-            .map_err(|e| JammiError::FineTune(format!("NER labels i64: {e}")))?
-            .to_vec1::<i64>()
-            .map_err(|e| JammiError::FineTune(format!("NER labels to_vec1: {e}")))?;
-
-        let mut keep_indices: Vec<u32> = Vec::with_capacity(label_values.len());
-        let mut keep_labels: Vec<u32> = Vec::with_capacity(label_values.len());
-        for (idx, &label) in label_values.iter().enumerate() {
-            if label != -100 {
-                keep_indices.push(idx as u32);
-                keep_labels.push(label as u32);
-            }
-        }
-
-        if keep_indices.is_empty() {
-            // Every position ignored: match PyTorch's CrossEntropyLoss
-            // (reduction="mean") returning 0.0 rather than a NaN 0/0 mean.
-            return Tensor::zeros((), logits.dtype(), logits.device())
-                .map_err(|e| JammiError::FineTune(format!("NER all-ignored zero loss: {e}")));
-        }
-
-        let n_keep = keep_indices.len();
-        let device = flat_logits.device();
-        let index_tensor = Tensor::from_vec(keep_indices, n_keep, device)
-            .map_err(|e| JammiError::FineTune(format!("NER keep indices: {e}")))?;
-        let label_tensor = Tensor::from_vec(keep_labels, n_keep, device)
-            .map_err(|e| JammiError::FineTune(format!("NER keep labels: {e}")))?;
-
-        // Gather only the non-ignored rows before computing cross-entropy so
-        // the ignored rows never enter the graph (see the doc comment above
-        // for why this, not a zero-mask multiply, makes their gradient
-        // exactly 0.0).
-        let selected_logits = flat_logits
-            .index_select(&index_tensor, 0)
-            .map_err(|e| JammiError::FineTune(format!("NER index_select logits: {e}")))?;
-
-        candle_nn::loss::cross_entropy(&selected_logits, &label_tensor)
-            .map_err(|e| JammiError::FineTune(format!("NER cross-entropy: {e}")))
     }
 
     /// Triplet loss: `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)`.
@@ -4169,33 +4143,16 @@ impl TrainingLoop {
     }
 
     /// Run forward pass over validation set without gradient updates.
+    ///
+    /// An empty loader is unreachable — the ValLoss path is refused at the
+    /// split, and the TrainLoss path never calls this — and scores no batch,
+    /// which [`mean_val_loss`] refuses.
     fn evaluate(&self, val_loader: &TrainingDataLoader) -> Result<f64> {
-        if val_loader.is_empty() {
-            // Unreachable: the ValLoss path is refused at the split, and the
-            // TrainLoss path never calls this. Kept as an error rather than a
-            // `0.0` because a fabricated measurement is indistinguishable from a
-            // real one downstream — it selected checkpoints, stopped runs early,
-            // and was reported as the run's final loss.
-            return Err(JammiError::FineTune(
-                "internal: evaluate() called with an empty validation loader".into(),
-            ));
-        }
-
         let mut total_loss = 0.0;
         let mut count = 0;
 
         let accumulate = |batch, total: &mut f64, count: &mut usize| -> Result<()> {
-            let loss = self.compute_loss(&batch)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-            };
-            *total += loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                as f64;
+            *total += host_loss(&self.compute_loss(&batch)?, "Val")?;
             *count += 1;
             Ok(())
         };
@@ -4212,11 +4169,7 @@ impl TrainingLoop {
             }
         }
 
-        Ok(if count > 0 {
-            total_loss / count as f64
-        } else {
-            0.0
-        })
+        mean_val_loss(total_loss, count)
     }
 
     /// Open a fresh [`super::stream::TrainingSetStream`] over `streamed`
@@ -4358,17 +4311,7 @@ impl TrainingLoop {
             chunks_seen += 1;
             let chunk = owned.into_chunk();
             let batch_out = self.encode_chunk(&chunk)?;
-            let loss = self.compute_loss(&batch_out)?;
-            let loss = if loss.dtype() == DType::F32 {
-                loss
-            } else {
-                loss.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-            };
-            total_loss += loss
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                as f64;
+            total_loss += host_loss(&self.compute_loss(&batch_out)?, "Val")?;
             count += 1;
         }
         let expected_chunks = val_count.div_ceil(batch);
@@ -4379,11 +4322,7 @@ impl TrainingLoop {
             )));
         }
 
-        Ok(if count > 0 {
-            total_loss / count as f64
-        } else {
-            0.0
-        })
+        mean_val_loss(total_loss, count)
     }
 
     /// The public per-pair held-out evaluation seam. Scores the current
@@ -4447,7 +4386,7 @@ impl TrainingLoop {
     ///   [`super::data::TrainingDataLoader::len`]), so the row-level check
     ///   happens per batch, as rows are actually produced.
     /// - A batch kind `Self::compute_loss_per_example` does not support
-    ///   (CoSENT/AnglE/NER/Regression — see that method's doc).
+    ///   (CoSENT/AnglE/Regression — see that method's doc).
     /// - A non-finite per-example loss: refused rather than folded into the
     ///   mean, because a NaN example silently dropped or silently averaged
     ///   in would corrupt every downstream paired-sign-test cell with no
@@ -4475,10 +4414,10 @@ impl TrainingLoop {
     /// other batch kind this seam supports (`Triplet` margin,
     /// `Contrastive`/`CosineMse`, `Classification`) scores each row
     /// independently of every other row in the batch: genuinely ZERO
-    /// in-batch negatives, not an approximation of MNRL's count. `Ner` and
-    /// `Regression` are typed refusals earlier in
-    /// `compute_loss_per_example` and never reach here in a successful call;
-    /// they fold to `0` for an exhaustive match rather than a wildcard.
+    /// in-batch negatives, not an approximation of MNRL's count. `Regression`
+    /// is a typed refusal earlier in `compute_loss_per_example` and never
+    /// reaches here in a successful call; it folds to `0` for an exhaustive
+    /// match rather than a wildcard.
     fn in_batch_negatives_for(
         &self,
         batch: &super::data::TrainingBatch,
@@ -4494,7 +4433,6 @@ impl TrainingLoop {
             },
             super::data::TrainingBatch::Contrastive { .. }
             | super::data::TrainingBatch::Classification { .. }
-            | super::data::TrainingBatch::Ner { .. }
             | super::data::TrainingBatch::Regression { .. } => 0,
         }
     }
@@ -4872,10 +4810,9 @@ impl TrainingLoop {
             ),
             _ => None,
         };
-        let regression_form = self.target_scaler.map(|_| self.regression_form());
         let saved = self
             .target
-            .saved_adapter(&self.config, self.target_scaler, regression_form);
+            .saved_adapter(&self.config, self.head_output())?;
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
         // A real collective call every rank takes part in — see this
         // function's own doc and `Self::save_epoch_checkpoint`'s rank-0-only
@@ -5269,9 +5206,9 @@ fn split_complex(emb: &Tensor) -> Result<(Tensor, Tensor)> {
         .dim(1)
         .map_err(|e| JammiError::FineTune(format!("complex dim: {e}")))?;
     if hidden % 2 != 0 {
-        return Err(JammiError::FineTune(format!(
+        return Err(JammiError::InvalidArgument { argument: "embedding_loss".into(), reason: format!(
             "AnglE requires an even embedding dimension to split into real/imaginary halves, got {hidden}"
-        )));
+        ) });
     }
     let half = hidden / 2;
     let re = emb
@@ -5587,7 +5524,6 @@ fn batch_row_count(batch: &super::data::TrainingBatch) -> Result<usize> {
         super::data::TrainingBatch::Pairs { anchors, .. } => dim0(anchors),
         super::data::TrainingBatch::Triplet { anchor, .. } => dim0(anchor),
         super::data::TrainingBatch::Classification { logits, .. } => dim0(logits),
-        super::data::TrainingBatch::Ner { hidden_states, .. } => dim0(hidden_states),
         super::data::TrainingBatch::Regression { input, .. } => dim0(input),
     }
 }
@@ -5650,9 +5586,10 @@ fn matryoshka_sum(
     let mut total: Option<Tensor> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::FineTune(format!(
-                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: format!("entry {dim} exceeds the embedding width {full_dim}"),
+            });
         }
         let truncated: Vec<Tensor> = embeddings
             .iter()
@@ -5695,9 +5632,10 @@ fn matryoshka_sum_per_example(
     let mut total: Option<Vec<f64>> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::FineTune(format!(
-                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: format!("entry {dim} exceeds the embedding width {full_dim}"),
+            });
         }
         let truncated: Vec<Tensor> = embeddings
             .iter()
@@ -6227,7 +6165,7 @@ mod tests {
         let scores = Tensor::new(&[1.0f32], &device).unwrap();
         let err = angle_loss(&odd, &odd, &scores).unwrap_err();
         assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("even embedding dimension")),
+            matches!(err, JammiError::InvalidArgument { ref reason, .. } if reason.contains("even embedding dimension")),
             "expected an even-dimension error, got {err:?}"
         );
     }
@@ -6396,7 +6334,7 @@ mod tests {
         let objective = |dims: Vec<Tensor>| mnrl_loss(&dims[0], &dims[1], None, 20.0, true);
         let err = matryoshka_sum(&[8], &[&anchor, &positive], &objective).unwrap_err();
         assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("exceeds the embedding width")),
+            matches!(err, JammiError::InvalidArgument { ref argument, ref reason } if argument == "matryoshka_dims" && reason.contains("exceeds the embedding width")),
             "expected an oversized-dim error, got {err:?}"
         );
     }
@@ -6885,7 +6823,7 @@ mod host_read_discipline {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("host-read-oracle-job".into())
             .catalog(catalog)
@@ -7125,244 +7063,6 @@ mod host_read_discipline {
     }
 }
 
-/// `ner_loss`'s `ignore_index=-100` semantics: positions labelled `-100` are
-/// excluded from the loss, never clamped to a valid class and run through
-/// an unmasked `cross_entropy`. Nothing in-repo constructs a
-/// `TrainingBatch::Ner` (`encode_chunk` refuses `TextChunk::Ner`), but the
-/// path is publicly reachable via `TrainingDataLoader::from_precomputed`,
-/// which is what these tests drive it through, exactly as a caller who
-/// bypasses `encode_chunk` and hand-builds a `TrainingBatch::Ner` batch
-/// would.
-#[cfg(test)]
-mod ner_loss_ignore_index {
-    use candle_core::{DType, Device, Tensor, Var};
-    use candle_nn::VarBuilder;
-    use candle_nn::VarMap;
-
-    use super::super::data::{TextChunk, TrainingBatch, TrainingDataLoader};
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::TrainingLoopBuilder;
-    use jammi_db::error::JammiError;
-
-    const HIDDEN: usize = 4;
-
-    /// A minimal real [`super::TrainingLoop`], mirroring
-    /// `host_read_discipline::minimal_loop`: `ner_loss`/`compute_loss`
-    /// never touch the catalog, so an empty, unclaimed-by-anything-else
-    /// catalog registered under its own tag is enough.
-    async fn minimal_loop(device: &Device) -> super::TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig::default();
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        let (catalog, dir) = super::test_fixtures::claimed_job("ner-loss-ignore-index").await;
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
-            .device(device.clone())
-            .job_id("ner-loss-ignore-index".into())
-            .catalog(catalog)
-            .artifact_dir(dir.path().to_path_buf())
-            .build()
-            .unwrap()
-    }
-
-    /// Build a `(1, 2, 3)` logits `Var` whose position-1 (the ignored row,
-    /// label `-100`) is `pos1`, and whose position-0 (label `0`) is fixed
-    /// across callers so batches only ever differ at the ignored row.
-    fn logits_var(device: &Device, pos1: [f32; 3]) -> Var {
-        Var::from_tensor(&Tensor::new(&[[[0.0f32, 0.0, 0.0], pos1]], device).unwrap()).unwrap()
-    }
-
-    fn ner_labels(device: &Device) -> Tensor {
-        // label 0 at position 0, ignore_index -100 at position 1.
-        Tensor::new(&[[0i64, -100i64]], device).unwrap()
-    }
-
-    /// Round-trip a `TrainingBatch::Ner` through the PUBLIC
-    /// `TrainingDataLoader::from_precomputed` / `batches()` API (rather than
-    /// calling `compute_loss` on a hand-held batch directly), so the masking is
-    /// verified through the same public surface an out-of-tree caller who
-    /// hand-builds a `TrainingBatch::Ner` batch would use.
-    fn round_trip_through_precomputed(batch: TrainingBatch) -> TrainingBatch {
-        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
-        let mut batches = loader.batches(1).unwrap();
-        assert_eq!(batches.len(), 1);
-        batches.remove(0).unwrap()
-    }
-
-    /// Two `Ner` batches identical except at the ignored (label `-100`)
-    /// position must produce bit-identical losses AND an exactly-zero,
-    /// finite gradient at that position's logits.
-    ///
-    /// Mutation: clamping `-100 -> 0` and running UNMASKED cross-entropy
-    /// over all positions makes batch A's (`pos1 = [0,0,0]`) and batch B's
-    /// (`pos1 = [0,0,8]`, a confident wrong prediction against the clamped
-    /// label `0`) losses differ by *far* more than 0.1 — the ignored row's
-    /// huge cross-entropy term leaks straight into the mean. Masking the
-    /// ignored row out before `cross_entropy` runs makes the two losses
-    /// depend only on the (identical) position-0 row, so they are
-    /// bit-identical, and `index_select`'s backward gives the ignored row's
-    /// gradient an exact `0.0` (see `ner_loss`'s doc comment for why that is
-    /// exact, not merely small).
-    #[test]
-    fn ignored_position_does_not_move_the_loss_or_the_gradient() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let labels = ner_labels(&device);
-        let var_a = logits_var(&device, [0.0, 0.0, 0.0]);
-        let var_b = logits_var(&device, [0.0, 0.0, 8.0]);
-
-        let batch_a = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: var_a.as_tensor().clone(),
-            labels: labels.clone(),
-        });
-        let batch_b = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: var_b.as_tensor().clone(),
-            labels: labels.clone(),
-        });
-
-        let loss_a = loop_.compute_loss(&batch_a).unwrap();
-        let loss_b = loop_.compute_loss(&batch_b).unwrap();
-        let loss_a_val: f32 = loss_a.to_scalar().unwrap();
-        let loss_b_val: f32 = loss_b.to_scalar().unwrap();
-
-        // CONTROL 1 (finite-guard FIRST): a NaN must fail this control
-        // outright, before any comparison — never fake either color.
-        assert!(
-            loss_a_val.is_finite() && loss_b_val.is_finite(),
-            "loss_a={loss_a_val} loss_b={loss_b_val} must both be finite before comparing them"
-        );
-
-        // Bit-identical scalars, checked via the raw bit pattern
-        // (not merely `abs(a - b) < eps`) — the ignored row must contribute
-        // NOTHING, not just something small.
-        assert_eq!(
-            loss_a_val.to_bits(),
-            loss_b_val.to_bits(),
-            "loss_a={loss_a_val} loss_b={loss_b_val} must be bit-identical: they differ only at \
-             the ignore_index=-100 position, which must not move the loss at all"
-        );
-
-        // The ignored row's gradient is EXACTLY 0.0 and finite.
-        let grads = loss_a.backward().unwrap();
-        let grad_a = grads.get(&var_a).expect("logits var must have a gradient");
-        let grad_rows = grad_a.to_vec3::<f32>().unwrap();
-        let ignored_row = grad_rows[0][1].clone();
-        assert!(
-            ignored_row.iter().all(|g| g.is_finite()),
-            "ignored row's gradient must be finite: {ignored_row:?}"
-        );
-        assert_eq!(
-            ignored_row.as_slice(),
-            [0.0f32, 0.0, 0.0],
-            "ignored (label=-100) row's gradient must be EXACTLY zero, got {ignored_row:?}"
-        );
-    }
-
-    /// POSITIVE CONTROL against an over-broad fix: with no `-100` label at
-    /// all (`labels = [0, 1]`), the masked path must select every row and
-    /// therefore agree with plain unmasked `cross_entropy` to bit-equality
-    /// — a fix that (say) always dropped the last position, or scaled the
-    /// mean by the wrong denominator, would show up here even though
-    /// nothing is actually ignored.
-    #[test]
-    fn no_ignored_positions_matches_unmasked_cross_entropy_bit_exactly() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let logits = Tensor::new(&[[[1.0f32, 0.2, -0.5], [0.1, 2.0, 0.3]]], &device).unwrap();
-        let labels = Tensor::new(&[[0i64, 1i64]], &device).unwrap();
-        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: logits.clone(),
-            labels,
-        });
-
-        let masked_loss = loop_.compute_loss(&batch).unwrap();
-        let masked_val: f32 = masked_loss.to_scalar().unwrap();
-
-        let flat_logits = logits.reshape((2, 3)).unwrap();
-        let flat_labels = Tensor::new(&[0u32, 1u32], &device).unwrap();
-        let unmasked_loss = candle_nn::loss::cross_entropy(&flat_logits, &flat_labels).unwrap();
-        let unmasked_val: f32 = unmasked_loss.to_scalar().unwrap();
-
-        // CONTROL 1 (finite-guard FIRST).
-        assert!(
-            masked_val.is_finite() && unmasked_val.is_finite(),
-            "masked={masked_val} unmasked={unmasked_val} must both be finite before comparing"
-        );
-
-        assert_eq!(
-            masked_val.to_bits(),
-            unmasked_val.to_bits(),
-            "with no ignore_index=-100 labels, the masked path (selects every row) must match \
-             plain cross_entropy bit-for-bit: masked={masked_val} unmasked={unmasked_val}"
-        );
-    }
-
-    /// All-ignored batch: PyTorch's `CrossEntropyLoss(reduction="mean")`
-    /// returns `0.0` (not a `0/0` NaN) when every target equals
-    /// `ignore_index`; `ner_loss` must match that rather than propagating a
-    /// NaN into training.
-    #[test]
-    fn all_ignored_batch_returns_zero_not_nan() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let logits = Tensor::new(&[[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]], &device).unwrap();
-        let labels = Tensor::new(&[[-100i64, -100i64]], &device).unwrap();
-        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: logits,
-            labels,
-        });
-
-        let loss = loop_.compute_loss(&batch).unwrap();
-        let val: f32 = loss.to_scalar().unwrap();
-        assert!(
-            val.is_finite(),
-            "all-ignored loss must be finite, got {val}"
-        );
-        assert_eq!(val, 0.0, "all-ignored loss must be exactly 0.0, got {val}");
-    }
-
-    /// NON-BUG GOLDEN: fixing `ner_loss`'s masking must not be mistaken for
-    /// enabling end-to-end NER training. `encode_chunk` still refuses
-    /// `TextChunk::Ner` with its typed error — the only in-repo way to
-    /// reach `TrainingBatch::Ner` remains the precomputed test seam.
-    #[test]
-    fn encode_chunk_still_refuses_text_chunk_ner() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let chunk = TextChunk::Ner {
-            texts: vec!["Alice works at Acme.".into()],
-            entities_json: vec!["[]".into()],
-        };
-        let err = loop_.encode_chunk(&chunk).err().unwrap();
-        assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("NER fine-tuning is not yet available")),
-            "encode_chunk must still refuse TextChunk::Ner with its typed error, got {err:?}"
-        );
-    }
-}
-
 /// Last-step lattice row: **GradCache**. `run_gradcache_epoch` has no
 /// loss-value divergence check of its own (unlike `process_batch_loss`'s
 /// `loss_val.is_nan() || loss_val > 100.0` guard) — the ONLY thing that can
@@ -7426,7 +7126,7 @@ mod test_fixtures {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: tag,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some(&format!("{model_id}::1")),
@@ -7439,7 +7139,7 @@ mod test_fixtures {
         catalog
             .claim_next(
                 &format!("{tag}-worker"),
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -7520,7 +7220,7 @@ mod gradcache_last_step_oracle {
                     .unwrap(),
             );
             let mut loop_ =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device.clone())
                     .job_id("gradcache-last-step-job".into())
                     .catalog(catalog)
@@ -7712,7 +7412,7 @@ mod streamed_whole_set_arm_refusal_oracle {
                     .unwrap(),
             );
             let mut loop_ =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id("streamed-mining-job".into())
                     .catalog(catalog)
@@ -7848,7 +7548,7 @@ mod last_step_run_harness {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let mut builder = TrainingLoopBuilder::new(
-                TrainingTarget::ProjectionHead { head },
+                TrainingTarget::FrozenEncoder { head },
                 varmap.clone(),
                 config.clone(),
             )
@@ -8202,7 +7902,7 @@ mod gang_lockstep_oracle {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(catalog)
@@ -8313,7 +8013,7 @@ mod gang_lockstep_oracle {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(catalog)
@@ -8613,7 +8313,7 @@ mod runner_role_and_agreement_oracle {
                 }
             };
             let mut builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(Arc::clone(&catalog))
@@ -8768,7 +8468,7 @@ mod runner_role_and_agreement_oracle {
                 let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
                 let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
                 let mut builder = TrainingLoopBuilder::new(
-                    TrainingTarget::ProjectionHead { head },
+                    TrainingTarget::FrozenEncoder { head },
                     varmap,
                     config,
                 )
@@ -8969,7 +8669,7 @@ mod gang_determinism_oracle {
             let head = build_projection_head_for_rank(HIDDEN, &config, &varmap, &vb, dropout_seed)
                 .unwrap();
             let mut builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device.clone())
                     .job_id(job_id.clone())
                     .catalog(Arc::clone(&durable.catalog))
@@ -9188,13 +8888,13 @@ mod gang_determinism_oracle {
     /// mutation would then pass, which is why the kill goes through
     /// `cancel_after_step` at the full horizon.
     /// The run-level record a result carries: the train-loss curve, the
-    /// epochs the walls close, and the final loss.
-    fn run_record(result: &TrainingResult) -> (serde_json::Value, Vec<usize>, f64) {
+    /// epochs the walls close, and the best epoch and its loss.
+    fn run_record(result: &TrainingResult) -> (serde_json::Value, Vec<usize>, serde_json::Value) {
         let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json).unwrap();
         (
             metrics["train_loss_curve"].clone(),
             result.epoch_walls.iter().map(|w| w.epoch).collect(),
-            result.final_loss,
+            serde_json::json!([metrics["best_epoch"], metrics["best_loss"]]),
         )
     }
 
@@ -9235,10 +8935,10 @@ mod gang_determinism_oracle {
             .result
             .unwrap();
 
-        let (curve, walls, final_loss) = run_record(&resumed);
-        assert_eq!((curve, final_loss), {
-            let (curve, _, final_loss) = run_record(&uninterrupted);
-            (curve, final_loss)
+        let (curve, walls, best) = run_record(&resumed);
+        assert_eq!((curve, best), {
+            let (curve, _, best) = run_record(&uninterrupted);
+            (curve, best)
         });
         assert_eq!(walls, vec![0, 1, 2]);
     }
@@ -10081,7 +9781,7 @@ mod loss_curve_metrics {
 /// a `VarMap` head + scaler and call the loss functions directly), these oracles
 /// drive the **actual production dispatch** a real `db.fine_tune(task=regression)`
 /// exercises: a [`TrainingLoop`] built by the production [`TrainingLoopBuilder`],
-/// holding a real [`TrainingTarget::ProjectionHead`] regression head assembled by
+/// holding a real [`TrainingTarget::FrozenEncoder`] regression head assembled by
 /// the production [`build_distribution_head`], with its [`TargetScaler`] reduced
 /// from the training targets exactly as `TrainingLoop::run` does — then each step
 /// runs the head forward through the production `TrainingLoop::regress`
@@ -10101,7 +9801,7 @@ mod loss_curve_metrics {
 /// pipeline-private episode/predictor machinery unreachable from this module, so
 /// it stays where its dependencies live; both surfaces are pinned, together).
 ///
-/// Heads 1–5 (CoSENT / MNRL / Triplet / Classification-CE / NER-CE) are
+/// Heads 1–4 (CoSENT / MNRL / Triplet / Classification-CE) are
 /// offset-INVARIANT by construction (cosine / softmax / class-index), carry no
 /// `TargetScaler`, and are deliberately excluded from
 /// [`super::target::StandardizableHead`] — so this oracle asserts nothing for them.
@@ -10136,7 +9836,7 @@ mod standardization_contract {
     const WIDE: [f32; 9] = [6.0, 13.0, 20.0, 27.0, 34.0, 41.0, 48.0, 55.0, 68.0];
 
     /// Build a real production [`TrainingLoop`] over a regression
-    /// [`TrainingTarget::ProjectionHead`] (projection + distribution head of the
+    /// [`TrainingTarget::FrozenEncoder`] (projection + distribution head of the
     /// given width), with its [`TargetScaler`] reduced from `targets` exactly as
     /// `TrainingLoop::run` does. The infra (catalog/job/worker/artifact_dir) is the
     /// production builder's required plumbing — the dispatch we exercise
@@ -10173,7 +9873,7 @@ mod standardization_contract {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oracle-job",
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("oracle-model::1"),
@@ -10186,7 +9886,7 @@ mod standardization_contract {
         catalog
             .claim_next(
                 "oracle-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -10194,7 +9894,7 @@ mod standardization_contract {
             .expect("queued job is claimable");
 
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -11915,7 +11615,7 @@ mod standardization_contract {
 /// This module instead drives the **production forward dispatch**, the same way
 /// the `standardization_contract` oracle above drives `regress` → `compute_loss`:
 /// every step runs the projection layer's `forward` (the production
-/// `project_frozen_embedding` step — drawing the projection dropout mask),
+/// `frozen_pooled` + `project` step — drawing the projection dropout mask),
 /// `regress` (the distribution head's `forward` — drawing the distribution
 /// dropout mask, then `TargetScaler::destandardize`), and the production
 /// `compute_loss` → AdamW step. So the adapter genuinely TRAINS off zero-init and
@@ -11988,7 +11688,7 @@ mod determinism_through_forward {
     }
 
     /// Build a real production [`TrainingLoop`] over a regression
-    /// [`TrainingTarget::ProjectionHead`] (projection + 2-wide Gaussian head),
+    /// [`TrainingTarget::FrozenEncoder`] (projection + 2-wide Gaussian head),
     /// seeded at `seed`, with its [`TargetScaler`] reduced from `targets` exactly
     /// as `TrainingLoop::run` does. Goes through the production builder so nothing
     /// about the head/scaler wiring is synthetic.
@@ -12021,7 +11721,7 @@ mod determinism_through_forward {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "det-job",
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("det-model::1"),
@@ -12034,7 +11734,7 @@ mod determinism_through_forward {
         catalog
             .claim_next(
                 "det-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -12042,7 +11742,7 @@ mod determinism_through_forward {
             .expect("queued job is claimable");
 
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -12059,8 +11759,8 @@ mod determinism_through_forward {
     /// Borrow the projection-head [`LoraModel`] out of a built loop's target.
     fn head_of(loop_: &TrainingLoop) -> &LoraModel {
         match &loop_.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            _ => unreachable!("regression_loop builds a ProjectionHead target"),
+            TrainingTarget::FrozenEncoder { head } => head,
+            _ => unreachable!("regression_loop builds a FrozenEncoder target"),
         }
     }
 
@@ -12068,7 +11768,7 @@ mod determinism_through_forward {
     /// return the saved `adapter.safetensors` bytes plus the trained weights map.
     ///
     /// Each step is the exact production chain a `db.fine_tune(task=regression)`
-    /// runs per batch: projection `forward` (the `project_frozen_embedding` step,
+    /// runs per batch: projection `forward` (the `frozen_pooled` + `project` step,
     /// drawing the projection dropout mask) → `head_forward` (distribution head
     /// `forward`, drawing its dropout mask, the raw z-output) → production
     /// `compute_loss` against the z-scored target → backward → AdamW. The adapter
@@ -12095,7 +11795,7 @@ mod determinism_through_forward {
 
         let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap();
         for _ in 0..STEPS {
-            // PRODUCTION projection forward (== `project_frozen_embedding`): the
+            // PRODUCTION projection forward (== `frozen_pooled` + `project`): the
             // base-model pooled output `feats` shifted by the projection LoRA. This
             // draws the projection layer's seeded dropout mask.
             let proj = head_of(&loop_).layers[0].1.forward(&feats).unwrap();
@@ -12112,11 +11812,10 @@ mod determinism_through_forward {
         }
 
         let weights = loop_.target.named_trainable_weights().unwrap();
-        let saved = loop_.target.saved_adapter(
-            &loop_.config,
-            loop_.target_scaler,
-            Some(loop_.regression_form()),
-        );
+        let saved = loop_
+            .target
+            .saved_adapter(&loop_.config, loop_.head_output())
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         jammi_lora::save_adapter(dir.path(), &weights, &saved).unwrap();
         let bytes = std::fs::read(dir.path().join("adapter.safetensors")).unwrap();
@@ -12219,13 +11918,12 @@ mod resume_invariant {
 
     use bytes::Bytes;
     use candle_core::{DType, Device, Tensor};
-    use candle_nn::{Linear, VarBuilder, VarMap};
+    use candle_nn::{VarBuilder, VarMap};
 
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
 
     use super::super::data::TrainingBatch;
-    use super::super::lora::LoraModel;
     use super::super::regression_loss::TargetScaler;
     use super::super::resume::{load_bundle, RestoredCheckpoint};
     use super::super::target::TrainingTarget;
@@ -12273,40 +11971,12 @@ mod resume_invariant {
         Tensor::from_vec(vals, (n, HIDDEN), device).unwrap()
     }
 
-    /// One seeded LoRA layer (`ZerosB` init + seeded dropout) at `vb.pp(name)`,
-    /// registered into `varmap` — the production `build_head_layer` shape.
-    fn lora_layer(
-        out: usize,
-        in_: usize,
-        config: &FineTuneConfig,
-        varmap: &VarMap,
-        vb: &VarBuilder,
-        name: &str,
-    ) -> jammi_lora::LoraLinear {
-        let base = Linear::new(
-            Tensor::zeros((out, in_), DType::F32, vb.device()).unwrap(),
-            None,
-        );
-        jammi_lora::LoraLinear::new(
-            base,
-            config.lora_rank,
-            config.lora_alpha,
-            config.use_rslora,
-            jammi_lora::LoraInitMode::ZerosB,
-            Some(config.lora_dropout as f32),
-            config.seed,
-            varmap,
-            &vb.pp(name),
-        )
-        .unwrap()
-    }
-
-    /// A regression `ProjectionHead` with THREE LoRA layers (R1: enough that the
-    /// optimizer's `all_vars()` HashMap order is non-trivially permuted, so a
-    /// positional moment serialization would load the wrong param's moments). The
-    /// `distribution` head stays at index 1 so `TrainingLoop::regress` reads it.
-    /// All three layers are exercised and trained by `step_epoch` below.
-    async fn build_three_layer_loop(
+    /// A regression `FrozenEncoder` over the production distribution head
+    /// (`projection` + `distribution`, four trainable tensors: enough that the
+    /// optimizer's `all_vars()` HashMap order differs between two loops, so a
+    /// positional moment serialization would load the wrong param's moments).
+    /// Both layers are exercised and trained by `step_epoch` below.
+    async fn build_regression_loop(
         seed: u64,
         targets: &Tensor,
         device: &Device,
@@ -12317,17 +11987,8 @@ mod resume_invariant {
         let config = resume_config(seed);
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-
-        let projection = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "projection");
-        let distribution = lora_layer(2, HIDDEN, &config, &varmap, &vb, "distribution");
-        let aux = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "aux");
-        let head = LoraModel {
-            layers: vec![
-                ("projection".into(), projection),
-                ("distribution".into(), distribution),
-                ("aux".into(), aux),
-            ],
-        };
+        let head =
+            super::super::lora::build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
@@ -12348,7 +12009,7 @@ mod resume_invariant {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("resume-model::1"),
@@ -12361,7 +12022,7 @@ mod resume_invariant {
         catalog
             .claim_next(
                 "resume-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -12369,7 +12030,7 @@ mod resume_invariant {
             .expect("queued job is claimable");
 
         let mut builder = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -12386,24 +12047,15 @@ mod resume_invariant {
         (loop_, varmap)
     }
 
-    fn head_of(loop_: &TrainingLoop) -> &LoraModel {
-        match &loop_.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            _ => unreachable!("three-layer loop builds a ProjectionHead target"),
-        }
-    }
-
-    /// One production training step over all three LoRA layers — the exact chain
-    /// `TrainingLoop::run`'s production path runs per batch: projection forward,
-    /// the aux forward, the distribution forward (`head_forward`, the raw z-output),
+    /// One production training step over both head layers — the exact chain
+    /// `TrainingLoop::run`'s production path runs per batch: the projection
+    /// (`project`), the distribution forward (`head_forward`, the raw z-output),
     /// production `compute_loss` against the z-scored target, backward, AdamW step.
     /// Dropout masks are drawn on every forward, advancing each layer's seeded
     /// stream.
     fn step_epoch(loop_: &TrainingLoop, opt: &mut AdamW, feats: &Tensor, targets: &Tensor) {
-        let head = head_of(loop_);
-        let proj = head.layers[0].1.forward(feats).unwrap();
-        let aux = head.layers[2].1.forward(&proj).unwrap();
-        let head_out = loop_.head_forward(&aux).unwrap();
+        let proj = loop_.project(feats.clone()).unwrap();
+        let head_out = loop_.head_forward(&proj).unwrap();
         // Z-score the target with the resumed scaler (persisted across crash/resume),
         // exactly as `embed_chunk` does in production.
         let z_target = {
@@ -12542,8 +12194,7 @@ mod resume_invariant {
 
         // ── Reference ──────────────────────────────────────────────────────────
         let (mut ref_loop, ref_varmap) =
-            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job")
-                .await;
+            build_regression_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job").await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
         for _ in 0..K {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
@@ -12583,7 +12234,7 @@ mod resume_invariant {
 
         // ── Crashed ────────────────────────────────────────────────────────────
         let (mut crash_loop, crash_varmap) =
-            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
+            build_regression_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
                 .await;
         let (mut crash_opt, crash_names) = build_opt(&crash_varmap, &crash_loop);
         for _ in 0..K {
@@ -12652,7 +12303,7 @@ mod resume_invariant {
         let perturbed = Tensor::from_vec(vec![0.0f32; n], (n,), &device).unwrap();
 
         // ── Resumed ──────────────────────────────────────────────────────────────
-        let (resume_loop, resume_varmap) = build_three_layer_loop(
+        let (resume_loop, resume_varmap) = build_regression_loop(
             42,
             &perturbed,
             &device,
@@ -12748,7 +12399,7 @@ mod resume_invariant {
         let store = file_store();
 
         let (mut ref_loop, ref_varmap) =
-            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
+            build_regression_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
         for _ in 0..K {
@@ -12784,7 +12435,7 @@ mod resume_invariant {
         // BROKEN resume: nothing restored — the loop starts over from its
         // seed's initial weights, zero moments and stream positions at 0.
         let (wo_loop, wo_varmap) =
-            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
+            build_regression_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
         assert_ne!(
             weight_bytes(&wo_loop.target.named_trainable_weights().unwrap()),
             weight_bytes(&bundle.weights),
@@ -12823,8 +12474,7 @@ mod resume_invariant {
         let store = file_store();
 
         let (mut src_loop, src_varmap) =
-            build_three_layer_loop(11, &targets, &device, Arc::clone(&store), None, "src-job")
-                .await;
+            build_regression_loop(11, &targets, &device, Arc::clone(&store), None, "src-job").await;
         let (mut src_opt, src_names) = build_opt(&src_varmap, &src_loop);
         for _ in 0..K {
             step_epoch(&src_loop, &mut src_opt, &feats, &targets);
@@ -12853,8 +12503,7 @@ mod resume_invariant {
         .unwrap();
 
         let (mut loop_, varmap) =
-            build_three_layer_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job")
-                .await;
+            build_regression_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job").await;
         let (mut opt, _) = build_opt(&varmap, &loop_);
         for _ in 0..K {
             step_epoch(&loop_, &mut opt, &feats, &targets);
@@ -12921,7 +12570,7 @@ mod resume_invariant {
 
         // Run A: K steps, then one more training step.
         let (a_loop, a_varmap) =
-            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-a").await;
+            build_regression_loop(99, &targets, &device, Arc::clone(&store), None, "val-a").await;
         let (mut a_opt, _) = build_opt(&a_varmap, &a_loop);
         for _ in 0..K {
             step_epoch(&a_loop, &mut a_opt, &feats, &targets);
@@ -12933,19 +12582,15 @@ mod resume_invariant {
         // training step. `set_training` is `&mut`, so take the head out by value
         // through a fresh binding.
         let (mut b_loop, b_varmap) =
-            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-b").await;
+            build_regression_loop(99, &targets, &device, Arc::clone(&store), None, "val-b").await;
         let (mut b_opt, _) = build_opt(&b_varmap, &b_loop);
         for _ in 0..K {
             step_epoch(&b_loop, &mut b_opt, &feats, &targets);
         }
         // A validation pass: dropout off → no mask draws, the stream is untouched.
         b_loop.target.set_training(false);
-        {
-            let head = head_of(&b_loop);
-            let proj = head.layers[0].1.forward(&feats).unwrap();
-            let aux = head.layers[2].1.forward(&proj).unwrap();
-            let _ = b_loop.head_forward(&aux).unwrap();
-        }
+        let proj = b_loop.project(feats.clone()).unwrap();
+        b_loop.head_forward(&proj).unwrap();
         b_loop.target.set_training(true);
         step_epoch(&b_loop, &mut b_opt, &feats, &targets);
         let w_b = b_loop.target.named_trainable_weights().unwrap();
@@ -13013,10 +12658,7 @@ mod resume_invariant {
         let config = resume_config(42);
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let projection = lora_layer(4, 4, &config, &varmap, &vb, "projection");
-        let head = LoraModel {
-            layers: vec![("projection".into(), projection)],
-        };
+        let head = super::super::lora::build_projection_head(4, &config, &varmap, &vb).unwrap();
 
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
@@ -13034,7 +12676,7 @@ mod resume_invariant {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: job,
-                kind: "fine_tune",
+                kind: jammi_db::catalog::status::JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("r5-model::1"),
@@ -13047,7 +12689,7 @@ mod resume_invariant {
         catalog
             .claim_next(
                 "r5-worker",
-                &["fine_tune"],
+                &[jammi_db::catalog::status::JobKind::FineTune],
                 std::time::Duration::from_secs(60),
             )
             .await
@@ -13064,7 +12706,7 @@ mod resume_invariant {
         let loader = TrainingDataLoader::from_precomputed(vec![batch]);
 
         let mut zombie =
-            TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                 .device(device.clone())
                 .job_id(job.into())
                 .catalog(Arc::clone(&catalog))
@@ -13148,7 +12790,7 @@ mod held_out_eval_tests {
     const NUM_CLASSES: usize = 3;
 
     /// A minimal real [`TrainingLoop`] over a `Pairs`/MNRL-shaped
-    /// `ProjectionHead` — mirrors `host_read_discipline::minimal_loop`. The
+    /// `FrozenEncoder` — mirrors `host_read_discipline::minimal_loop`. The
     /// held-out seam's `Pairs` path never touches `self.target`, so a bare,
     /// unclaimed catalog is enough (`evaluate_held_out`/`compute_loss` never
     /// reach the catalog either).
@@ -13159,7 +12801,7 @@ mod held_out_eval_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("held-out-pairs-job".into())
             .catalog(catalog)
@@ -13494,7 +13136,7 @@ mod held_out_eval_tests {
     }
 
     /// A minimal real [`TrainingLoop`] over a `Classification`-shaped
-    /// `ProjectionHead` with seeded dropout ON (`lora_dropout > 0.0`) — the
+    /// `FrozenEncoder` with seeded dropout ON (`lora_dropout > 0.0`) — the
     /// no-RNG-perturbation fixture needs a target whose forward path
     /// actually draws a dropout mask when training, unlike the dropout-free
     /// `Pairs` fixture above.
@@ -13509,7 +13151,7 @@ mod held_out_eval_tests {
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         let loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -13774,14 +13416,14 @@ mod held_out_eval_tests {
 }
 
 /// A target does not necessarily start in training mode:
-/// `TrainingTarget::EncoderAdapters`'s `ModernBert` body is constructed
+/// `TrainingTarget::AdaptedEncoder`'s `ModernBert` body is constructed
 /// `training: false` (only the injected `LoraLinear` adapters start `true`),
 /// so a `training_mode: true` mirror written at [`TrainingLoopBuilder::build`]
 /// without driving the target would make every restore path
 /// (`with_dropout_disabled`, the mining and GradCache brackets) read a
 /// fabricated `true`.
 ///
-/// These tests build a REAL `EncoderAdapters` target — the smallest
+/// These tests build a REAL `AdaptedEncoder` target — the smallest
 /// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
 /// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
@@ -13809,7 +13451,7 @@ mod encoder_adapters_training_state_tests {
     use jammi_lora::{AdapterConfig, LoraBuildConfig, LoraInitMode};
 
     use super::super::data::TrainingDataLoader;
-    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::target::{AdaptedEncoderTarget, TrainingTarget};
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
 
@@ -13830,7 +13472,7 @@ mod encoder_adapters_training_state_tests {
             .join("tiny_modernbert")
     }
 
-    /// Build a real `TrainingTarget::EncoderAdapters` over the tiny-ModernBERT
+    /// Build a real `TrainingTarget::AdaptedEncoder` over the tiny-ModernBERT
     /// fixture, with LoRA injected into `Wqkv`/`Wo` (ModernBERT's fused
     /// attention linears — the same pair the `encoder_adapters` tests use)
     /// and dropout ON, so a real `LoraLinear` dropout gate is exercised
@@ -13871,13 +13513,14 @@ mod encoder_adapters_training_state_tests {
             .build(&[weights.as_path()], &model_config, device, varmap)
             .expect("tiny_modernbert fixture must build");
 
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder: AnyEncoder::ModernBert(encoder),
             adapter_cfg,
+            head: None,
         }))
     }
 
-    /// A minimal real `TrainingLoop` over the `EncoderAdapters` target above.
+    /// A minimal real `TrainingLoop` over the `AdaptedEncoder` target above.
     async fn minimal_encoder_adapters_loop(device: &Device) -> TrainingLoop {
         let varmap = VarMap::new();
         let target = build_encoder_adapters_target(device, &varmap);
@@ -13886,7 +13529,7 @@ mod encoder_adapters_training_state_tests {
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
             .device(device.clone())
-            .job_id("encoder-adapters-training-state-job".into())
+            .job_id("adapted-encoder-training-state-job".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -13897,12 +13540,12 @@ mod encoder_adapters_training_state_tests {
     /// (the mirror under test) — by reaching through the real `AnyEncoder`.
     fn real_encoder_is_training(loop_: &TrainingLoop) -> bool {
         match &loop_.target {
-            TrainingTarget::EncoderAdapters(state) => match &state.encoder {
+            TrainingTarget::AdaptedEncoder(state) => match &state.encoder {
                 AnyEncoder::ModernBert(mb) => mb.is_training(),
                 _ => panic!("fixture must build an AnyEncoder::ModernBert"),
             },
-            TrainingTarget::ProjectionHead { .. } => {
-                panic!("fixture must build an EncoderAdapters target")
+            TrainingTarget::FrozenEncoder { .. } => {
+                panic!("fixture must build an AdaptedEncoder target")
             }
         }
     }
@@ -13918,7 +13561,7 @@ mod encoder_adapters_training_state_tests {
         let loop_ = minimal_encoder_adapters_loop(&device).await;
         assert!(
             real_encoder_is_training(&loop_),
-            "TrainingLoopBuilder::build must switch an EncoderAdapters target's \
+            "TrainingLoopBuilder::build must switch an AdaptedEncoder target's \
              encoder body into training mode, not just its injected LoRA adapters"
         );
         assert!(
@@ -13967,7 +13610,7 @@ mod encoder_adapters_training_state_tests {
 
     /// (c) The real-encoder analog of
     /// `held_out_eval_tests::seam_on_a_non_training_trainer_leaves_it_non_training`: on an
-    /// `EncoderAdapters` target explicitly placed in eval mode, a REFUSED
+    /// `AdaptedEncoder` target explicitly placed in eval mode, a REFUSED
     /// `evaluate_held_out` call (the leading "empty held-out set" check, fired
     /// before any forward) must not flip the encoder body back into training
     /// mode as a side effect.
@@ -14002,13 +13645,13 @@ mod encoder_adapters_training_state_tests {
 /// never derived — these tests exercise the real mechanism (`encode_media`'s
 /// `training_mode` dispatch) rather than asserting on a fabricated number.
 ///
-/// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
+/// Builds a real `TrainingTarget::AdaptedEncoder` over the checked-in
 /// `htsat_clap_tiny` test fixture (the same 4-stage HTSAT-Swin CLAP
 /// audio tower the `it` suite's `tower_adapters::clap_audio_tower_adapter_
 /// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
 /// through the SAME `ModelResolver` + `CandleBackend::load` pair the
 /// production worker path uses — needed here only so `encode_media`'s
-/// `EncoderAdapters` arm has a real `audio_frontend()` (CLAP fusion
+/// `AdaptedEncoder` arm has a real `audio_frontend()` (CLAP fusion
 /// front-end geometry) to preprocess through; the base model's own tower
 /// forward is never invoked on this target.
 #[cfg(test)]
@@ -14031,7 +13674,7 @@ mod media_front_end_wall_tests {
     use jammi_datafusion::ModelTask;
 
     use super::super::data::TrainingDataLoader;
-    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::target::{AdaptedEncoderTarget, TrainingTarget};
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder, TrainingResult};
 
@@ -14116,10 +13759,10 @@ mod media_front_end_wall_tests {
         )
     }
 
-    /// Build a real `TrainingTarget::EncoderAdapters` over a freshly built
+    /// Build a real `TrainingTarget::AdaptedEncoder` over a freshly built
     /// `AnyEncoder::Htsat` tower (LoRA injected into `query`/`value`, the
     /// Swin blocks' attention sites) plus the base model's `audio_frontend`
-    /// — the two pieces `encode_media`'s `EncoderAdapters` arm needs for the
+    /// — the two pieces `encode_media`'s `AdaptedEncoder` arm needs for the
     /// audio task.
     fn build_htsat_encoder_adapters_target(device: &Device, varmap: &VarMap) -> TrainingTarget {
         let fixture = htsat_clap_tiny_dir();
@@ -14161,9 +13804,10 @@ mod media_front_end_wall_tests {
             )
             .expect("htsat_clap_tiny fixture must build a real HtsatAudio tower");
 
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder: AnyEncoder::Htsat(Box::new(tower)),
             adapter_cfg,
+            head: None,
         }))
     }
 
@@ -14179,7 +13823,7 @@ mod media_front_end_wall_tests {
         )])
     }
 
-    /// A minimal real `TrainingLoop` over the HTSAT `EncoderAdapters` target,
+    /// A minimal real `TrainingLoop` over the HTSAT `AdaptedEncoder` target,
     /// driven by a data loader that is EITHER precomputed tensors (a text
     /// run that never touches `encode_media`) or the one-row audio loader
     /// above, matching the shape `TrainingLoopBuilder`'s own doc calls the
@@ -14213,7 +13857,7 @@ mod media_front_end_wall_tests {
     }
 
     /// (a) mechanism, end to end through the real `run`: a media
-    /// `EncoderAdapters` run reports a positive `media_front_end_wall`
+    /// `AdaptedEncoder` run reports a positive `media_front_end_wall`
     /// strictly under the run's own total wall (the front end is one part
     /// of a training step, not the whole of it — the tower forward,
     /// backward, and optimizer step all cost real wall too), and a text run
@@ -14235,12 +13879,12 @@ mod media_front_end_wall_tests {
             })
             .await
             .unwrap()
-            .expect("the audio EncoderAdapters run must complete");
+            .expect("the audio AdaptedEncoder run must complete");
         let total_wall = started.elapsed();
 
         assert!(
             result.media_front_end_wall > Duration::ZERO,
-            "a media EncoderAdapters run must report a positive media_front_end_wall"
+            "a media AdaptedEncoder run must report a positive media_front_end_wall"
         );
         assert!(
             result.media_front_end_wall < total_wall,
@@ -14265,7 +13909,7 @@ mod media_front_end_wall_tests {
             &vb,
         )
         .unwrap();
-        let text_target = TrainingTarget::ProjectionHead { head };
+        let text_target = TrainingTarget::FrozenEncoder { head };
         let text_batch = super::super::data::TrainingBatch::Contrastive {
             embeddings_a: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
             embeddings_b: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
@@ -14345,7 +13989,7 @@ mod media_front_end_wall_tests {
         );
     }
 
-    /// (c) the `ProjectionHead` arm of `encode_media` never advances the
+    /// (c) the `FrozenEncoder` arm of `encode_media` never advances the
     /// accumulator, on a real audio forward, even while `training_mode` is
     /// true. That arm's decode/preprocess and tower forward are one
     /// combined call with no seam to time in isolation, so timing it would
@@ -14354,7 +13998,7 @@ mod media_front_end_wall_tests {
     /// above, that the arm does not accumulate rather than merely happening
     /// to report zero on this input.
     #[tokio::test(flavor = "multi_thread")]
-    async fn encode_media_projection_head_arm_never_advances_the_accumulator() {
+    async fn encode_media_frozen_encoder_arm_never_advances_the_accumulator() {
         use arrow::array::{ArrayRef, BinaryArray};
         use candle_nn::VarBuilder;
 
@@ -14365,7 +14009,7 @@ mod media_front_end_wall_tests {
 
         // Probe the frozen base's own pooled-output width for
         // `AudioEmbedding` so the projection head's input dim matches it
-        // exactly — the SAME width `project_frozen_embedding` forwards
+        // exactly — the SAME width `frozen_pooled` returns
         // through at test time.
         let probe_arr = Arc::new(BinaryArray::from(vec![clip.as_slice()])) as ArrayRef;
         let probe = base_model
@@ -14388,7 +14032,7 @@ mod media_front_end_wall_tests {
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap,
             FineTuneConfig {
                 epochs: 1,
@@ -14412,11 +14056,11 @@ mod media_front_end_wall_tests {
         assert_eq!(loop_.media_front_end_wall.get(), Duration::ZERO);
         loop_
             .encode_media(std::slice::from_ref(&clip))
-            .expect("encode_media must succeed on the ProjectionHead arm");
+            .expect("encode_media must succeed on the FrozenEncoder arm");
         assert_eq!(
             loop_.media_front_end_wall.get(),
             Duration::ZERO,
-            "the ProjectionHead arm of encode_media must never advance \
+            "the FrozenEncoder arm of encode_media must never advance \
              media_front_end_wall, even while training_mode is true — it \
              has no seam between decode/preprocess and the tower forward \
              to time in isolation"
@@ -14427,7 +14071,7 @@ mod media_front_end_wall_tests {
 /// A production-call-site oracle for sequence-length bucketing.
 ///
 /// `jammi_numerics::ShapeLadder`'s and `BatchEncoding::pad_to`'s own unit
-/// tests never drive [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// tests never drive [`TrainingLoop::encode_texts`]'s `AdaptedEncoder`
 /// branch, the ONLY production call site (via this file's own
 /// `tokenize_and_bucket`, its sole caller), so an unwired call site would
 /// pass them. This module covers the call site:
@@ -14458,7 +14102,7 @@ mod encode_texts_bucketing_oracle {
     use jammi_datafusion::ModelTask;
 
     // The tests below all call into `tokenize_and_bucket` (directly, or
-    // indirectly via `TrainingLoop::encode_texts`'s `EncoderAdapters`
+    // indirectly via `TrainingLoop::encode_texts`'s `AdaptedEncoder`
     // branch), which increments the process-wide
     // `BUCKETED_TOKENIZE_CALLS` test-only counter (c) reads. `cargo test`
     // runs tests in parallel threads within the SAME process, so an
@@ -14468,7 +14112,7 @@ mod encode_texts_bucketing_oracle {
 
     /// Real `LoadedModel` (the `base_model` `encode_texts` reads its
     /// tokenizer from) for the SAME `tiny_modernbert` fixture the
-    /// `EncoderAdapters` target below is built from — shared vocab/config,
+    /// `AdaptedEncoder` target below is built from — shared vocab/config,
     /// so the tokenizer's emitted token ids are valid inputs to the
     /// encoder's own embedding table. Mirrors
     /// `test_fixtures::tiny_bert`'s real model-cache load path, substituting
@@ -14512,7 +14156,7 @@ mod encode_texts_bucketing_oracle {
     }
 
     /// (a) The production oracle: calling `tokenize_and_bucket` — the exact
-    /// helper `TrainingLoop::encode_texts`'s `EncoderAdapters` branch calls,
+    /// helper `TrainingLoop::encode_texts`'s `AdaptedEncoder` branch calls,
     /// its only caller — against a real tokenizer must return rows extended
     /// to the ladder, strictly wider than the batch's own
     /// natural (tokenizer `BatchLongest`) width.
@@ -14637,7 +14281,7 @@ mod encode_texts_bucketing_oracle {
     }
 
     /// (b) Output-invariance at the REAL call site: [`TrainingLoop::encode_
-    /// texts`]'s `EncoderAdapters` branch, driven end-to-end through a real
+    /// texts`]'s `AdaptedEncoder` branch, driven end-to-end through a real
     /// `TrainingLoop`, must produce the same pooled output as an
     /// independently-built forward pass over the batch's own NATURAL
     /// (unbucketed) width.
@@ -14691,9 +14335,9 @@ mod encode_texts_bucketing_oracle {
         let varmap2 = VarMap::new();
         let target2 = build_encoder_adapters_target(&device, &varmap2);
         let encoder2 = match &target2 {
-            TrainingTarget::EncoderAdapters(state) => &state.encoder,
-            TrainingTarget::ProjectionHead { .. } => {
-                unreachable!("build_encoder_adapters_target always builds EncoderAdapters")
+            TrainingTarget::AdaptedEncoder(state) => &state.encoder,
+            TrainingTarget::FrozenEncoder { .. } => {
+                unreachable!("build_encoder_adapters_target always builds AdaptedEncoder")
             }
         };
         let tokenizer = tokenizer_of(&base_model);
@@ -14735,7 +14379,7 @@ mod encode_texts_bucketing_oracle {
         }
     }
 
-    /// (c) Every mode pads to the ladder: `encode_texts`'s `EncoderAdapters`
+    /// (c) Every mode pads to the ladder: `encode_texts`'s `AdaptedEncoder`
     /// branch reaches [`super::tokenize_and_bucket`] while
     /// `self.training_mode` is `true` AND while it is `false` (the state
     /// `evaluate`/`evaluate_held_out` run in), proven via the process-wide
@@ -15066,7 +14710,7 @@ mod encode_texts_bucketing_oracle {
 /// every objective this seam supports (MNRL over `Pairs`, MNRL over a
 /// `Triplet` batch, Triplet-margin, Classification, Contrastive/CosineMse —
 /// the same five arms [`TrainingLoop::compute_loss_per_example`]'s own doc
-/// enumerates as supported; `CoSENT`/`AnglE`/`Ner`/`Regression` are typed
+/// enumerates as supported; `CoSENT`/`AnglE`/`Regression` are typed
 /// refusals there, not decompositions, so they have no oracle here).
 ///
 /// Mutation: adding a constant to each row `mnrl_loss_per_example` returns
@@ -15107,7 +14751,7 @@ mod decomposition_oracle_tests {
     /// it, while legitimate summation-order noise does not flake it.
     const REL_TOL: f64 = 1e-5;
 
-    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target, for the
+    /// A minimal real [`TrainingLoop`] over a `FrozenEncoder` target, for the
     /// four objectives whose loss functions never touch `self.target` (they
     /// operate directly on the batch's already-embedded tensors): MNRL/Pairs,
     /// MNRL/Triplet, Triplet-margin, Contrastive/CosineMse.
@@ -15118,7 +14762,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-job".into())
             .catalog(catalog)
@@ -15128,7 +14772,7 @@ mod decomposition_oracle_tests {
     }
 
     /// A minimal real [`TrainingLoop`] over a classification-shaped
-    /// `ProjectionHead` (projection + classifier layers) — Classification's
+    /// `FrozenEncoder` (projection + classifier layers) — Classification's
     /// loss DOES route through `self.target` (`Self::classify`).
     async fn minimal_classification_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
         let varmap = VarMap::new();
@@ -15137,7 +14781,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-cls-job".into())
             .catalog(catalog)
@@ -15284,7 +14928,7 @@ mod decomposition_oracle_tests {
     /// into.
     const MATRYOSHKA_HIDDEN: usize = 4;
 
-    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target sized
+    /// A minimal real [`TrainingLoop`] over a `FrozenEncoder` target sized
     /// for the matryoshka oracle ([`MATRYOSHKA_HIDDEN`]-wide embeddings)
     /// rather than [`minimal_loop`]'s fixed [`HIDDEN`].
     async fn minimal_matryoshka_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
@@ -15294,7 +14938,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-matryoshka-job".into())
             .catalog(catalog)

@@ -9,17 +9,12 @@ title: "The model catalog — referential integrity on either transport"
 absence is a *typed* condition, not an ambiguous failure · **Checked:** parity (the
 same lifecycle, the same outcomes, in process and against a server).
 
-The engine's model catalog lets you **see** the models it serves and has
-trained — `list_models`, `describe_model` — and **clean them up** —
-`delete_model`. A model enters the catalog by being used: loading one records it,
-and training records both its base and the model it produced. And a model is a
-row other rows point at: the job that trained it names it, so deleting it while
-that job is on record would leave a dangling reference. The engine refuses that
-delete, typed, until the reference is gone.
-
-This chapter runs the whole lifecycle as one function, against an in-process
-engine and against a live server, and checks that every outcome — including
-every refusal's class — is the same on both.
+The [model catalog recipe](../recipes/model_catalog.qmd) walks the catalog a step
+at a time: a model enters it by being loaded or trained, a delete is refused while
+the job that trained it is on record, and succeeds once that job is pruned. This
+chapter asks one question of that lifecycle: does one program get the same outcome,
+refusal for refusal, in process and against a server? It runs the lifecycle as one
+function on each and compares every outcome, including every refusal's class.
 
 ```{python}
 import tempfile
@@ -120,21 +115,6 @@ claim("once its jobs are pruned the model deletes, and the catalog no longer des
       local["jobs_left"] == 0 and local["delete_unreferenced"] == "deleted"
       and local["described_after"] is None)
 ```
-
-## Reading the outcomes
-
-- **Two rows, both `registered`.** Loading the base model recorded it; the
-  finished job wrote the fine-tuned model. `describe_model` reads one back by
-  id, and `None` once it is gone.
-- **A referenced delete is refused with `ModelReferenced`.** The job that
-  trained the model names it, so the delete would leave that reference
-  dangling. The refusal is a class, not a message to parse — the same class in
-  process and from a server.
-- **An absent delete is `ModelNotFound`,** a condition distinct from a
-  referenced one, and `if_exists=True` makes it a no-op for cleanup code that
-  does not care.
-- **Pruning ends the reference.** With the job past its retention and pruned,
-  nothing points at the model, and the same delete succeeds.
 
 ## Bridge note
 

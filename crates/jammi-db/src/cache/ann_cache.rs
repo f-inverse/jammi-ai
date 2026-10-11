@@ -68,7 +68,7 @@ impl AnnCache {
         self.entries
             .invalidate_entries_if(move |k, _v| k.source_id == sid)
             .map_err(|e| {
-                crate::error::JammiError::Other(format!("Cache invalidation failed: {e}"))
+                crate::error::JammiError::Internal(format!("Cache invalidation failed: {e}"))
             })?;
         Ok(())
     }

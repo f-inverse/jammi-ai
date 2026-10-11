@@ -58,7 +58,7 @@ def test_embedded_fine_tune_runs_through_the_shared_assembly(tmp_path: Path) -> 
     # session.fine_tune, and the embedded worker carries it to completion.
     assert job.output_model_id.startswith("jammi:fine-tuned:")
     job.wait()
-    assert job.status() == "completed"
+    assert job.status() == jammi.JobStatus.COMPLETED
 
 
 def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path) -> None:
@@ -88,14 +88,15 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
         early_stopping_metric="val_loss",
     )
     job.wait()
-    assert job.status() == "completed"
+    assert job.status() == jammi.JobStatus.COMPLETED
 
     metrics = job.metrics()
     assert isinstance(metrics, dict)
     # Divergence-prone case: the val_loss arm must actually be the metric
     # recorded, not silently the train_loss default.
     assert metrics["early_stopping_metric"] == "val_loss"
-    assert math.isfinite(metrics["final_loss"])
+    assert math.isfinite(metrics["best_loss"])
+    assert metrics["best_epoch"] < len(metrics["val_loss_curve"])
     assert metrics["total_steps"] > 0
     assert metrics["started_at"]
     assert metrics["completed_at"]
@@ -196,7 +197,7 @@ def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> N
     )
     submit_job = submit_db._start_training_proto(request.SerializeToString())
     submit_job.wait()
-    assert submit_job.status() == "completed"
+    assert jammi.JobStatus(submit_job.status()) is jammi.JobStatus.COMPLETED
     job_id = submit_job.job_id
 
     # State 1: determined — the job's OWN natural post-completion state. The

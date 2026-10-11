@@ -43,10 +43,12 @@ use datafusion_flight_sql_server::service::FlightSqlService;
 use datafusion_flight_sql_server::session::SessionStateProvider;
 use datafusion_flight_sql_server::state::CommandTicket;
 use futures::{Stream, StreamExt, TryStreamExt};
-use jammi_db::error::JammiError;
+use jammi_db::error::{ErrorClass, JammiError};
 use jammi_db::session::QueryContext;
+use jammi_db::store::statement::StatementClass;
 use jammi_db::tenant::TenantContext;
 use jammi_db::tenant_scope::TenantBinding;
+use prost::Message;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tower::Layer;
@@ -247,6 +249,32 @@ impl JammiFlightService {
         }
     }
 
+    /// The statement a descriptor carries, when it is a statement descriptor
+    /// (`CommandStatementQuery`, what a client's `execute` sends first);
+    /// `None` for every other command, which the inner service answers.
+    fn descriptor_statement(descriptor: &FlightDescriptor) -> Option<String> {
+        let any = arrow_flight::sql::Any::decode(descriptor.cmd.clone()).ok()?;
+        match Command::try_from(any).ok()? {
+            Command::CommandStatementQuery(query) => Some(query.query),
+            _ => None,
+        }
+    }
+
+    /// Plan `query` through the engine's statement entry on the request's own
+    /// state, executing nothing, so a statement the engine refuses is refused
+    /// at the first call with the status the engine's own classification gives
+    /// it — a missing relation is `NOT_FOUND` here exactly as it is in process —
+    /// rather than with the inner service's planner's untyped failure.
+    async fn plan_statement<T>(&self, request: &Request<T>, query: &str) -> Result<(), Status> {
+        let inspect =
+            Request::from_parts(request.metadata().clone(), request.extensions().clone(), ());
+        let state = self.provider.new_context(&inspect).await?;
+        StatementClass::plan(&state, query)
+            .await
+            .map(|_| ())
+            .map_err(engine_status)
+    }
+
     /// Run `query` through the engine's statement entry on the request's
     /// own state and encode its rows under the plan's schema — the schema
     /// the inner service advertised for it (`get_flight_info` derives the
@@ -273,12 +301,48 @@ impl JammiFlightService {
 }
 
 /// The status a statement's DataFusion error reaches the client as — raised
-/// while planning or while its rows stream — the engine's own mapping over
-/// the classified `JammiError`, so a typed refusal (a routed plan's among
-/// them, which arrives mid-stream) carries the same code and detail the
-/// gRPC plane gives it.
+/// while planning or while its rows stream — the engine's own mapping over the
+/// classified `JammiError`, so a typed refusal (a routed plan's among them,
+/// which arrives mid-stream) carries the same code and detail the gRPC plane
+/// gives it.
+///
+/// It also carries Arrow Flight's own status trailer, `x-arrow-status`. An
+/// Arrow client that finds none rebuilds the error from the gRPC code alone, by
+/// a table that folds `FAILED_PRECONDITION` and `RESOURCE_EXHAUSTED` into
+/// `INVALID_ARGUMENT`, and drops the typed detail; with it, the client keeps the
+/// `grpc-status-details-bin` envelope as the error's extra info, so a Flight
+/// client classifies a statement's failure exactly as the typed gRPC lane does.
 fn engine_status(e: datafusion::error::DataFusionError) -> Status {
-    crate::grpc::wire::map_engine_error(JammiError::from(e))
+    let err = JammiError::from(e);
+    let arrow_code = arrow_status_code(err.class());
+    let mut status = crate::grpc::wire::map_engine_error(err);
+    status.metadata_mut().insert(
+        "x-arrow-status",
+        tonic::metadata::MetadataValue::from(arrow_code),
+    );
+    status
+}
+
+/// The Arrow `StatusCode` (`arrow/status.h`) nearest an engine error class,
+/// for the Arrow clients that read `x-arrow-status` without the detail.
+fn arrow_status_code(class: ErrorClass) -> u16 {
+    const KEY_ERROR: u16 = 2;
+    const INVALID: u16 = 4;
+    const IO_ERROR: u16 = 5;
+    const CANCELLED: u16 = 8;
+    const ALREADY_EXISTS: u16 = 45;
+    match class {
+        ErrorClass::NotFound => KEY_ERROR,
+        ErrorClass::InvalidArgument
+        | ErrorClass::FailedPrecondition
+        | ErrorClass::ResourceExhausted => INVALID,
+        ErrorClass::AlreadyExists => ALREADY_EXISTS,
+        ErrorClass::Cancelled => CANCELLED,
+        ErrorClass::PermissionDenied
+        | ErrorClass::Aborted
+        | ErrorClass::Unavailable
+        | ErrorClass::Internal => IO_ERROR,
+    }
 }
 
 type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -311,6 +375,9 @@ impl FlightService for JammiFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        if let Some(query) = Self::descriptor_statement(request.get_ref()) {
+            self.plan_statement(&request, &query).await?;
+        }
         self.inner.get_flight_info(request).await
     }
 
@@ -364,5 +431,39 @@ impl FlightService for JammiFlightService {
         request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         self.inner.list_actions(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jammi_db::error::Missing;
+    use tonic::Code;
+
+    /// A statement refused over a missing relation reaches a Flight client as
+    /// `NOT_FOUND` with Arrow's own status trailer (`KeyError`), the trailer an
+    /// Arrow client needs to keep the engine's typed detail as the error's
+    /// extra info rather than rebuild the error from the gRPC code alone.
+    #[test]
+    fn a_refused_statement_carries_the_arrow_status_trailer() {
+        let refused = datafusion::error::DataFusionError::External(Box::new(JammiError::NotFound(
+            Missing::Relation {
+                name: "mutable.public.notes".to_string(),
+            },
+        )));
+        let status = engine_status(refused);
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(
+            status
+                .metadata()
+                .get("x-arrow-status")
+                .map(|v| v.to_str().unwrap()),
+            Some("2"),
+            "an Arrow client reads KeyError (2) for a missing relation"
+        );
+        assert!(
+            !status.details().is_empty(),
+            "the typed detail rides beside the trailer"
+        );
     }
 }

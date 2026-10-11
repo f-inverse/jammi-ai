@@ -171,7 +171,7 @@ _PIPELINE_VERBS = {
 }
 
 
-# The evaluation verbs. They DO hit the wire: the model and the golden data
+# The evaluation verbs. They DO hit the wire: the model and the ground-truth data
 # both live in the engine, so the compute runs where the data is
 # (`EvalService`) and only the typed report crosses the wire. The embedded
 # `Database` runs them in the compiled engine; the client's `RemoteDatabase`
@@ -824,13 +824,13 @@ def test_training_verbs_have_identical_signatures_across_wheels():
 
 def test_remote_job_matches_the_local_handle_shape():
     """The client's `RemoteJob` carries the SAME handle surface as the
-    embedded engine's `Job`: the `job_id` / `kind` / `output_model_id`
+    embedded engine's `EmbeddedJob`: the `job_id` / `kind` / `output_model_id`
     properties, the `status()` / `wait()` / `progress()` / `cancel()`
     methods, `metrics()`, and `acceleration_report()`. A remote `wait()`
     polls `JobStatus` and raises on a
     failed job with the wire error, mirroring the local handle, so a caller
     treats the two interchangeably."""
-    local = jammi_native.Job
+    local = jammi.EmbeddedJob
     remote = jammi.RemoteJob
     for member in (
         "job_id",
@@ -884,8 +884,8 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
     """The client's pure-Python conformal / RRF numerics produce output EQUAL to
     the embedded engine's on shared fixtures. Both are computed locally (no
     server), so this asserts the two implementations reproduce the same
-    finite-sample quantile, score families, interval construction, and fusion
-    order — the byte-identical agreement the compute-to-data split requires.
+    finite-sample quantile, score families, calibration schemes, interval
+    construction, and fusion order — the byte-identical agreement the compute-to-data split requires.
 
     Hermetic: the embedded side opens a local engine (`file://`); the client side
     runs entirely in process. No server is contacted by either."""
@@ -938,6 +938,29 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
         ) == remote.conformalize_cqr(
             lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25
         )
+
+        # Mondrian and weighted calibration, on every verb: one cohort or
+        # likelihood ratio per calibration row and per test row.
+        schemes = (
+            {"groups": ["a", "b", "a", "b", "a"], "test_groups": ["a", "c"]},
+            {"weights": [0.5, 2.0, 1.0, 1.5, 0.25], "test_weights": [1.0, 3.0]},
+        )
+        for scheme in schemes:
+            assert local.conformalize(
+                calibration, true_labels, test[:2], alpha=0.2, score="aps", **scheme
+            ) == remote.conformalize(
+                calibration, true_labels, test[:2], alpha=0.2, score="aps", **scheme
+            ), scheme
+            assert local.conformalize_interval(
+                predictions, observed, test_predictions, alpha=0.25, **scheme
+            ) == remote.conformalize_interval(
+                predictions, observed, test_predictions, alpha=0.25, **scheme
+            ), scheme
+            assert local.conformalize_cqr(
+                lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25, **scheme
+            ) == remote.conformalize_cqr(
+                lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25, **scheme
+            ), scheme
 
         # Reciprocal-rank fusion, default and explicit k_rrf.
         ranked_lists = [["a", "b", "c"], ["c", "a", "d"], ["b", "d", "a"]]
@@ -1207,47 +1230,47 @@ def test_jsonl_and_ndjson_add_source_are_accepted_on_both_backends(tmp_path):
         )
 
 
-def test_failed_job_wait_raises_training_error_on_both_raise_sites():
+def test_failed_job_wait_raises_job_failed_on_both_raise_sites():
     """Tier B (converter-level) — a failed job's `wait()` maps to ONE class,
-    `jammi.errors.TrainingError`, on both transports.
+    `jammi.errors.JobFailed`, on both transports.
 
     Converter-level on the embedded arm BY NECESSITY: a failed embedded job needs
     the worker to run and fail, which is not hermetic (it would pull a
     base model / run compute), so driving one here would violate test discipline.
     We therefore pin the two raise-sites at the converter:
       * the REMOTE raise-site is driven directly — a stubbed `JobStatus` of
-        `failed` makes `RemoteJob.wait()` raise, asserted to `TrainingError`;
-      * the EMBEDDED raise-site (`job.rs` failed `wait()` → `to_pyerr`'s
-        `JammiError::FineTune` → `TrainingError` variant-dispatch) is wired to the
-        SAME class object: the native engine imports `jammi.errors` and
-        raises `TrainingError` from there, so the class both produce is one and the
-        same. The seam is named here, not silently skipped."""
+        `failed` makes `RemoteJob.wait()` raise, asserted to `JobFailed`;
+      * the EMBEDDED raise-site (`JobRecord::unsuccessful_error`'s
+        `JammiError::JobFailed` → `to_pyerr`'s `JobFailed` variant-dispatch) is
+        wired to the SAME class object: the native engine imports `jammi.errors`
+        and raises `JobFailed` from there, so the class both produce is one and
+        the same. The seam is named here, not silently skipped."""
     from jammi._generated.jammi.v1 import job_pb2
 
     class _FailedJobStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="failed", error="boom")
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_FAILED, error="boom")
 
     job = jammi.RemoteJob(
-        _FailedJobStub(), (), job_id="job-1", kind="fine_tune", output_model_id="model-1"
+        _FailedJobStub(), (), job_id="job-1", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-1"
     )
-    with pytest.raises(jammi.TrainingError) as info:
+    with pytest.raises(jammi.JobFailed) as info:
         job.wait()
-    assert type(info.value) is jammi.TrainingError
-    assert "boom" in str(info.value)
+    assert type(info.value) is jammi.JobFailed
+    assert str(info.value) == "boom"
 
     # Both raise-sites bind to THIS class: a `JammiError` refining `RuntimeError`,
     # so one `except JammiError` / `except RuntimeError` catches a failed job on
     # either transport. The embedded `Job.wait` raises it by importing
-    # `jammi.errors.TrainingError` — the same object asserted above.
-    assert issubclass(jammi.TrainingError, jammi.JammiError)
-    assert issubclass(jammi.TrainingError, RuntimeError)
+    # `jammi.errors.JobFailed` — the same object asserted above.
+    assert issubclass(jammi.JobFailed, jammi.JammiError)
+    assert issubclass(jammi.JobFailed, RuntimeError)
     from jammi import errors as client_errors
 
-    assert client_errors.TrainingError is jammi.TrainingError
+    assert client_errors.JobFailed is jammi.JobFailed
 
 
-def test_cancelled_job_wait_raises_job_cancelled_not_training_error():
+def test_cancelled_job_wait_raises_job_cancelled_not_job_failed():
     """Tier B (converter-level) — a cancelled job's `wait()` raises
     `jammi.errors.JobCancelled` on both transports, distinct from a failure.
 
@@ -1260,20 +1283,20 @@ def test_cancelled_job_wait_raises_job_cancelled_not_training_error():
 
     class _CancelledJobStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="cancelled", error="job 'job-1' cancelled")
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_CANCELLED, error="job 'job-1' cancelled")
 
     job = jammi.RemoteJob(
-        _CancelledJobStub(), (), job_id="job-1", kind="fine_tune", output_model_id="model-1"
+        _CancelledJobStub(), (), job_id="job-1", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-1"
     )
     with pytest.raises(jammi.JobCancelled) as info:
         job.wait()
     assert type(info.value) is jammi.JobCancelled
     assert "job-1" in str(info.value)
 
-    # The end a caller asked for is not a fault: `except TrainingError` must not
+    # The end a caller asked for is not a fault: `except JobFailed` must not
     # swallow it, while `except JammiError` / `except RuntimeError` still catch
     # any unsuccessful job.
-    assert not issubclass(jammi.JobCancelled, jammi.TrainingError)
+    assert not issubclass(jammi.JobCancelled, jammi.JobFailed)
     assert issubclass(jammi.JobCancelled, jammi.JammiError)
     assert issubclass(jammi.JobCancelled, RuntimeError)
     from jammi import errors as client_errors
@@ -1290,9 +1313,9 @@ def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_t
     This is deliberately scoped to the `Recompute` surface, not "the"
     empty-training-set refusal generally: the SAME typed engine error
     (`JammiError::EmptyTrainingSet`) reaches the caller as a DIFFERENT class,
-    `jammi.errors.TrainingError`, when it is instead raised on the fine-tune
+    `jammi.errors.JobFailed`, when it is instead raised on the fine-tune
     JOB path (`worker.rs::run_spec`'s `materialize_projection` call) — see
-    `test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports`
+    `test_empty_training_set_refusal_on_the_job_path_is_job_failed_on_both_transports`
     below. A test named "the" refusal would misstate that as one universal
     class; it is not — which surface carried the refusal determines the class.
 
@@ -1346,13 +1369,13 @@ def test_empty_training_set_refusal_over_recompute_is_invalid_argument_on_both_t
     assert issubclass(jammi.InvalidArgument, ValueError)
 
 
-def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_transports():
+def test_empty_training_set_refusal_on_the_job_path_is_job_failed_on_both_transports():
     """Tier B (converter-level) — the SAME typed engine error
     (`JammiError::EmptyTrainingSet`), WHEN IT SURFACES ON THE FINE-TUNE JOB
     PATH instead of the `Recompute` RPC, does NOT reach the caller as
     `InvalidArgument` on either transport: both `job.wait()` raise-sites
     collapse it (and every other job-failure cause) to
-    `jammi.errors.TrainingError`. This is the class-equality check the
+    `jammi.errors.JobFailed`. This is the class-equality check the
     `Recompute`-scoped test above deliberately does not claim to cover.
 
     On the JOB path, `run_spec` (`crates/jammi-ai/src/fine_tune/worker.rs`,
@@ -1363,16 +1386,16 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
     STRING alone, with NO branch on its content:
       * the REMOTE raise-site, `RemoteJob.wait()`
         (`clients/python/jammi/_database.py`), raises
-        `jammi.errors.TrainingError(resp.error)` for ANY `status == "failed"`
+        `jammi.errors.JobFailed(resp.error)` for ANY failed job
         — driven directly here with the refusal's message as the stubbed error;
-      * the EMBEDDED raise-site, `wait_for_result`
-        (`crates/jammi-python/src/job.rs`), raises
-        `JammiError::FineTune(record.error)` for ANY `JobStatus::Failed` —
+      * the EMBEDDED raise-site, `JobRecord::unsuccessful_error`
+        (`crates/jammi-db/src/catalog/jobs_repo.rs`), raises
+        `JammiError::JobFailed` carrying `record.error` for ANY failed job —
         the exact same unconditional wrap the generic
-        `test_failed_job_wait_raises_training_error_on_both_raise_sites`
+        `test_failed_job_wait_raises_job_failed_on_both_raise_sites`
         above already pins with an unrelated message ("boom") — which
         `jammi_error_class` (`crates/jammi-python/src/error.rs`) maps to
-        `TrainingError`. Neither raise-site inspects the failure's original
+        `JobFailed`. Neither raise-site inspects the failure's original
         cause, so the class the two transports agree on for THIS failure is
         the SAME class already pinned for every OTHER job failure — proven
         by the shared code path, not restated as a separate coincidence.
@@ -1390,18 +1413,18 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
 
     class _EmptyTrainingSetJobStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="failed", error=message)
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_FAILED, error=message)
 
     job = jammi.RemoteJob(
         _EmptyTrainingSetJobStub(),
         (),
         job_id="job-empty-training-set",
-        kind="fine_tune",
+        kind=jammi.JobKind.FINE_TUNE,
         output_model_id="model-empty-training-set",
     )
-    with pytest.raises(jammi.TrainingError) as info:
+    with pytest.raises(jammi.JobFailed) as info:
         job.wait()
-    assert type(info.value) is jammi.TrainingError
+    assert type(info.value) is jammi.JobFailed
     assert message in str(info.value)
 
     # This is NOT the class the Recompute-RPC-scoped test above pins for the
@@ -1411,31 +1434,28 @@ def test_empty_training_set_refusal_on_the_job_path_is_training_error_on_both_tr
     assert type(info.value) is not jammi.InvalidArgument
 
     # The embedded raise-site binds to THIS class the same way the generic
-    # failed-job test binds it: by importing `jammi.errors.TrainingError`,
-    # the same module object asserted above, so a caller's single `except`
-    # holds on either transport for this failure too.
+    # failed-job test binds it: by importing `jammi.errors.JobFailed`, the
+    # same module object asserted above, so a caller's single `except` holds
+    # on either transport for this failure too.
     from jammi import errors as client_errors
 
-    assert client_errors.TrainingError is jammi.TrainingError
-    assert issubclass(jammi.TrainingError, jammi.JammiError)
-    assert issubclass(jammi.TrainingError, RuntimeError)
+    assert client_errors.JobFailed is jammi.JobFailed
 
 
 def test_job_handle_protocol_is_satisfied_by_both_handles():
-    """Both `jammi_native.Job` (native) and `jammi.RemoteJob`
-    satisfy the `JobHandle` protocol — a caller treats the two
-    interchangeably. The remote handle is checked by `isinstance` on a
-    stub-constructed instance; the native handle, which needs a live engine to
-    instantiate, is checked structurally at the class level for the same members
-    (no engine is opened here)."""
+    """Both `jammi.EmbeddedJob` and `jammi.RemoteJob` satisfy the `JobHandle`
+    protocol — a caller treats the two interchangeably. The remote handle is
+    checked by `isinstance` on a stub-constructed instance; the embedded
+    handle, which needs a live engine to instantiate, is checked structurally
+    at the class level for the same members (no engine is opened here)."""
     from jammi._generated.jammi.v1 import job_pb2
 
     class _CompletedStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="completed")
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_COMPLETED)
 
     remote_job = jammi.RemoteJob(
-        _CompletedStub(), (), job_id="job-1", kind="fine_tune", output_model_id="model-1"
+        _CompletedStub(), (), job_id="job-1", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-1"
     )
     assert isinstance(remote_job, jammi.JobHandle)
     for member in (
@@ -1449,7 +1469,7 @@ def test_job_handle_protocol_is_satisfied_by_both_handles():
         "metrics",
         "acceleration_report",
     ):
-        assert hasattr(jammi_native.Job, member), member
+        assert hasattr(jammi.EmbeddedJob, member), member
 
 
 # crates/jammi-python/tests/this_file -> repo root is three parents up. Shared
@@ -1521,16 +1541,15 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
          way the prior version of this test did — then is itself `close()`d
          before the next state's injection.
 
-    The "absent" state's `jobs.result = NULL` is INJECTED, not the job's
-    natural just-submitted state: `wait()` blocks until the job reaches
-    `completed` (required before `close()` can run), and by then the worker
-    has already stamped a real tagged `result` (with a real `metrics`
-    string) onto the row. The state under test is the READ arm on the
-    payload's three possible SHAPES (absent / valid JSON / malformed JSON)
-    — reusing one job's completed row and overwriting its `result` column
-    directly exercises the identical read path the naturally-absent case
-    would (both are `None` at the `Option<String>` boundary `metrics()`
-    matches on), for one real training run instead of three.
+    The "absent" state is INJECTED as a `running` row with no result, not
+    the job's natural just-submitted state: `wait()` blocks until the job
+    reaches `completed` (required before `close()` can run), and by then the
+    worker has already stamped a real tagged `result` onto the row. A
+    completed row always carries its result (the finalize writes both in one
+    compare-and-set), so "no metrics yet" is a job that has not completed.
+    The states under test are the READ arm on the row's three possible
+    SHAPES (not completed / valid JSON / malformed JSON), for one real
+    training run instead of three.
 
     Asymmetry, named rather than papered over: `RemoteDatabase` already has
     `close()` (used throughout this module); `close()` is therefore symmetric
@@ -1550,27 +1569,27 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     from jammi.errors import BackendError
 
     valid_payload = (
-        '{"final_loss": 0.42, "total_steps": 100, '
+        '{"best_loss": 0.42, "total_steps": 100, '
         '"train_loss_curve": [{"epoch": 0, "loss": 1.0}, {"epoch": 1, "loss": 0.5}], '
         '"val_loss_curve": [{"epoch": 0, "loss": 1.1}, {"epoch": 1, "loss": 0.6}]}'
     )
     valid_expected = {
-        "final_loss": 0.42,
+        "best_loss": 0.42,
         "total_steps": 100,
         "train_loss_curve": [{"epoch": 0, "loss": 1.0}, {"epoch": 1, "loss": 0.5}],
         "val_loss_curve": [{"epoch": 0, "loss": 1.1}, {"epoch": 1, "loss": 0.6}],
     }
-    malformed_payload = '{"final_loss": 0.42, "total_steps"'  # truncated, invalid JSON
+    malformed_payload = '{"best_loss": 0.42, "total_steps"'  # truncated, invalid JSON
 
     # --- Remote arm: three stubbed `JobStatusResponse`s. -------------------
     class _AbsentStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="running")
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_RUNNING)
 
     class _ValidStub:
         def JobStatus(self, *_args, **_kwargs):
             return job_pb2.JobStatusResponse(
-                status="completed",
+                status=job_pb2.JOB_STATUS_COMPLETED,
                 model=job_pb2.ModelResult(
                     model_id="model-2", artifact_path="a2", metrics_json=valid_payload
                 ),
@@ -1579,7 +1598,7 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     class _MalformedStub:
         def JobStatus(self, *_args, **_kwargs):
             return job_pb2.JobStatusResponse(
-                status="completed",
+                status=job_pb2.JOB_STATUS_COMPLETED,
                 model=job_pb2.ModelResult(
                     model_id="model-3",
                     artifact_path="a3",
@@ -1588,13 +1607,13 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
             )
 
     remote_absent = jammi.RemoteJob(
-        _AbsentStub(), (), job_id="remote-1", kind="fine_tune", output_model_id="model-1"
+        _AbsentStub(), (), job_id="remote-1", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-1"
     )
     remote_valid = jammi.RemoteJob(
-        _ValidStub(), (), job_id="remote-2", kind="fine_tune", output_model_id="model-2"
+        _ValidStub(), (), job_id="remote-2", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-2"
     )
     remote_malformed = jammi.RemoteJob(
-        _MalformedStub(), (), job_id="remote-3", kind="fine_tune", output_model_id="model-3"
+        _MalformedStub(), (), job_id="remote-3", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-3"
     )
 
     assert remote_absent.metrics() == {}
@@ -1606,10 +1625,10 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     catalog_db = tmp_path / "catalog.db"
 
     def _set_result(job_id: str, metrics_value) -> None:
-        """Overwrite `jobs.result` with a tagged `model` result envelope
-        carrying `metrics_value` as its nested `metrics` field, or SQL NULL
-        when `metrics_value` is `None` (the natural pre-completion /
-        never-recorded state)."""
+        """Overwrite the row as `completed` with a tagged `model` result
+        envelope carrying `metrics_value` as its nested `metrics` field, or as
+        `running` with no result when `metrics_value` is `None` (the natural
+        pre-completion state)."""
         result_json = (
             None
             if metrics_value is None
@@ -1626,8 +1645,8 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
         conn = sqlite3.connect(str(catalog_db))
         try:
             conn.execute(
-                "UPDATE jobs SET result = ? WHERE job_id = ?",
-                (result_json, job_id),
+                "UPDATE jobs SET result = ?, status = ? WHERE job_id = ?",
+                (result_json, "running" if result_json is None else "completed", job_id),
             )
             conn.commit()
         finally:
@@ -1654,7 +1673,7 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
     )
     submit_job = submit_db._start_training_proto(request.SerializeToString())
     submit_job.wait()
-    assert submit_job.status() == "completed"
+    assert jammi.JobStatus(submit_job.status()) is jammi.JobStatus.COMPLETED
     job_id = submit_job.job_id
 
     # Deterministic teardown BEFORE any raw-sqlite3 injection (see the
@@ -1673,9 +1692,9 @@ def test_remote_and_embedded_job_metrics_agree_on_all_three_states(tmp_path):
         db = jammi_native.open_local(artifact_dir=str(tmp_path))
         return db, db.job(job_id)
 
-    # State 1: absent (`jobs.result` NULL) — injected explicitly; see the
-    # docstring on why the job's OWN natural post-submit state cannot be
-    # reused here.
+    # State 1: not completed (`running`, `jobs.result` NULL) — injected
+    # explicitly; see the docstring on why the job's OWN natural post-submit
+    # state cannot be reused here.
     absent_db, absent_job = _seed_and_attach(None)
     assert absent_job.metrics() == {}
     absent_db.close()
@@ -1771,7 +1790,7 @@ def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
     )
     submit_job = submit_db._start_training_proto(request.SerializeToString())
     submit_job.wait()
-    assert submit_job.status() == "completed"
+    assert jammi.JobStatus(submit_job.status()) is jammi.JobStatus.COMPLETED
     job_id = submit_job.job_id
 
     # State "determined": the job's OWN natural post-completion payload — a
@@ -1805,28 +1824,28 @@ def test_remote_and_embedded_job_acceleration_report_agree_on_all_three_states(
     # --- Remote arm: three stubbed `JobStatusResponse`s. -------------------
     class _AbsentStub:
         def JobStatus(self, *_args, **_kwargs):
-            return job_pb2.JobStatusResponse(status="running")
+            return job_pb2.JobStatusResponse(status=job_pb2.JOB_STATUS_RUNNING)
 
     class _PendingStub:
         def JobStatus(self, *_args, **_kwargs):
             return job_pb2.JobStatusResponse(
-                status="running", acceleration_report_json=pending_payload
+                status=job_pb2.JOB_STATUS_RUNNING, acceleration_report_json=pending_payload
             )
 
     class _DeterminedStub:
         def JobStatus(self, *_args, **_kwargs):
             return job_pb2.JobStatusResponse(
-                status="completed", acceleration_report_json=determined_payload
+                status=job_pb2.JOB_STATUS_COMPLETED, acceleration_report_json=determined_payload
             )
 
     remote_absent = jammi.RemoteJob(
-        _AbsentStub(), (), job_id="remote-accel-1", kind="fine_tune", output_model_id="model-1"
+        _AbsentStub(), (), job_id="remote-accel-1", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-1"
     )
     remote_pending = jammi.RemoteJob(
-        _PendingStub(), (), job_id="remote-accel-2", kind="fine_tune", output_model_id="model-2"
+        _PendingStub(), (), job_id="remote-accel-2", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-2"
     )
     remote_determined = jammi.RemoteJob(
-        _DeterminedStub(), (), job_id="remote-accel-3", kind="fine_tune", output_model_id="model-3"
+        _DeterminedStub(), (), job_id="remote-accel-3", kind=jammi.JobKind.FINE_TUNE, output_model_id="model-3"
     )
 
     # --- Value parity, both directions of the tri-state. -------------------
@@ -1971,10 +1990,10 @@ def test_close_is_idempotent_and_use_after_close_raises_the_same_error_on_both(
 
     This is the parity that `Capability.CLOSE`'s removal asserts. "Both have a
     `close()`" would be a shallow claim if the two disagreed on what a closed
-    session then does — and they did: the embedded arm raised the typed
-    `BackendError` from its FFI-boundary guard while the remote arm let grpcio's
-    bare `ValueError("Cannot invoke RPC on closed channel!")` escape the
-    `JammiError` taxonomy entirely. A caller writing one program against
+    session then does. A closed session is a precondition that no longer
+    holds, so both arms raise the typed `FailedPrecondition` — never grpcio's
+    bare `ValueError("Cannot invoke RPC on closed channel!")`, which escapes the
+    `JammiError` taxonomy. A caller writing one program against
     :class:`jammi.Session` must be able to catch one exception type.
 
     The CLASS is pinned identical (that is the contract a caller writes
@@ -1989,7 +2008,7 @@ def test_close_is_idempotent_and_use_after_close_raises_the_same_error_on_both(
 
     Hermetic on the remote side — the guard fires before any wire hop, so the
     unreachable endpoint is never dialed."""
-    from jammi.errors import BackendError, JammiError
+    from jammi.errors import FailedPrecondition, JammiError
 
     embed = jammi.connect(f"file://{tmp_path}")
     remote = jammi.connect("grpc://127.0.0.1:8081")
@@ -2007,14 +2026,14 @@ def test_close_is_idempotent_and_use_after_close_raises_the_same_error_on_both(
             ("get_server_info", lambda s=session: s.get_server_info()),
             ("sql", lambda s=session: s.sql("SELECT 1")),
         ):
-            with pytest.raises(BackendError) as excinfo:
+            with pytest.raises(FailedPrecondition) as excinfo:
                 call()
             assert issubclass(excinfo.type, JammiError), (name, verb)
             assert "closed" in str(excinfo.value), (name, verb, str(excinfo.value))
             raised[(name, verb)] = excinfo.type
 
     # One class across both transports and every verb — the whole point.
-    assert set(raised.values()) == {BackendError}
+    assert set(raised.values()) == {FailedPrecondition}
 
 
 class _FakeRpcError(grpc.RpcError):
@@ -2182,14 +2201,14 @@ def test_import_jammi_is_native_free_then_lazily_loads_the_engine(tmp_path):
 # message is the single source of truth for that shape, so this pin asserts each
 # REMOTE projection's key-structure reconciles with its proto message's LIVE
 # descriptor (identity, plus a small DECLARED set of renames / oneof-tags / dropped
-# fields) — NOT against a hand-authored golden. A proto field added or removed
+# fields) — NOT against a hand-authored truth. A proto field added or removed
 # then forces the projection (or the declared delta) to change, so the two
 # projection paths, both anchored to the proto, cannot drift from each other.
 #
 # This is the honest FLOOR: true per-VALUE equality on real data is
 # covered by the Rust it-suite (`grpc_remote_session.rs` / `grpc_remote_compute.rs`,
 # the embedded/remote parity anchor) and — for the three eval reports — by the
-# Rust-serde-GENERATED golden the client's `tests/test_eval_projection.py` locks,
+# Rust-serde-GENERATED truth the client's `tests/test_eval_projection.py` locks,
 # not hermetically constructible in Python (the native links no tonic/proto, so
 # there is no in-process Python value-parity oracle to stand up here).
 # ---------------------------------------------------------------------------

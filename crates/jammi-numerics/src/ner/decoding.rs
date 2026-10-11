@@ -1,113 +1,187 @@
-//! BIO span decoder for NER: converts token-level predictions to entity
-//! spans.
+//! Word-level BIO decoder for NER: token-level predictions to entity spans.
+//!
+//! A token classifier labels every subword token, but a subword is not a unit
+//! a reader names: "Hooli" tokenized as `Ho`, `##oli` is one word, and its two
+//! tokens can disagree (`B-PER`, `B-LOC`). The decoder therefore labels each
+//! WORD by its first subtoken's prediction — the convention a token classifier
+//! is trained under, its labels aligned to each word's first subtoken — and
+//! groups words, never tokens, into entities.
 
 use std::collections::HashMap;
 
 use crate::error::{NumericsError, Result};
 use crate::ner::types::Entity;
 
-/// Decode BIO-tagged token predictions into entity spans.
+/// One row's tokenization, as the decoder reads it: each token's byte offsets
+/// in the text, the word the tokenizer's pre-tokenizer assigned it (`None` for
+/// a special token), and whether it is a real token (`1`) or padding (`0`).
+#[derive(Debug, Clone, Copy)]
+pub struct TokenizedRow<'a> {
+    /// Each token's `(start, end)` byte offsets in the text.
+    pub offsets: &'a [(usize, usize)],
+    /// Each token's word index; `None` for a special token.
+    pub word_ids: &'a [Option<u32>],
+    /// `1` for a real token, `0` for padding.
+    pub attention_mask: &'a [u32],
+}
+
+/// Decode a row's token-level predictions into entity spans.
+///
+/// Each word takes the label and the confidence of its first subtoken and
+/// spans from that subtoken's start to its last subtoken's end. Words then
+/// group into entities by their BIO tags: `B-X` begins an `X`, `I-X` continues
+/// an open `X` and begins one when none is open, and `O` ends the open entity.
+/// A label with no `B-`/`I-` prefix continues an entity of its own type, as an
+/// IO-tagged checkpoint names them.
 ///
 /// # Errors
 ///
-/// Returns [`NumericsError::InvalidInput`] naming the offending token index
-/// if any non-skipped token's logit row contains a non-finite (`NaN` or
-/// `±inf`) value. This is checked BEFORE the internal softmax step: a raw
-/// logit is a real-number domain value, and a `NaN` or `+inf` element
-/// corrupts the entire softmax row to `NaN` (a `-inf` element happens not
-/// to, but is refused anyway as an equally invalid logit). Refusing at the
-/// logit edge, before a corrupted row could produce a plausible-looking but
-/// meaningless decoded label, surfaces a diverged model's corrupted logits
-/// as an error instead.
+/// [`NumericsError::InvalidInput`] naming the offending token index if any real
+/// token's logit row contains a non-finite (`NaN` or `±inf`) value — checked
+/// before the softmax, where a `NaN` or `+inf` element would corrupt the whole
+/// row into a plausible-looking but meaningless label — or if a span does not
+/// fall on the text's character boundaries.
 pub fn decode_bio_spans(
     token_logits: &[Vec<f32>],
-    offsets: &[(usize, usize)],
-    attention_mask: &[u32],
+    row: &TokenizedRow<'_>,
     id2label: &HashMap<u32, String>,
     original_text: &str,
 ) -> Result<Vec<Entity>> {
+    let words = words(token_logits, row, id2label)?;
     let mut entities = Vec::new();
-    let mut current: Option<PartialEntity> = None;
+    let mut open: Option<Partial> = None;
+    for (_, word) in words {
+        open = match (Tag::of(&word.label), open.take()) {
+            (Tag::Outside, current) => {
+                entities.extend(current.map(|p| p.finish(original_text)).transpose()?);
+                None
+            }
+            (Tag::Inside(kind), Some(mut current)) if current.label == kind => {
+                current.extend(&word);
+                Some(current)
+            }
+            (Tag::Begin(kind) | Tag::Inside(kind), current) => {
+                entities.extend(current.map(|p| p.finish(original_text)).transpose()?);
+                Some(Partial::begin(kind, &word))
+            }
+        };
+    }
+    entities.extend(open.map(|p| p.finish(original_text)).transpose()?);
+    Ok(entities)
+}
 
+/// A word's prediction: its first subtoken's label and confidence, over the
+/// byte span of all its subtokens.
+struct Word {
+    label: String,
+    start: usize,
+    end: usize,
+    confidence: f32,
+}
+
+/// The row's words, in order: consecutive real tokens sharing a word id are
+/// one word.
+fn words(
+    token_logits: &[Vec<f32>],
+    row: &TokenizedRow<'_>,
+    id2label: &HashMap<u32, String>,
+) -> Result<Vec<(u32, Word)>> {
+    let mut words: Vec<(u32, Word)> = Vec::new();
     for (idx, logits) in token_logits.iter().enumerate() {
-        if idx >= attention_mask.len() || attention_mask[idx] == 0 {
+        let real = row.attention_mask.get(idx).is_some_and(|&m| m != 0);
+        let Some(word_id) = row.word_ids.get(idx).copied().flatten().filter(|_| real) else {
             continue;
-        }
-
-        let (start_byte, end_byte) = offsets.get(idx).copied().unwrap_or((0, 0));
-        // Skip special tokens (offset (0, 0))
-        if start_byte == 0 && end_byte == 0 {
-            continue;
-        }
-
+        };
         if logits.iter().any(|x| !x.is_finite()) {
             return Err(NumericsError::InvalidInput(format!(
                 "decode_bio_spans: token {idx} has a non-finite logit"
             )));
         }
-
-        let probs = softmax(logits);
-        let (pred_idx, confidence) = argmax(&probs);
-        let label = id2label
-            .get(&(pred_idx as u32))
-            .cloned()
-            .unwrap_or_else(|| format!("LABEL_{pred_idx}"));
-
-        if let Some(entity_type) = label.strip_prefix("B-") {
-            if let Some(partial) = current.take() {
-                entities.push(partial.finalize(original_text));
+        let (start, end) = row.offsets.get(idx).copied().ok_or_else(|| {
+            NumericsError::InvalidInput(format!("decode_bio_spans: token {idx} has no offsets"))
+        })?;
+        match words.last_mut() {
+            Some((id, word)) if *id == word_id => word.end = end,
+            _ => {
+                let (class, confidence) = argmax(&softmax(logits));
+                let label = id2label
+                    .get(&(class as u32))
+                    .cloned()
+                    .unwrap_or_else(|| format!("LABEL_{class}"));
+                words.push((
+                    word_id,
+                    Word {
+                        label,
+                        start,
+                        end,
+                        confidence,
+                    },
+                ));
             }
-            current = Some(PartialEntity {
-                label: entity_type.to_string(),
-                start: start_byte,
-                end: end_byte,
-                total_confidence: confidence,
-                token_count: 1,
-            });
-        } else if let Some(entity_type) = label.strip_prefix("I-") {
-            let type_matches = current.as_ref().is_some_and(|p| p.label == entity_type);
-            if type_matches {
-                let partial = current.as_mut().unwrap();
-                partial.end = end_byte;
-                partial.total_confidence += confidence;
-                partial.token_count += 1;
-            } else if let Some(partial) = current.take() {
-                entities.push(partial.finalize(original_text));
-            }
-        } else if let Some(partial) = current.take() {
-            entities.push(partial.finalize(original_text));
         }
     }
-
-    if let Some(partial) = current.take() {
-        entities.push(partial.finalize(original_text));
-    }
-
-    Ok(entities)
+    Ok(words)
 }
 
-struct PartialEntity {
+/// A word's BIO tag and the entity type it names.
+enum Tag<'a> {
+    Begin(&'a str),
+    Inside(&'a str),
+    Outside,
+}
+
+impl<'a> Tag<'a> {
+    fn of(label: &'a str) -> Self {
+        if label == "O" {
+            Self::Outside
+        } else if let Some(kind) = label.strip_prefix("B-") {
+            Self::Begin(kind)
+        } else {
+            Self::Inside(label.strip_prefix("I-").unwrap_or(label))
+        }
+    }
+}
+
+/// An entity being assembled from consecutive words.
+struct Partial {
     label: String,
     start: usize,
     end: usize,
-    total_confidence: f32,
-    token_count: usize,
+    confidence_sum: f32,
+    words: usize,
 }
 
-impl PartialEntity {
-    fn finalize(self, original_text: &str) -> Entity {
-        let text = if self.end <= original_text.len() {
-            original_text[self.start..self.end].to_string()
-        } else {
-            String::new()
-        };
-        Entity {
+impl Partial {
+    fn begin(label: &str, word: &Word) -> Self {
+        Self {
+            label: label.to_string(),
+            start: word.start,
+            end: word.end,
+            confidence_sum: word.confidence,
+            words: 1,
+        }
+    }
+
+    fn extend(&mut self, word: &Word) {
+        self.end = word.end;
+        self.confidence_sum += word.confidence;
+        self.words += 1;
+    }
+
+    fn finish(self, original_text: &str) -> Result<Entity> {
+        let text = original_text.get(self.start..self.end).ok_or_else(|| {
+            NumericsError::InvalidInput(format!(
+                "decode_bio_spans: span {}..{} is not on the text's character boundaries",
+                self.start, self.end
+            ))
+        })?;
+        Ok(Entity {
             label: self.label,
             start: self.start,
             end: self.end,
-            text,
-            confidence: self.total_confidence / self.token_count as f32,
-        }
+            text: text.to_string(),
+            confidence: self.confidence_sum / self.words as f32,
+        })
     }
 }
 

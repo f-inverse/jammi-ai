@@ -1,19 +1,19 @@
-//! Projection-head assemblies for
-//! [`crate::fine_tune::target::TrainingTarget::ProjectionHead`]: a single
-//! projection layer for embedding fine-tunes, or a projection plus a
-//! classifier head for classification / NER. All three builders return a
-//! [`LoraModel`] — a flat sequence of named [`jammi_lora::LoraLinear`]
-//! layers that the trainer consumes uniformly.
+//! Head assemblies over an encoder's pooled output: a single projection
+//! layer for an embedding fine-tune over a frozen encoder, or a projection
+//! plus a task layer for classification and regression over either encoder.
+//! Every builder returns a [`LoraModel`] — a flat sequence of named
+//! [`jammi_lora::LoraLinear`] layers ([`HeadLayer`]) that the trainer and
+//! serving apply in order.
 
-use candle_core::{DType, Tensor};
+use candle_core::Tensor;
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
 use jammi_lora::LoraLinear;
 
-/// A sequence of named LoRA layers — the trainable state of a
-/// [`TrainingTarget::ProjectionHead`] target.
-///
-/// [`TrainingTarget::ProjectionHead`]: crate::fine_tune::target::TrainingTarget::ProjectionHead
+use super::target::HeadLayer;
+
+/// A sequence of named LoRA layers — the trainable head of a
+/// [`crate::fine_tune::target::TrainingTarget`].
 pub struct LoraModel {
     /// LoRA layers keyed by their name (e.g. `"projection"`, `"classifier"`).
     pub layers: Vec<(String, LoraLinear)>,
@@ -72,6 +72,36 @@ fn build_head_layer_for_rank(
     .map_err(|e| JammiError::FineTune(format!("{name} LoRA: {e}")))
 }
 
+/// Build the head `layers` names over a `hidden`-wide pooled output, each
+/// layer's base from [`HeadLayer::base`] and its LoRA from
+/// `build_head_layer_for_rank`. A task layer's output width is `task_width`.
+fn build_head_for_rank(
+    layers: &[HeadLayer],
+    hidden_size: usize,
+    task_width: usize,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    dropout_seed: u64,
+) -> Result<LoraModel> {
+    let layers = layers
+        .iter()
+        .map(|&layer| {
+            let out = match layer {
+                HeadLayer::Projection => hidden_size,
+                HeadLayer::Classifier | HeadLayer::Distribution => task_width,
+            };
+            let base = layer
+                .base(out, hidden_size, vb.device())
+                .map_err(|e| JammiError::FineTune(format!("{} base: {e}", layer.name())))?;
+            let lora =
+                build_head_layer_for_rank(base, config, varmap, vb, layer.name(), dropout_seed)?;
+            Ok((layer.name().to_string(), lora))
+        })
+        .collect::<Result<_>>()?;
+    Ok(LoraModel { layers })
+}
+
 /// Build a projection-plus-classifier head for classification fine-tunes.
 ///
 /// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`.
@@ -96,26 +126,15 @@ pub fn build_classification_head_for_rank(
     vb: &VarBuilder,
     dropout_seed: u64,
 ) -> Result<LoraModel> {
-    // Layer 0: projection (identity base, same as embedding)
-    let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("Projection identity: {e}")))?;
-    let proj_linear = Linear::new(proj_base, None);
-    let projection =
-        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
-
-    // Layer 1: classifier (zeros base, trained from scratch via LoRA)
-    let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("Classifier zeros: {e}")))?;
-    let cls_linear = Linear::new(cls_base, None);
-    let classifier =
-        build_head_layer_for_rank(cls_linear, config, varmap, vb, "classifier", dropout_seed)?;
-
-    Ok(LoraModel {
-        layers: vec![
-            ("projection".to_string(), projection),
-            ("classifier".to_string(), classifier),
-        ],
-    })
+    build_head_for_rank(
+        &[HeadLayer::Projection, HeadLayer::Classifier],
+        hidden_size,
+        num_classes,
+        config,
+        varmap,
+        vb,
+        dropout_seed,
+    )
 }
 
 /// Build a projection-plus-distribution head for regression fine-tunes.
@@ -146,82 +165,15 @@ pub fn build_distribution_head_for_rank(
     vb: &VarBuilder,
     dropout_seed: u64,
 ) -> Result<LoraModel> {
-    let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("Regression projection identity: {e}")))?;
-    let proj_linear = Linear::new(proj_base, None);
-    let projection =
-        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
-
-    let head_base = Tensor::zeros((output_dim, hidden_size), DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("Distribution head zeros: {e}")))?;
-    let head_linear = Linear::new(head_base, None);
-    let distribution = build_head_layer_for_rank(
-        head_linear,
+    build_head_for_rank(
+        &[HeadLayer::Projection, HeadLayer::Distribution],
+        hidden_size,
+        output_dim,
         config,
         varmap,
         vb,
-        "distribution",
         dropout_seed,
-    )?;
-
-    Ok(LoraModel {
-        layers: vec![
-            ("projection".to_string(), projection),
-            ("distribution".to_string(), distribution),
-        ],
-    })
-}
-
-/// Build a projection-plus-token-classifier head for NER fine-tunes.
-///
-/// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`, per token.
-/// Layer 1 (`token_classifier`): LoRA-wrapped zeros, `hidden → num_labels`, per token.
-pub fn build_ner_head(
-    hidden_size: usize,
-    num_labels: usize,
-    config: &super::FineTuneConfig,
-    varmap: &VarMap,
-    vb: &VarBuilder,
-) -> Result<LoraModel> {
-    build_ner_head_for_rank(hidden_size, num_labels, config, varmap, vb, config.seed)
-}
-
-/// [`build_ner_head`] with every layer's dropout mask keyed by
-/// `dropout_seed` — see `build_head_layer_for_rank`'s doc.
-pub fn build_ner_head_for_rank(
-    hidden_size: usize,
-    num_labels: usize,
-    config: &super::FineTuneConfig,
-    varmap: &VarMap,
-    vb: &VarBuilder,
-    dropout_seed: u64,
-) -> Result<LoraModel> {
-    // Layer 0: projection (identity base, same as embedding/classification)
-    let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("NER projection identity: {e}")))?;
-    let proj_linear = Linear::new(proj_base, None);
-    let projection =
-        build_head_layer_for_rank(proj_linear, config, varmap, vb, "projection", dropout_seed)?;
-
-    // Layer 1: token classifier (zeros base, trained from scratch via LoRA)
-    let cls_base = Tensor::zeros((num_labels, hidden_size), DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("NER classifier zeros: {e}")))?;
-    let cls_linear = Linear::new(cls_base, None);
-    let classifier = build_head_layer_for_rank(
-        cls_linear,
-        config,
-        varmap,
-        vb,
-        "token_classifier",
-        dropout_seed,
-    )?;
-
-    Ok(LoraModel {
-        layers: vec![
-            ("projection".to_string(), projection),
-            ("token_classifier".to_string(), classifier),
-        ],
-    })
+    )
 }
 
 /// Build a single-layer head for embedding fine-tunes.
@@ -255,11 +207,13 @@ pub fn build_projection_head_for_rank(
     vb: &VarBuilder,
     dropout_seed: u64,
 ) -> Result<LoraModel> {
-    let base_weight = Tensor::eye(hidden_size, DType::F32, vb.device())
-        .map_err(|e| JammiError::FineTune(format!("Identity weight: {e}")))?;
-    let base = Linear::new(base_weight, None);
-    let lora = build_head_layer_for_rank(base, config, varmap, vb, "projection", dropout_seed)?;
-    Ok(LoraModel {
-        layers: vec![("projection".into(), lora)],
-    })
+    build_head_for_rank(
+        &[HeadLayer::Projection],
+        hidden_size,
+        hidden_size,
+        config,
+        varmap,
+        vb,
+        dropout_seed,
+    )
 }

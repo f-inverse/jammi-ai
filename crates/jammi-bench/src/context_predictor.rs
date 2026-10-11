@@ -893,7 +893,7 @@ impl Host {
                 let record = session
                     .catalog()
                     .pinned_to_tenant(None)
-                    .get_job(&job.job_id)
+                    .get_job(job.job_id())
                     .await?;
                 let job = CompletedJob {
                     session,
@@ -911,7 +911,7 @@ impl Host {
                     .train_context_predictor(&fleet_source_id(suffix), config)
                     .await?;
                 let (record, ran_on) = fleet
-                    .shape_d_training_ran_on(&job.job_id)
+                    .shape_d_training_ran_on(job.job_id())
                     .await
                     .map_err(|e| e.to_string())?;
                 let job = CompletedJob {

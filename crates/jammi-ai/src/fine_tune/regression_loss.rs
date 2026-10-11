@@ -45,12 +45,12 @@ use serde::{Deserialize, Serialize};
 /// # Train in z-space, de-standardise at serve
 ///
 /// The fine-tune regression loss scores the head's raw z-output against a
-/// **z-scored** target ([`Self::standardize_value`]: `(y−μ_y)/σ_y`), so the
+/// **z-scored** target (`(y−μ_y)/σ_y`), so the
 /// optimizer sees O(1) residuals for any target scale. De-standardisation back to
 /// raw units happens only at serve:
 ///
-/// - the **mean** (Gaussian) / **quantile** columns are mapped `μ_y + σ_y·z` by
-///   [`Self::destandardize`] at the backend (the offset axis);
+/// - the **mean** (Gaussian) / **quantile** columns are mapped `μ_y + σ_y·z` at
+///   the backend (the offset axis);
 /// - the **σ** column — a z-scale (σ_z ≈ 1) the loss trained — is multiplied by
 ///   σ_y on the post-softplus value at the inference adapter (the variance axis).
 ///
@@ -83,13 +83,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// The amortized in-context predictor already trains in z-space: it z-scores both
 /// the held-out target `y` and every context member's `y` with one scaler
-/// ([`Self::standardize_value`]) before they enter the episode, scores the head's
+/// before they enter the episode, scores the head's
 /// z-output against the z-target, and de-standardises only at serve (`μ_y + σ_y·z`
-/// on the mean/quantiles, `σ_y·σ_z` on the σ). The fine-tune path is now the same
+/// on the mean/quantiles, `σ_y·σ_z` on the σ). The fine-tune path has the same
 /// shape: z-scored loss, de-standardise at serve. The scaler is the one transform
 /// shared by both ends and is persisted with the head.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct TargetScaler {
+pub struct TargetScaler {
     /// Mean of all training targets, μ_y. The zero-init head emits this.
     mean: f64,
     /// Standard deviation of all training targets, σ_y, floored at [`STD_FLOOR`].
@@ -388,9 +388,10 @@ pub(crate) fn pinball_loss(input: &Tensor, target: &Tensor, levels: &[f64]) -> R
         )));
     }
     if levels.is_empty() {
-        return Err(JammiError::FineTune(
-            "pinball loss requires at least one quantile level".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "quantile_levels".into(),
+            reason: "the pinball loss needs at least one level".into(),
+        });
     }
 
     let mut total: Option<Tensor> = None;

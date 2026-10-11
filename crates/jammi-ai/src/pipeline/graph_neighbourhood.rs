@@ -510,10 +510,10 @@ impl InferenceSession {
             .context()
             .sql(&sql)
             .await
-            .map_err(|e| JammiError::Other(format!("Homophily: label scan: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Homophily: label scan")))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Homophily: label collect: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("Homophily: label collect")))?;
 
         let mut map = HashMap::new();
         for batch in &batches {
@@ -537,10 +537,12 @@ impl InferenceSession {
             .context()
             .table(table_ref.clone())
             .await
-            .map_err(|e| JammiError::Other(format!("Edge load: resolve '{table_ref}': {e}")))?
+            .map_err(|e| JammiError::from(e.context(format!("Edge load: resolve '{table_ref}'"))))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Edge load: collect '{table_ref}': {e}")))?;
+            .map_err(|e| {
+                JammiError::from(e.context(format!("Edge load: collect '{table_ref}'")))
+            })?;
         collect_edge_rows(&batches, "src", "dst", None, Some("similarity"))
     }
 
@@ -557,7 +559,7 @@ impl InferenceSession {
             as_of_column,
         } = &gather.edge_source
         else {
-            return Err(JammiError::Other(
+            return Err(JammiError::Internal(
                 "load_registered_edges called on a non-registered edge source".into(),
             ));
         };
@@ -593,10 +595,10 @@ impl InferenceSession {
             .context()
             .sql(&sql)
             .await
-            .map_err(|e| JammiError::Other(format!("Edge load: scan: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Edge load: scan")))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Edge load: collect: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("Edge load: collect")))?;
 
         let type_alias = type_column.as_ref().map(|_| "_etype");
         let weight_alias = weight_column.as_ref().map(|_| "_weight");
@@ -682,7 +684,7 @@ fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| JammiError::Other(format!("Edge load: column '{name}' is not Utf8")))
+        .ok_or_else(|| JammiError::Internal(format!("Edge load: column '{name}' is not Utf8")))
 }
 
 /// Downcast a batch column to a `Float64Array`, accepting either `Float64` (the
@@ -701,7 +703,7 @@ fn f64_column(batch: &RecordBatch, name: &str) -> Result<Option<Float64Array>> {
             .collect();
         return Ok(Some(widened));
     }
-    Err(JammiError::Other(format!(
+    Err(JammiError::Internal(format!(
         "Edge load: weight column '{name}' is not a float"
     )))
 }

@@ -12,8 +12,8 @@
 #     cannot enter the engine unnoticed.
 #   * bans + sources — formalizes the engine's one-way dependency direction: the
 #     engine depends only on crates.io crates (no git / private registry),
-#     which is the lockfile half of the `dep-direction` / `oss-only-build`
-#     guards already in CI.
+#     which is the lockfile half of the `engine dep-direction` guard
+#     already in CI.
 #
 # Every lane binds exactly the feature graph its invocation builds, so the
 # `dep-audit` job runs all four TWICE: over the DEFAULT-feature graph (only
@@ -110,7 +110,7 @@ ignore = [
 # Licenses — the allowlist lane.
 # ---------------------------------------------------------------------------
 [licenses]
-# Permissive and acceptable-copyleft licenses present in the resolved OSS tree.
+# Permissive and acceptable-copyleft licenses present in the resolved engine tree.
 # A crate whose SPDX expression is not satisfiable from this list reds CI.
 allow = [
     "MIT",
@@ -129,16 +129,14 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
-    # Weak-copyleft, file-scoped — acceptable as a dependency of an OSS engine
+    # Weak-copyleft, file-scoped — acceptable as a dependency of the engine
     # (the engine links them, it does not modify them): symphonia (audio codecs)
     # and r-efi sit behind feature/target gates.
     "MPL-2.0",
     "LGPL-2.1-or-later",
 ]
-# Workspace crates carry no `license` field (they are not published to a license
-# registry as OSS-licensed leaf crates in the conventional way); treat the
-# first-party workspace members as private so the allowlist applies only to
-# third-party dependencies.
+# The allowlist applies to third-party dependencies; the first-party workspace
+# members are treated as private.
 [licenses.private]
 ignore = true
 
@@ -215,9 +213,9 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 [sources]
-# The OSS engine resolves only from crates.io. A git or private-registry source
-# in the lockfile reds CI — the lockfile half of the `oss-only-build` hermeticity
-# guard and the `dep-direction` proprietary-crate guard already in CI.
+# The engine resolves only from crates.io. A git or private-registry source in
+# the lockfile reds CI — the lockfile half of the `engine dep-direction` guard
+# already in CI.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use crate::catalog::lease::LeaseIntervals;
+use crate::catalog::status::{JobKind, JobKinds};
 use crate::error::{JammiError, Result};
 use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 
@@ -1252,11 +1253,8 @@ pub struct WorkerConfig {
     /// switches the loop on later cannot smuggle in bad timing.
     pub enabled: bool,
     /// Which job kinds this worker claims. `"all"` (the default) claims every
-    /// kind compiled into the binary; an explicit list claims only those
-    /// named. This layer carries the raw selection only — `jammi-ai` owns
-    /// the kind vocabulary and validates it against the compiled set at
-    /// startup, the same "raw tokens here, validated downstream" split
-    /// [`ServiceSelection`] uses for `[server].services`.
+    /// kind; an explicit list claims only those named, and a name that is not
+    /// a [`JobKind`] is refused when the config loads.
     pub kinds: WorkerKinds,
     /// How often an idle worker polls for a queued job (and reclaims expired
     /// leases). Must be non-zero — a zero poll is a busy-loop. Default: 1.
@@ -1314,8 +1312,8 @@ impl Default for WorkerConfig {
     }
 }
 
-/// The worker's job-kind selection: `All` (the default) claims every kind
-/// compiled into this binary; `Only` claims exactly the named kinds (e.g.
+/// The worker's job-kind selection: `All` (the default) claims every kind;
+/// `Only` claims exactly the named kinds (e.g.
 /// `[]` for a claim loop that runs but claims nothing — equivalent to
 /// `enabled = false` for the poll loop's own effect, but distinguishable in
 /// `ListWorkers`). Deserializes through the identical hand-written grammar
@@ -1325,10 +1323,20 @@ impl Default for WorkerConfig {
 /// (service tiers vs. job kinds, each validated by its own owning layer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerKinds {
-    /// Every kind compiled into this binary.
+    /// Every kind.
     All(AllSentinel),
     /// Exactly these kinds.
-    Only(Vec<String>),
+    Only(Vec<JobKind>),
+}
+
+impl WorkerKinds {
+    /// The kinds this selection claims.
+    pub fn resolve(&self) -> JobKinds {
+        match self {
+            WorkerKinds::All(_) => JobKinds::all(),
+            WorkerKinds::Only(kinds) => JobKinds::new(kinds.clone()),
+        }
+    }
 }
 
 impl Default for WorkerKinds {
@@ -1341,7 +1349,13 @@ impl<'de> Deserialize<'de> for WorkerKinds {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         Ok(match ServiceSelection::deserialize(deserializer)? {
             ServiceSelection::All(sentinel) => WorkerKinds::All(sentinel),
-            ServiceSelection::Only(tokens) => WorkerKinds::Only(tokens),
+            ServiceSelection::Only(tokens) => WorkerKinds::Only(
+                tokens
+                    .iter()
+                    .map(|token| token.parse::<JobKind>())
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(serde::de::Error::custom)?,
+            ),
         })
     }
 }
@@ -2751,7 +2765,7 @@ impl JammiConfig {
         // Reject an out-of-domain `[server.limits]` knob (a zero
         // `max_message_bytes`, a per-connection budget over the global one, a
         // zero timeout) at load time, naming the offending key, rather than
-        // at server startup deep inside `OssServer::new`.
+        // at server startup deep inside `Server::new`.
         config.server.limits.validate()?;
         // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
         // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)

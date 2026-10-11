@@ -143,6 +143,17 @@ pub use noop::Noop;
 pub use peer::{CoordinatorLink, LinkFault, MemberEnd, MemberLink, Peer, RankReadFault};
 pub use transport::{DeviceExchange, Transport};
 
+/// The words to record as a gang's fault for `error`: a
+/// [`JammiError::FineTune`]'s own message rather than its `Display`, so a fault
+/// quoted inside a later [`JammiError::FineTune`] refusal carries the prefix
+/// once.
+fn reason_of(error: &JammiError) -> String {
+    match error {
+        JammiError::FineTune(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// A thread-bound witness that the current thread may block.
 ///
 /// Minted ONLY inside the closure one of [`Self::spawn_blocking`],

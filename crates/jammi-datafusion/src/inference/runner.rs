@@ -395,14 +395,21 @@ impl InferenceRunner {
             drop(admitted);
             match forward_result {
                 Ok(raw_output) => {
-                    let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
+                    // One measurement for the batch's `_latency_ms` column and
+                    // the observer, so the two never disagree.
+                    let latency = start.elapsed();
                     let output_batch = tracing::debug_span!("forward.output", rows = chunk_len)
                         .in_scope(|| {
-                            Self::build_output_batch(ctx, &rows, raw_output, latency_ms)
+                            Self::build_output_batch(
+                                ctx,
+                                &rows,
+                                raw_output,
+                                latency.as_secs_f32() * 1000.0,
+                            )
                         })?;
 
                     if let Some(obs) = ctx.observer {
-                        obs.on_batch(&output_batch, ctx.model_label, start.elapsed());
+                        obs.on_batch(&output_batch, ctx.model_label, latency);
                     }
 
                     if tx.send(Ok(output_batch)).await.is_err() {

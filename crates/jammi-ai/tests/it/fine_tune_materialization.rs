@@ -21,7 +21,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::JobResult;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::ModelLocation;
-use jammi_db::catalog::status::ArtifactState;
+use jammi_db::catalog::status::{ArtifactState, JobKind, JobStatus};
 use jammi_db::store::{CacheOutcome, CachePolicy, ReconcileOptions, ReusedArtifact};
 use std::time::Duration;
 
@@ -31,32 +31,15 @@ use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 /// enough to train in milliseconds on CPU, at a given `backbone_dtype` and
 /// `cache` policy.
 ///
-/// **Deliberately stays on the PLAIN projection-head arm (`target_modules`
-/// empty) for every `backbone_dtype`, including non-`F32`.** `backbone_dtype`
-/// only takes effect (`validate_backbone_precision`/`compute_precision_to_dtype`)
-/// on the ENCODER-ADAPTERS arm (`target_modules` non-empty — `worker.rs`'s
-/// own module doc), so an `F16` leg through THAT arm would genuinely
-/// exercise the cast — but it is not the shape this fn uses, for an
-/// executed reason: reusing `acceleration_report.rs`'s own
-/// `encoder_adapters_config`/`tiny_modernbert` shape for an F16 CPU job
-/// that must actually COMPLETE (publish a `materialization.json` this
-/// suite reads back) reproducibly diverges here — "Training diverged: loss
-/// was NaN or >100 for 3 consecutive batches" — over one epoch on this
-/// tiny fixture, with both `CosineDecay` and `Constant` schedules tried.
-/// `acceleration_report.rs`'s OWN f16 tests are explicitly "tolerant of
-/// EITHER terminal outcome" for exactly this reason (their oracle is the
-/// PRE-training acceleration report, written before divergence could ever
-/// happen) — a test that needs a PUBLISHED artifact cannot adopt that
-/// tolerance, since a failed job publishes nothing to read back at all.
-///
-/// This is still the right input for THIS suite's own oracle: the kernel-admission-profile fold
-/// under test (`render_kernel_admission_profile`'s `dtype` argument) reads
-/// `common.config.backbone_dtype` UNCONDITIONALLY of which arm trains — so
-/// `backbone_dtype: F16` here is exactly the value production's own fold
-/// reads, even on an arm that ignores it for the forward math. What this
-/// fn does NOT prove — and does not claim to — is that the encoder-adapters
-/// arm's own F16-on-CPU numerics are stable; that is `acceleration_report.rs`'s
-/// concern, with its own, correctly-tolerant oracle.
+/// **Deliberately trains a frozen encoder for every `backbone_dtype`,
+/// including non-`F32`.** `backbone_dtype` only takes effect
+/// (`validate_backbone_precision`/`compute_precision_to_dtype`) on an adapted
+/// encoder, where the cast is genuinely exercised — but the kernel-admission
+/// profile fold under test (`render_kernel_admission_profile`'s `dtype`
+/// argument) reads `common.config.backbone_dtype` UNCONDITIONALLY of which
+/// arm trains, so `backbone_dtype: F16` here is exactly the value
+/// production's own fold reads. The adapted arm's F16 numerics are
+/// `acceleration_report.rs`'s concern.
 fn spec_with_backbone_dtype(
     cache: CachePolicy,
     backbone_dtype: jammi_numerics::ComputePrecision,
@@ -78,6 +61,7 @@ fn spec_with_backbone_dtype(
                 lora_rank: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 backbone_dtype,
+                encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
                 ..Default::default()
             },
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -105,16 +89,17 @@ async fn submit_and_run(
         .catalog()
         .claim_next(
             worker.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(3600),
         )
         .await
         .unwrap()
         .expect("the queued job is claimable");
     worker.run_claimed_job(session, claimed).await;
-    let after = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after.status, "completed",
+        after.status,
+        JobStatus::Completed,
         "the job must complete for either outcome (fresh train or cache hit): {after:?}"
     );
     let result: JobResult = serde_json::from_str(
@@ -132,7 +117,11 @@ async fn submit_and_run(
     else {
         panic!("a training kind's result must be JobResult::Model, got {result:?}");
     };
-    (job.model_id.clone(), metrics.is_some(), cache_outcome)
+    (
+        job.output_model_id().unwrap().to_string(),
+        metrics.is_some(),
+        cache_outcome,
+    )
 }
 
 /// Two submissions of the SAME `TrainingSpec::FineTune` under `Use` train
@@ -288,7 +277,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     // the expired lease and re-claims under a long one.
     let stale_claim = session
         .catalog()
-        .claim_next(worker_a.worker_id(), &["fine_tune"], Duration::ZERO)
+        .claim_next(worker_a.worker_id(), &[JobKind::FineTune], Duration::ZERO)
         .await
         .unwrap()
         .expect("worker-a claims the queued cache=Use job");
@@ -302,7 +291,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
         .catalog()
         .claim_next(
             worker_b.worker_id(),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             Duration::from_secs(3600),
         )
         .await
@@ -312,16 +301,17 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     // worker-a runs its STALE claim: the probe hits, but the attempt guard
     // inside the reusing finalize misses, so nothing is written.
     worker_a.run_claimed_job(&session, stale_claim).await;
-    let after_a = session.catalog().get_job(&job.job_id).await.unwrap();
+    let after_a = session.catalog().get_job(job.job_id()).await.unwrap();
     assert_eq!(
-        after_a.status, "running",
+        after_a.status,
+        JobStatus::Running,
         "a worker that lost its lease must not finalize, even on a cache hit"
     );
     assert_eq!(after_a.claimed_by.as_deref(), Some(worker_b.worker_id()));
     assert!(
         session
             .catalog()
-            .get_model(&job.model_id)
+            .get_model(job.output_model_id().unwrap())
             .await
             .unwrap()
             .is_none(),
@@ -358,7 +348,7 @@ async fn a_lost_lease_on_a_cache_hit_leaves_no_reference_and_the_bytes_intact() 
     job.wait().await.unwrap();
     let second = session
         .catalog()
-        .get_model(&job.model_id)
+        .get_model(job.output_model_id().unwrap())
         .await
         .unwrap()
         .expect("the legitimate owner's model row must exist");
@@ -449,7 +439,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
         )
         .await
         .unwrap();
-    let output_name = job.model_id().to_string();
+    let output_name = job.output_model_id().unwrap().to_string();
     job.wait().await.unwrap();
     worker
         .stop_and_join()
@@ -716,7 +706,7 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
 
 /// A REAL `F16`-backbone fine-tune
 /// (`spec_with_backbone_dtype` — see its own doc for why this stays on the
-/// plain arm rather than the encoder-adapters arm `acceleration_report.rs`
+/// plain arm rather than the adapted-encoder arm `acceleration_report.rs`
 /// uses) has its `DefinitionHash` MOVE under
 /// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` — the key its OWN dtype
 /// resolves, per `cast_scale`'s two dtype-branching entries

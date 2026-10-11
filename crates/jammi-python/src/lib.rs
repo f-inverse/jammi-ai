@@ -1,4 +1,5 @@
 mod audit;
+mod conformal;
 mod convert;
 mod database;
 mod ephemeral;
@@ -31,10 +32,12 @@ use crate::error::to_pyerr;
 use crate::job::PyJob;
 use crate::model_task::PyModelTask;
 
-/// The embedded engine's log level when neither `[logging] level` nor
+/// The embedded engine's log filter when neither `[logging] level` nor
 /// `RUST_LOG` names one: a library inside the caller's process reports what
-/// needs their attention and is otherwise quiet.
-const LOG_DEFAULT: tracing::level_filters::LevelFilter = tracing::level_filters::LevelFilter::WARN;
+/// needs their attention and is otherwise quiet. Only the engine's own crates
+/// speak: a dependency's failure reaches the caller as the engine's typed
+/// error or per-row outcome, never as the dependency's own log line.
+const LOG_DEFAULT: &str = "off,jammi=warn";
 
 /// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
 /// user-facing surface is the thin Python wrapper (`jammi._embedded.EmbeddedBackend`)
@@ -47,7 +50,7 @@ pub use crate::database::PyDatabase;
 /// Re-export of the underlying inference session type. External Rust
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
-/// trigger broker, catalog cache, and tenant binding with the OSS
+/// trigger broker, catalog cache, and tenant binding with
 /// `jammi.EmbeddedBackend`.
 pub use jammi_ai::session::InferenceSession;
 
@@ -61,6 +64,9 @@ pub use jammi_ai::session::InferenceSession;
 #[pymodule]
 fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize_interval, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize_cqr, m)?)?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<crate::database::PyTenantScope>()?;
     m.add_class::<PyJob>()?;

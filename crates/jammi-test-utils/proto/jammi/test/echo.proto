@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package jammi.test.echo;
+
+// A service a test mounts beside the engine's own, the way a downstream
+// mounts its services on the engine's gRPC chain: it reports what a call
+// carried, so a test can assert which headers and which tenant reached a
+// mounted service.
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoReply);
+}
+
+message EchoRequest {
+  string payload = 1;
+}
+
+message EchoReply {
+  // The request's payload, unchanged.
+  string payload = 1;
+  // The call's `authorization` metadata; empty when it carried none.
+  string authorization = 2;
+  // The call's session-id metadata; empty when it carried none.
+  string session_id = 3;
+  // The tenant the server resolved for the call; empty for the global scope.
+  string tenant = 4;
+}

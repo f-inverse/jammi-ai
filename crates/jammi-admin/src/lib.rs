@@ -14,9 +14,6 @@
 //! — never a lossy gRPC-code-category guess. Tenant scope rides on the session
 //! header the transport stamps, never in a request body.
 
-pub mod lifecycle;
-pub use lifecycle::{Bearer, Bootstrapped, LicenseApplied, LifecycleClient, PlatformStatus};
-
 use std::str::FromStr;
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
@@ -42,8 +39,8 @@ use jammi_wire::proto::catalog::{
 };
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
-    CancelJobRequest as JobCancelJobRequest, JobStatusRequest, JobStatusResponse, ListJobsRequest,
-    ListWorkersRequest, PruneJobsRequest,
+    CancelJobRequest as JobCancelJobRequest, JobStatusRequest, ListJobsRequest, ListWorkersRequest,
+    PruneJobsRequest,
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
@@ -51,6 +48,10 @@ use jammi_wire::{
     index_segment_from_proto, match_verdict_from_proto, model_from_proto,
     source_descriptor_from_proto, source_type_to_proto, staleness_from_proto, topic_from_proto,
     trigger_error_from_status, SessionChannel, SessionTransport,
+};
+use jammi_wire::{
+    job_status_info_from_proto, job_summary_from_proto, worker_summary_from_proto, JobStatusInfo,
+    JobSummary, WorkerSummary,
 };
 use tonic::transport::Endpoint;
 
@@ -238,10 +239,9 @@ impl CatalogClient {
 
     // --- jobs (read-only + cancel) -----------------------------------------
 
-    /// Read one job's lifecycle status by id: status, kind, the resolved
-    /// output model id (training kinds only; empty for a compute kind), the
-    /// failure message (non-empty exactly when status is `"failed"`), and the
-    /// run-metrics blob (present once the worker has stamped a
+    /// Read one job's lifecycle status by id: status, kind, the model it
+    /// produced (once a training kind completes), the failure message (once it
+    /// fails), and the run-metrics blob (present once the worker has stamped a
     /// first run record — the same catalog `jobs.result` payload the wire's
     /// `JobStatus.model.metrics_json` carries). The control-plane read peer of
     /// the data-plane client's submit — there is no progress surface to read
@@ -255,7 +255,7 @@ impl CatalogClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(job_status_info_from_proto(resp))
+        job_status_info_from_proto(resp).map_err(|s| error_from_status(&s))
     }
 
     /// List jobs visible to the session tenant, most recent first — each row
@@ -268,21 +268,11 @@ impl CatalogClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp
-            .jobs
+        resp.jobs
             .into_iter()
-            .map(|j| JobSummary {
-                job_id: j.job_id,
-                kind: j.kind,
-                status: j.status,
-                base_model_id: j.base_model_id,
-                output_model_id: j.output_model_id,
-                created_at: j.created_at,
-                error: j.error,
-                claimed_by: j.claimed_by,
-                ranks: j.ranks,
-            })
-            .collect())
+            .map(job_summary_from_proto)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|s| error_from_status(&s))
     }
 
     /// Request cancellation of a job by id. `false` when the request had no
@@ -307,27 +297,11 @@ impl CatalogClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp
-            .workers
+        resp.workers
             .into_iter()
-            .map(|w| WorkerSummary {
-                instance_id: w.instance_id,
-                label: w.label,
-                host: w.host,
-                kinds: w.kinds,
-                started_at: w.started_at,
-                last_seen_at: w.last_seen_at,
-                state: w.state,
-                devices: w
-                    .devices
-                    .into_iter()
-                    .map(|d| DeviceFact {
-                        kind: d.kind,
-                        ordinal: d.ordinal,
-                    })
-                    .collect(),
-            })
-            .collect())
+            .map(worker_summary_from_proto)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|s| error_from_status(&s))
     }
 
     /// Eagerly delete terminal job rows older than the deployment's
@@ -568,12 +542,7 @@ impl CatalogClient {
     pub async fn list_topics(&self) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
         let resp = self
             .client()
-            .list_topics(ListTopicsRequest {
-                page_size: 0,
-                page_token: String::new(),
-                // Tenant scope rides on the session header, not the body.
-                tenant_id: String::new(),
-            })
+            .list_topics(ListTopicsRequest {})
             .await
             .map_err(|s| trigger_error_from_status(&s))?
             .into_inner();
@@ -669,275 +638,6 @@ impl CatalogClient {
         }
         id.parse()
             .map(Some)
-            .map_err(|e| JammiError::Tenant(format!("invalid tenant id from server: {e}")))
+            .map_err(|e| JammiError::Internal(format!("invalid tenant id from server: {e}")))
     }
-}
-
-/// One job's lifecycle status, as read by [`CatalogClient::job_status`].
-#[derive(Debug, Clone)]
-pub struct JobStatusInfo {
-    /// Current lifecycle status: `"queued"`, `"running"`, `"completed"`, or
-    /// `"failed"`.
-    pub status: String,
-    /// The `jobs.kind` tag this job submitted under.
-    pub kind: String,
-    /// The output model id the trained artifact registers under, resolved at
-    /// every lifecycle state; empty for a compute kind (never populated).
-    pub output_model_id: String,
-    /// The failure message; non-empty exactly when `status` is `"failed"`.
-    pub error: String,
-    /// Run metrics recorded for a training kind, as the opaque JSON blob text
-    /// nested inside the wire's `JobStatus.model.metrics_json` —
-    /// the SAME blob the embedded `TrainingJob.metrics()` reads. `None` for a
-    /// job with no run record yet, a compute kind, or a still-running job;
-    /// this control-plane read never decodes or re-encodes the blob, so it
-    /// stays byte-identical to the wire field. Schema documented at the
-    /// trainer, not here.
-    pub metrics_json: Option<String>,
-    /// GPU-acceleration determination for this job, as the opaque,
-    /// self-describing JSON blob text the wire's
-    /// `JobStatus.acceleration_report_json` carries — the SAME
-    /// catalog `jobs.acceleration_report` column the embedded record read
-    /// returns. `None` for a row whose column is SQL `NULL`;
-    /// otherwise a `"state"`-keyed object whose vocabulary is owned by the
-    /// payload's producer (e.g. `"pending"` before a determination exists,
-    /// `"determined"` once one does) and documented there, not enumerated
-    /// here. This control-plane read never decodes or re-encodes the blob, so
-    /// it stays byte-identical to the wire field.
-    pub acceleration_report_json: Option<String>,
-}
-
-/// Build a [`JobStatusInfo`] from the wire response. Pulled out of
-/// [`CatalogClient::job_status`] so the `metrics_json` present/absent
-/// mapping is unit-testable without a live gRPC round trip. `metrics_json`
-/// is `None` unless the terminal `result` oneof carries the `model` arm —
-/// a compute kind's `table` arm (or no result yet) never fabricates one.
-fn job_status_info_from_proto(resp: JobStatusResponse) -> JobStatusInfo {
-    use jammi_wire::proto::job::job_status_response::Result as WireResult;
-    let metrics_json = match &resp.result {
-        Some(WireResult::Model(m)) => m.metrics_json.clone(),
-        _ => None,
-    };
-    JobStatusInfo {
-        status: resp.status,
-        kind: resp.kind,
-        output_model_id: resp.output_model_id,
-        error: resp.error,
-        metrics_json,
-        acceleration_report_json: resp.acceleration_report_json,
-    }
-}
-
-#[cfg(test)]
-mod job_status_info_tests {
-    use super::*;
-    use jammi_wire::proto::job::{job_status_response::Result as WireResult, ModelResult};
-
-    /// The present arm: a completed training job's wire response carries a
-    /// `model` result with a metrics blob, and the control-plane read relays
-    /// it verbatim (no decode, no re-encode) — byte-identical to the wire
-    /// text.
-    #[test]
-    fn metrics_json_present_arm_carries_the_wire_blob_verbatim() {
-        let resp = JobStatusResponse {
-            status: "completed".to_string(),
-            kind: "fine_tune".to_string(),
-            progress: None,
-            output_model_id: "jammi:fine-tuned:abc".to_string(),
-            error: String::new(),
-            result: Some(WireResult::Model(ModelResult {
-                model_id: "jammi:fine-tuned:abc".to_string(),
-                artifact_path: "file:///artifacts/abc".to_string(),
-                metrics_json: Some(
-                    r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#.to_string(),
-                ),
-                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
-                    &jammi_db::store::CacheOutcome::Computed,
-                )),
-            })),
-            acceleration_report_json: Some(r#"{"state":"determined","fa2_f16":true}"#.to_string()),
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(
-            info.metrics_json.as_deref(),
-            Some(r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#)
-        );
-    }
-
-    /// The absent arm: a queued job's wire response carries no result yet
-    /// (field presence, not an empty string) — the control-plane read stays
-    /// `None`, never inventing an empty-object placeholder.
-    #[test]
-    fn metrics_json_absent_arm_stays_none() {
-        let resp = JobStatusResponse {
-            status: "queued".to_string(),
-            kind: "fine_tune".to_string(),
-            progress: None,
-            output_model_id: String::new(),
-            error: String::new(),
-            result: None,
-            acceleration_report_json: Some(r#"{"state":"pending"}"#.to_string()),
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(info.metrics_json, None);
-    }
-
-    /// A compute kind's terminal `table` result carries no metrics — the
-    /// control-plane read stays `None` rather than misreading the other
-    /// oneof arm.
-    #[test]
-    fn table_result_arm_carries_no_metrics() {
-        let resp = JobStatusResponse {
-            status: "completed".to_string(),
-            kind: "embedding".to_string(),
-            progress: None,
-            output_model_id: String::new(),
-            error: String::new(),
-            result: Some(WireResult::Table(jammi_wire::proto::job::TableResult {
-                table: "jammi.embeddings_1".to_string(),
-                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
-                    &jammi_db::store::CacheOutcome::Computed,
-                )),
-            })),
-            acceleration_report_json: None,
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(info.metrics_json, None);
-    }
-
-    /// The determined arm: a claimed job's wire response carries
-    /// the claiming worker's determination, and the control-plane read
-    /// relays it verbatim (no decode, no re-encode) — byte-identical to the
-    /// wire text. Mirrors `metrics_json_present_arm_carries_the_wire_blob_verbatim`.
-    #[test]
-    fn acceleration_report_json_determined_arm_carries_the_wire_blob_verbatim() {
-        let resp = JobStatusResponse {
-            status: "running".to_string(),
-            kind: "fine_tune".to_string(),
-            progress: None,
-            output_model_id: String::new(),
-            error: String::new(),
-            result: None,
-            acceleration_report_json: Some(
-                r#"{"state":"determined","fa2_f16":true,"reason":"sm_90 capable"}"#.to_string(),
-            ),
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(
-            info.acceleration_report_json.as_deref(),
-            Some(r#"{"state":"determined","fa2_f16":true,"reason":"sm_90 capable"}"#)
-        );
-    }
-
-    /// The pending arm: a freshly submitted, unclaimed job's wire
-    /// response carries the explicit pending marker, never `None` or an
-    /// empty string.
-    #[test]
-    fn acceleration_report_json_pending_arm_carries_the_explicit_marker() {
-        let resp = JobStatusResponse {
-            status: "queued".to_string(),
-            kind: "fine_tune".to_string(),
-            progress: None,
-            output_model_id: String::new(),
-            error: String::new(),
-            result: None,
-            acceleration_report_json: Some(r#"{"state":"pending"}"#.to_string()),
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(
-            info.acceleration_report_json.as_deref(),
-            Some(r#"{"state":"pending"}"#)
-        );
-    }
-
-    /// The absent arm: a row whose `acceleration_report` column is SQL
-    /// `NULL` carries no wire field (field presence,
-    /// not an empty string) — the control-plane read stays `None`, never
-    /// inventing a fabricated tri-state value. Mirrors
-    /// `metrics_json_absent_arm_stays_none`.
-    #[test]
-    fn acceleration_report_json_absent_arm_stays_none() {
-        let resp = JobStatusResponse {
-            status: "completed".to_string(),
-            kind: "fine_tune".to_string(),
-            progress: None,
-            output_model_id: "jammi:fine-tuned:legacy".to_string(),
-            error: String::new(),
-            result: Some(WireResult::Model(ModelResult {
-                model_id: "jammi:fine-tuned:legacy".to_string(),
-                artifact_path: "file:///artifacts/legacy".to_string(),
-                metrics_json: Some(r#"{"final_loss":0.2}"#.to_string()),
-                cache_outcome: Some(jammi_wire::cache_outcome_to_proto(
-                    &jammi_db::store::CacheOutcome::Computed,
-                )),
-            })),
-            acceleration_report_json: None,
-        };
-        let info = job_status_info_from_proto(resp);
-        assert_eq!(info.acceleration_report_json, None);
-    }
-}
-
-/// One row of [`CatalogClient::list_jobs`]: the [`JobStatusInfo`]-adjacent
-/// projection plus the job's submit-time identity — mirrors the former
-/// `TrainingJobSummary`, generalised to every job kind.
-#[derive(Debug, Clone)]
-pub struct JobSummary {
-    /// Server-assigned job id — the `job_status` key.
-    pub job_id: String,
-    /// The `jobs.kind` tag this job submitted under.
-    pub kind: String,
-    /// Current lifecycle status: `"queued"`, `"running"`, `"completed"`, or
-    /// `"failed"`.
-    pub status: String,
-    /// The base model a training kind trains from — the catalog's registered
-    /// model id. Empty for a compute kind.
-    pub base_model_id: String,
-    /// The output model id the trained artifact registers under; empty until
-    /// a training kind completes, and always empty for a compute kind.
-    pub output_model_id: String,
-    /// Job creation time, as recorded by the catalog (UTC text timestamp).
-    pub created_at: String,
-    /// The failure message; non-empty exactly when `status` is `"failed"`.
-    pub error: String,
-    /// The instance holding (or last holding) the job's claim; empty while
-    /// queued.
-    pub claimed_by: String,
-    /// The instance that ran each rank of the latest training attempt, in
-    /// rank order; empty for a compute job and until an attempt records it.
-    pub ranks: Vec<String>,
-}
-
-/// One engine process currently running the claim loop, as read by
-/// [`CatalogClient::list_workers`].
-#[derive(Debug, Clone)]
-pub struct WorkerSummary {
-    /// The process's minted-at-construction uuid.
-    pub instance_id: String,
-    /// `JAMMI_WORKER_ID`, non-unique — an operator-chosen label, empty when
-    /// unset.
-    pub label: String,
-    pub host: String,
-    /// The `[worker] kinds` configuration this process claims: `"all"` or a
-    /// comma-joined kind list.
-    pub kinds: String,
-    /// The claim loop's lifecycle state as the `workers.state` row carries
-    /// it: `warming`, `claiming` or `draining`.
-    pub state: String,
-    pub started_at: String,
-    pub last_seen_at: String,
-    /// This worker's device inventory — a `ListWorkers` mirror only (never
-    /// the placement policy's authority; see
-    /// `jammi_wire::proto::job::WorkerSummary::devices`'s doc).
-    pub devices: Vec<DeviceFact>,
-}
-
-/// One device a worker process names as its own, mirrored from the wire's
-/// `jammi.v1.job.DeviceFact` field for field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceFact {
-    /// The device kind (`"cpu"` / `"cuda"` / `"metal"`, opaque here).
-    pub kind: String,
-    /// The device's ordinal within `kind`.
-    pub ordinal: u32,
 }

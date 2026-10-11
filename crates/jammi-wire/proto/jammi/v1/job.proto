@@ -49,7 +49,7 @@ service JobService {
   // accepted and stays `queued` until a worker claims it (or, embedded-side,
   // until `run_now` claims and executes it inline) — there is no `NoWorker`
   // refusal. `output_model_id` is populated via the same `resolve_model_id`
-  // rule the embedded `TrainingJob` handle uses, so a remote caller reads the
+  // rule the embedded `JobHandle` uses, so a remote caller reads the
   // byte-identical deterministic id at submit time. A second `SubmitJob` call
   // carrying the same `idempotency_key` (when non-empty) returns the handle
   // of the job that key first created rather than submitting a duplicate.
@@ -170,15 +170,71 @@ message SubmitJobRequest {
   reserved 7, 8;
 }
 
+// A job's lifecycle status.
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  // Waiting for a worker to claim it.
+  JOB_STATUS_QUEUED = 1;
+  // Claimed and executing.
+  JOB_STATUS_RUNNING = 2;
+  // Finished with its result.
+  JOB_STATUS_COMPLETED = 3;
+  // Finished without its result; `error` says why.
+  JOB_STATUS_FAILED = 4;
+  // Stopped because a cancel was requested.
+  JOB_STATUS_CANCELLED = 5;
+}
+
+// What a job runs. A training kind registers a model; a compute kind writes a
+// result table.
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_FINE_TUNE = 1;
+  JOB_KIND_GRAPH_FINE_TUNE = 2;
+  JOB_KIND_CONTEXT_PREDICTOR = 3;
+  JOB_KIND_NEIGHBOR_GRAPH = 4;
+  JOB_KIND_PROPAGATE = 5;
+  JOB_KIND_GRAPH_STRUCTURE = 6;
+  JOB_KIND_ASOF_JOIN = 7;
+  JOB_KIND_LEXICAL_INDEX = 8;
+  JOB_KIND_EMBEDDING = 9;
+  JOB_KIND_INFER = 10;
+}
+
+// What a running job is doing.
+enum JobPhase {
+  // No progress recorded yet.
+  JOB_PHASE_UNSPECIFIED = 0;
+  // Assembling its inputs (a training set); `done` counts the rows read.
+  JOB_PHASE_ASSEMBLING = 1;
+  // Training a model; `done` counts the optimizer steps taken of `total`.
+  JOB_PHASE_TRAINING = 2;
+  // Computing a result table; `done` counts the rows read.
+  JOB_PHASE_COMPUTING = 3;
+  // Publishing the model or the table.
+  JOB_PHASE_PUBLISHING = 4;
+}
+
+// A worker's claim loop state.
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  // Preloading models; it has claimed nothing yet.
+  WORKER_STATE_WARMING = 1;
+  // The claim loop is live.
+  WORKER_STATE_CLAIMING = 2;
+  // A DRAIN is finishing the in-flight job.
+  WORKER_STATE_DRAINING = 3;
+}
+
 message SubmitJobResponse {
   // Server-assigned job id. Read status with `JobStatus`/`WaitJob`.
   string job_id = 1;
-  // The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`).
-  string kind = 2;
+  // The kind this job submitted under.
+  JobKind kind = 2;
   // The deterministic output model id the trained artifact registers under —
-  // resolved via the same rule the embedded `TrainingJob::model_id` uses.
-  // Empty for a compute kind (no training kinds ever compute this).
-  string output_model_id = 3;
+  // resolved via the same rule the embedded `JobHandle::output_model_id`
+  // uses. Absent for a compute kind, which registers no model.
+  optional string output_model_id = 3;
 }
 
 // A job's identity, for `WaitJob` and `CancelJob`.
@@ -190,12 +246,13 @@ message JobStatusRequest {
   string job_id = 1;
 }
 
-// A job's progress, updated at producer checkpoint boundaries. Field presence
-// distinguishes "no progress recorded yet" from a legal `0`.
+// A job's progress, updated at producer checkpoints: `done` of `total`, counted
+// in the unit `phase` names. `JOB_PHASE_UNSPECIFIED` means nothing is recorded
+// yet; `total` is absent when the phase cannot know it up front.
 message JobProgress {
-  optional uint64 rows_done = 1;
-  optional uint64 rows_total = 2;
-  string phase = 3;
+  optional uint64 done = 1;
+  optional uint64 total = 2;
+  JobPhase phase = 3;
 }
 
 // A training kind's terminal model result.
@@ -220,18 +277,18 @@ message TableResult {
 }
 
 message JobStatusResponse {
-  // Current lifecycle status: "queued", "running", "completed", or "failed".
-  string status = 1;
-  // The `jobs.kind` tag this job submitted under.
-  string kind = 2;
+  JobStatus status = 1;
+  // The kind this job submitted under.
+  JobKind kind = 2;
   JobProgress progress = 3;
-  // The failure message when `status` is "failed"; empty otherwise.
-  string error = 4;
+  // The recorded error of a job that ended unsuccessfully (`JOB_STATUS_FAILED`
+  // or `JOB_STATUS_CANCELLED`); absent otherwise.
+  optional string error = 4;
   // The output model id the trained artifact registers under, resolved the
-  // same way `SubmitJobResponse.output_model_id` is; empty for a compute
-  // kind (never populated).
-  string output_model_id = 5;
-  // The tagged terminal result. Unset until `status` is "completed".
+  // same way `SubmitJobResponse.output_model_id` is; absent for a compute
+  // kind.
+  optional string output_model_id = 5;
+  // The tagged terminal result. Unset until `status` is `JOB_STATUS_COMPLETED`.
   oneof result {
     ModelResult model = 6;
     TableResult table = 7;
@@ -262,21 +319,22 @@ message ListJobsResponse {
 // submit-time identity fields a listing needs to tell jobs apart.
 message JobSummary {
   string job_id = 1;
-  // The `jobs.kind` tag this job submitted under.
-  string kind = 2;
-  string status = 3;
+  // The kind this job submitted under.
+  JobKind kind = 2;
+  JobStatus status = 3;
   // The base model a training kind trains from — the catalog's registered
-  // model id (PK-keyed). Empty for a compute kind.
-  string base_model_id = 4;
-  // The output model id the trained artifact registers under, stamped at
-  // submission for a training kind; always empty for a compute kind.
-  string output_model_id = 5;
+  // model id (PK-keyed). Absent for a compute kind.
+  optional string base_model_id = 4;
+  // The model this job produced: absent until a training kind completes, and
+  // always absent for a compute kind.
+  optional string output_model_id = 5;
   // Job creation time, as recorded by the catalog (UTC text timestamp).
   string created_at = 6;
-  string error = 7;
+  // The recorded error of a job that ended unsuccessfully; absent otherwise.
+  optional string error = 7;
   // The instance holding (or, on a terminal job, last holding) the job's
-  // claim. Empty while the job is queued and unclaimed.
-  string claimed_by = 8;
+  // claim. Absent while the job is queued and unclaimed.
+  optional string claimed_by = 8;
   // The instance that ran each rank of the latest training attempt, in rank
   // order (the same id `ListWorkers` reports). Empty for a compute job and
   // until a training attempt records its ranks.
@@ -304,22 +362,19 @@ message ListWorkersResponse {
 message WorkerSummary {
   // The process's minted-at-construction uuid.
   string instance_id = 1;
-  // `JAMMI_WORKER_ID`, non-unique — an operator-chosen label, empty when
+  // `JAMMI_WORKER_ID`, non-unique — an operator-chosen label, absent when
   // unset.
-  string label = 2;
-  // The machine the process runs on, as its OS names it; empty when the OS
+  optional string label = 2;
+  // The machine the process runs on, as its OS names it; absent when the OS
   // reports none.
-  string host = 3;
-  // The `[worker] kinds` configuration this process claims: `"all"` or a
-  // comma-joined kind list.
-  string kinds = 4;
+  optional string host = 3;
+  // The job kinds this process claims (`[worker] kinds`).
+  repeated JobKind kinds = 4;
   string started_at = 5;
   string last_seen_at = 6;
-  // The claim loop's lifecycle state, exactly as the `workers.state` row
-  // carries it: `warming` (the process is preloading; nothing claimed yet),
-  // `claiming` (the loop is live), `draining` (a DRAIN is finishing the
-  // in-flight job). The row is deleted once the loop has exited.
-  string state = 7;
+  // The claim loop's lifecycle state. The row is deleted once the loop has
+  // exited.
+  WorkerState state = 7;
   // This worker's device inventory, as `workers.devices` carries it
   // (`jammi_db::catalog::jobs_repo::WorkerRecord::devices`) — a MIRROR of
   // the process's own registration, informational only (never the
@@ -327,11 +382,18 @@ message WorkerSummary {
   repeated DeviceFact devices = 8;
 }
 
-// One device a worker process names as its own: a KIND (`"cpu"` / `"cuda"`
-// / `"metal"`, opaque here) and its ORDINAL within that kind. Mirrors
-// `jammi_db::catalog::instance::DeviceFact` field for field.
+// The kind of device a worker lists in its inventory.
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_CPU = 1;
+  DEVICE_KIND_CUDA = 2;
+  DEVICE_KIND_METAL = 3;
+}
+
+// One device a worker process names as its own: its kind and its ordinal
+// within that kind. Mirrors `jammi_db::catalog::instance::DeviceFact`.
 message DeviceFact {
-  string kind = 1;
+  DeviceKind kind = 1;
   uint32 ordinal = 2;
 }
 

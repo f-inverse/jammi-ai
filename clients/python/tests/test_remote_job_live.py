@@ -23,8 +23,7 @@ from pathlib import Path
 import pytest
 
 import jammi
-from jammi._database import _QUEUED_STATE
-from jammi.errors import BackendError
+from jammi.errors import NotFound
 
 pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
@@ -84,7 +83,7 @@ def _seed(artifact_dir: Path, monkeypatch) -> tuple[str, dict, dict, str]:
         db.close()
     monkeypatch.delenv("JAMMI_WORKER__ENABLED", raising=False)
 
-    assert status == _QUEUED_STATE
+    assert status == jammi.JobStatus.QUEUED
     assert len(summaries) == 1, summaries
     return job_id, summaries[0], report, status
 
@@ -119,7 +118,7 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
             # half of this pair is asserted in
             # `crates/jammi-python/tests/test_job_attach.py`; here the
             # remote half is pinned against the same class object.
-            with pytest.raises(BackendError):
+            with pytest.raises(NotFound):
                 remote.job("no-such-job-id")
         finally:
             remote.close()
@@ -127,13 +126,12 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     # The comparison was on real content, not on two empty answers.
     assert embedded_summary["job_id"] == job_id
     assert set(embedded_summary.keys()) == _SUMMARY_KEYS
-    assert embedded_summary["status"] == _QUEUED_STATE
-    # The deterministic output id is stamped at submit time (it depends only
-    # on job_id, never on the run's outcome) — never empty for this kind.
-    assert embedded_summary["output_model_id"] == f"jammi:fine-tuned:{job_id}"
-    assert embedded_summary["error"] == ""
+    assert embedded_summary["status"] == jammi.JobStatus.QUEUED
+    # A listing names only a model a job produced: none while queued.
+    assert embedded_summary["output_model_id"] is None
+    assert embedded_summary["error"] is None
     # Queued, never claimed: no claimant and no ranks yet.
-    assert embedded_summary["claimed_by"] == ""
+    assert embedded_summary["claimed_by"] is None
     assert embedded_summary["ranks"] == []
     assert embedded_report == {"state": "pending"}
 
@@ -142,20 +140,12 @@ def test_remote_and_embedded_attach_output_model_id_agree_before_completion(
     tmp_path, monkeypatch, live_server_on
 ):
     """`output_model_id` on an attach to a NOT-YET-COMPLETED job is byte-identical
-    on both arms — the divergence this module once recorded as a stated
-    difference is closed, and this is the equality that keeps it closed.
-
-    Pre-completion is the whole point: `jobs.output_model_id` is
-    stamped only at finalization, so a queued row has no column to relay. Both
-    arms therefore report a DERIVED id, and they report the same one because
-    they make the same call — `jammi_ai::fine_tune::training_job::
-    resolve_model_id`, which the embedded attach binding and the server's
-    `JobStatus` handler each delegate to rather than re-spelling the
-    naming rule. An equality that held only after completion would prove
-    nothing here: it would just be two relays of one stamped column.
+    on both arms. The submit stamps it on the job's row, so a queued job
+    already names the model it will register, and both arms relay that one
+    column.
 
     The final assertion is the non-vacuity check — the shared value is the real
-    `jammi:fine-tuned:{job_id}` mint, not two empty strings agreeing.
+    `jammi:fine-tuned:{job_id}` mint, not two absent values agreeing.
     """
     artifact_dir = tmp_path / "engine"
     artifact_dir.mkdir()

@@ -4,22 +4,23 @@ title: "The two datasets, at two scales"
 
 The book runs on two public graphs, each used where it is strongest.
 
-- **Air Routes** — Neptune's own teaching dataset: 3,504 airports, a `route`
-  graph (airport↔airport) and a `contains` hierarchy
+- **Air Routes** — Kelvin R. Lawrence's sample graph from *Practical Gremlin*:
+  3,504 airports, a `route` graph (airport↔airport) and a `contains` hierarchy
   (continent→country→airport). Numeric and categorical features, thin text.
-  It carries the **tiers 01–02 on-ramp**.
+  The case study opens on it: building graphs and propagating over them.
 - **ogbn-arxiv** — ~169k computer-science papers, ~1.17M citation edges, 40
-  subject classes, title + abstract. It carries the **tiers 03–04 spine**, and
-  is the dataset the graph-conformal literature reports on.
+  subject classes, title + abstract. It carries the case study from end to end
+  — graphs, fine-tuning, prediction — and is the dataset the graph-conformal
+  literature reports on.
 
 ## Two scales, one book
 
 Every chapter runs its capability live. What it runs over is a **scale**:
 
 - **`small`** — the committed samples of both datasets and a compact sentence
-  encoder (`all-MiniLM-L6-v2`): seconds to minutes per chapter on a CPU, less
-  on a GPU. This is what the book's CI renders and what a notebook runs by
-  default.
+  encoder (`all-MiniLM-L6-v2`): what a notebook runs by default. Most chapters
+  take seconds to minutes on a CPU; the ones that fine-tune an encoder take
+  longer, and minutes on a GPU.
 - **`full`** — the published datasets and a larger encoder
   (`gte-modernbert-base`, a ModernBERT trained for embeddings), on a GPU: the
   book's findings at the size they are about.

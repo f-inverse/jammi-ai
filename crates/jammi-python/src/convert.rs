@@ -25,7 +25,7 @@ pub fn batches_to_pyarrow(py: Python<'_>, batches: &[RecordBatch]) -> PyResult<P
 /// become Python dicts, scalars become their Python equivalents).
 pub fn serializable_to_pydict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>> {
     let json_str = serde_json::to_string(value)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("JSON serialize: {e}")))?;
+        .map_err(|e| crate::error::client_error("BackendError", format!("JSON serialize: {e}")))?;
     let json_mod = py.import("json")?;
     let dict = json_mod.call_method1("loads", (json_str,))?;
     Ok(dict.unbind())

@@ -52,7 +52,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
+from . import _conformal
 from ._capability import Capability
+from ._jobs import JobKind, JobProgress, JobStatus, WorkerState, progress_from_spelling
 from .errors import NotSupportedOnBackend
 from ._sessions import register as _register_session
 from ._sessions import unregister as _unregister_session
@@ -115,6 +117,66 @@ class _TenantScope:
 
     def __exit__(self, *exc: object) -> bool:
         return self._native_scope.__exit__(*exc)
+
+
+class EmbeddedJob:
+    """Handle to a job on the in-process engine (training or compute).
+
+    The embedded peer of :class:`jammi.RemoteJob`, with the same handle shape:
+    ``job_id`` / ``kind`` / ``output_model_id``, a ``status()`` poll, a
+    ``progress()`` read, ``cancel()``, ``wait()``, ``metrics()`` and
+    ``acceleration_report()``. It reads the engine's own handle and returns
+    the typed job vocabulary both transports share.
+    """
+
+    def __init__(self, native: Any) -> None:
+        self._native = native
+
+    @property
+    def job_id(self) -> str:
+        """The unique id the submit assigned this job."""
+        return self._native.job_id
+
+    @property
+    def kind(self) -> JobKind:
+        """The kind this job submitted under."""
+        return JobKind(self._native.kind)
+
+    @property
+    def output_model_id(self) -> Optional[str]:
+        """The model a training kind registers, stamped at submission;
+        ``None`` for a compute kind."""
+        return self._native.output_model_id
+
+    def status(self) -> JobStatus:
+        """The job's current status."""
+        return JobStatus(self._native.status())
+
+    def progress(self) -> Optional[JobProgress]:
+        """This job's latest recorded progress, or ``None`` before the executor
+        records any."""
+        return progress_from_spelling(self._native.progress())
+
+    def cancel(self) -> bool:
+        """Request cancellation. `True` if the request landed on a still
+        non-terminal row; `False` if the job was already terminal or absent."""
+        return self._native.cancel()
+
+    def wait(self) -> Dict[str, Any]:
+        """Block until a terminal state; raise on a failed or cancelled job.
+        Returns the tagged terminal result dict."""
+        return self._native.wait()
+
+    def metrics(self) -> Dict[str, Any]:
+        """Run metrics recorded for this job, as a dict. `{}` until recorded."""
+        return self._native.metrics()
+
+    def acceleration_report(self) -> Optional[Dict[str, Any]]:
+        """GPU-acceleration determination for this job, as a dict, or `None`."""
+        return self._native.acceleration_report()
+
+    def __repr__(self) -> str:
+        return f"EmbeddedJob(job_id={self.job_id!r}, kind={self.kind})"
 
 
 class EmbeddedBackend:
@@ -450,6 +512,10 @@ class EmbeddedBackend:
         )
 
     # --- Stateless conformal / RRF numerics (computed in-process) ---------------
+    #
+    # The conformal verbs hold no session: they are `jammi_native` module
+    # functions over the engine's `ConformalModel`, so they answer on a closed
+    # database exactly as the remote transport's client-side ones do.
 
     def conformalize(
         self,
@@ -460,15 +526,22 @@ class EmbeddedBackend:
         alpha: float,
         score: Optional[str] = None,
         raps_params: Optional[Tuple[float, int]] = None,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[List[int]]:
         """Conformalize a classification predictor into prediction sets."""
-        return self._native.conformalize(
+        import jammi_native
+
+        return jammi_native.conformalize(
             calibration,
             true_labels,
             test,
             alpha=alpha,
-            score=score,
-            raps_params=raps_params,
+            score=_conformal.score_family(score),
+            raps_params=raps_params if raps_params is not None else (0.0, 1),
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def conformalize_interval(
@@ -478,10 +551,20 @@ class EmbeddedBackend:
         test_predictions: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize an absolute-residual regression predictor into intervals."""
-        return self._native.conformalize_interval(
-            predictions, observed, test_predictions, alpha=alpha
+        import jammi_native
+
+        return jammi_native.conformalize_interval(
+            predictions,
+            observed,
+            test_predictions,
+            alpha=alpha,
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def conformalize_cqr(
@@ -493,10 +576,22 @@ class EmbeddedBackend:
         test_upper: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize a CQR predictor into adaptive-width intervals."""
-        return self._native.conformalize_cqr(
-            lower, upper, observed, test_lower, test_upper, alpha=alpha
+        import jammi_native
+
+        return jammi_native.conformalize_cqr(
+            lower,
+            upper,
+            observed,
+            test_lower,
+            test_upper,
+            alpha=alpha,
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def rrf_fuse(
@@ -524,7 +619,7 @@ class EmbeddedBackend:
         raises here. There is no separate existence check to drift from the
         catalog read itself.
         """
-        return self._native.job(job_id)
+        return EmbeddedJob(self._native.job(job_id))
 
     def list_jobs(self) -> List[Dict[str, Any]]:
         """Jobs visible to the current tenant, most recent first.
@@ -532,14 +627,17 @@ class EmbeddedBackend:
         Each entry carries the wire's `JobSummary` field set — ``job_id``,
         ``kind``, ``status``, ``base_model_id``, ``output_model_id``,
         ``created_at``, ``error``, ``claimed_by``, ``ranks`` — with
-        ``output_model_id`` stamped at submission (always empty for a compute
-        kind), ``error`` empty unless it failed, ``claimed_by`` the instance
-        holding (or last holding) the claim and ``ranks`` the instance that
-        ran each rank of the latest training attempt. A listing of :meth:`job` answers
-        plus the submit-time identity; read :meth:`job(job_id).progress()
-        <Job.progress>` for the mid-run progress surface.
+        ``output_model_id`` the model the job produced (present once it
+        completed), ``error`` present once it failed, ``claimed_by`` the
+        instance holding (or last holding) the claim and ``ranks`` the
+        instance that ran each rank of the latest training attempt. Read
+        :meth:`job(job_id).progress() <EmbeddedJob.progress>` for the mid-run
+        progress surface.
         """
-        return self._native.list_jobs()
+        return [
+            {**entry, "kind": JobKind(entry["kind"]), "status": JobStatus(entry["status"])}
+            for entry in self._native.list_jobs()
+        ]
 
     def cancel_job(self, job_id: str) -> bool:
         """Request cancellation of a job by id. `True` when the request landed
@@ -552,7 +650,14 @@ class EmbeddedBackend:
         (`[worker] enabled = true`), most recently seen first: each entry
         carries ``instance_id``, ``label``, ``host``, ``kinds``,
         ``state``, ``started_at``, ``last_seen_at``."""
-        return self._native.list_workers()
+        return [
+            {
+                **entry,
+                "kinds": [JobKind(kind) for kind in entry["kinds"]],
+                "state": WorkerState(entry["state"]),
+            }
+            for entry in self._native.list_workers()
+        ]
 
     def prune_jobs(self) -> int:
         """Eagerly delete this session's own terminal job rows older than the
@@ -580,6 +685,7 @@ class EmbeddedBackend:
         warmup_fraction: Optional[float] = None,
         gradient_accumulation_steps: Optional[int] = None,
         triplet_margin: Optional[float] = None,
+        encoder: Optional[str] = None,
         target_modules: Optional[List[str]] = None,
         early_stopping_metric: Optional[str] = None,
         backbone_dtype: Optional[str] = None,
@@ -637,6 +743,7 @@ class EmbeddedBackend:
             warmup_fraction=warmup_fraction,
             gradient_accumulation_steps=gradient_accumulation_steps,
             triplet_margin=triplet_margin,
+            encoder=encoder,
             target_modules=target_modules,
             early_stopping_metric=early_stopping_metric,
             backbone_dtype=backbone_dtype,
@@ -659,8 +766,10 @@ class EmbeddedBackend:
             world_size=world_size,
             cache=cache,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def fine_tune_graph(
@@ -699,6 +808,7 @@ class EmbeddedBackend:
         warmup_steps: Optional[int] = None,
         warmup_fraction: Optional[float] = None,
         gradient_accumulation_steps: Optional[int] = None,
+        encoder: Optional[str] = None,
         target_modules: Optional[List[str]] = None,
         backbone_dtype: Optional[str] = None,
         weight_decay: Optional[float] = None,
@@ -766,6 +876,7 @@ class EmbeddedBackend:
             warmup_steps=warmup_steps,
             warmup_fraction=warmup_fraction,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            encoder=encoder,
             target_modules=target_modules,
             backbone_dtype=backbone_dtype,
             weight_decay=weight_decay,
@@ -777,8 +888,10 @@ class EmbeddedBackend:
             world_size=world_size,
             cache=cache,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def train_context_predictor(
@@ -842,8 +955,10 @@ class EmbeddedBackend:
             idempotency_key=idempotency_key,
             embedding_table=embedding_table,
         )
-        return self._native._start_training_proto(
-            request.SerializeToString(), idempotency_key or None
+        return EmbeddedJob(
+            self._native._start_training_proto(
+                request.SerializeToString(), idempotency_key or None
+            )
         )
 
     def infer(
@@ -1487,22 +1602,22 @@ class EmbeddedBackend:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         embedding_table: Optional[str] = None,
         k: int = 10,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate embedding retrieval quality against a golden relevance set.
+        """Evaluate embedding retrieval quality against a relevance judgments.
 
         Returns a nested dict with ``eval_run_id``, ``aggregate`` (mean
         ``recall_at_k`` / ``precision_at_k`` / ``mrr`` / ``ndcg`` over all
-        queries), and ``per_query`` (one record per golden-set query).
+        queries), and ``per_query`` (one record per ground-truth query).
         ``embedding_table`` names the result table to evaluate; ``None`` resolves
-        the source's most recent embedding table. ``golden_source`` addresses the
-        golden set by its full catalog path (``<source>.public.<table>``) or bare
-        name. ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
+        the source's most recent embedding table. ``ground_truth`` addresses the
+        ground truth by its full catalog path (``<source>.public.<table>``) or bare
+        name. ``cohorts`` optionally maps a ground truth ``query_id`` to an opaque
         ``{key: value}`` segment map, persisted with that query's per-query
         metrics (read back via :meth:`eval_per_query`). ``oversample`` / ``exact`` rank each query as they rank a :meth:`search`:
         ``exact=True`` scores every vector, so the report measures the embedding
@@ -1513,7 +1628,7 @@ class EmbeddedBackend:
         """
         request = build_eval_embeddings_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             embedding_table=embedding_table,
             k=k,
             cohorts=cohorts,
@@ -1543,15 +1658,15 @@ class EmbeddedBackend:
         source: str,
         columns: List[str],
         task: str,
-        golden_source: str,
+        ground_truth: str,
         label_column: str,
     ) -> Dict[str, Any]:
-        """Evaluate inference quality against golden labels.
+        """Evaluate inference quality against ground-truth labels.
 
         Returns a nested dict with ``aggregate`` (task-shaped, tagged by
         ``"task"``) and ``per_record`` (one tagged record per predicted/gold
-        pair). ``task`` is ``"classification"`` or ``"ner"``; ``golden_source``
-        addresses the golden labels by full catalog path
+        pair). ``task`` is ``"classification"`` or ``"ner"``; ``ground_truth``
+        addresses the ground-truth labels by full catalog path
         (``<source>.public.<table>``) or bare name, with ``label_column`` naming
         the gold-label column. Same handle shape and verb signature as the remote
         `RemoteDatabase.eval_inference`; the request is assembled with the shared
@@ -1563,7 +1678,7 @@ class EmbeddedBackend:
             source=source,
             columns=columns,
             task=task,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             label_column=label_column,
         )
         return self._native._eval_inference_proto(request.SerializeToString())
@@ -1573,18 +1688,18 @@ class EmbeddedBackend:
         *,
         embedding_tables: List[str],
         source: str,
-        golden_source: str,
+        ground_truth: str,
         k: int = 10,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Compare multiple embedding tables side-by-side against one golden set.
+        """Compare multiple embedding tables side-by-side against one ground truth.
 
         Returns a nested dict with a ``per_table`` list whose first entry is the
         baseline (``delta: None``) and whose subsequent entries carry a ``delta``
         against it (per-metric absolute/relative deltas plus paired
         ``significance``, ``None`` when the runs share no query to pair on).
-        ``golden_source`` addresses the golden set by full catalog path
+        ``ground_truth`` addresses the ground truth by full catalog path
         (``<source>.public.<table>``) or bare name. ``oversample`` / ``exact``
         rank every table's queries as :meth:`eval_embeddings` ranks them. Same
         handle shape and verb signature as the remote `RemoteDatabase.eval_compare`; the request is
@@ -1594,7 +1709,7 @@ class EmbeddedBackend:
         request = build_eval_compare_request(
             embedding_tables=embedding_tables,
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             k=k,
             oversample=oversample,
             exact=exact,
@@ -1605,12 +1720,12 @@ class EmbeddedBackend:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         shape: str,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate whether a predictor's uncertainty is honest against a held-out
-        golden set pairing a predictive distribution with its realised outcome.
+        ground truth pairing a predictive distribution with its realised outcome.
 
         Returns a nested dict with ``aggregate`` (``crps`` / ``nll`` /
         ``adaptive_ece`` / ``sharpness`` / ``coverage`` / ``n``), ``per_cohort``,
@@ -1624,7 +1739,7 @@ class EmbeddedBackend:
         """
         request = build_eval_calibration_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             shape=shape,
             cohorts=cohorts,
         )

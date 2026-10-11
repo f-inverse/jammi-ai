@@ -109,8 +109,9 @@ impl HardNegativeMiner {
         let dim = candidates
             .first()
             .map(|c| c.embedding.len())
-            .ok_or_else(|| {
-                JammiError::FineTune("hard-negative mining needs at least one candidate".into())
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "source".into(),
+                reason: "hard-negative mining needs at least one candidate".into(),
             })?;
 
         // A transient in-memory index for mining; the deployment's HNSW tuning

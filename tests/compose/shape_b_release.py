@@ -150,7 +150,7 @@ def run(target: str, health_url: str) -> int:
         )
         job_id = job.job_id
         print(f"=== submitted long fine-tune {job_id} ===")
-        _wait_for(lambda: job.status() == "running", 120, "the job being claimed")
+        _wait_for(lambda: job.status() == jammi.JobStatus.RUNNING, 120, "the job being claimed")
         print("job running; sending SIGINT (RELEASE)")
     finally:
         db.close()

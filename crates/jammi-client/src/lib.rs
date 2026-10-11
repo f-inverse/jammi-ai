@@ -33,6 +33,7 @@ use tonic::transport::Endpoint;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
@@ -63,7 +64,7 @@ use jammi_wire::proto::inference::InferRequest;
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
     submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
-    JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
+    JobStatusRequest, ListJobsRequest, SubmitJobRequest,
 };
 use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
@@ -74,9 +75,10 @@ use jammi_wire::request::{
 };
 use jammi_wire::{
     audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
-    encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
-    model_task_to_proto, record_from_wire, result_rows_from_proto, result_table_from_proto,
-    trigger_error_from_status, SessionChannel, SessionTransport, SESSION_HEADER,
+    encode_publish_batch, error_from_status, eval_task_to_proto, job_status_info_from_proto,
+    job_summary_from_proto, method_to_proto, model_task_to_proto, record_from_wire,
+    result_rows_from_proto, result_table_from_proto, trigger_error_from_status, JobStatusInfo,
+    JobSummary, SessionChannel, SessionTransport, SESSION_HEADER,
 };
 
 /// A data-plane client backed by a remote engine over gRPC + Flight SQL.
@@ -181,21 +183,16 @@ impl DataClient {
         let info = client
             .execute(query.to_string(), None)
             .await
-            .map_err(|e| JammiError::Other(format!("flight sql execute: {e}")))?;
+            .map_err(flight_error)?;
 
         let mut batches = Vec::new();
         for endpoint in info.endpoint {
-            let ticket = endpoint
-                .ticket
-                .ok_or_else(|| JammiError::Other("flight sql endpoint carried no ticket".into()))?;
-            let stream = client
-                .do_get(ticket)
-                .await
-                .map_err(|e| JammiError::Other(format!("flight sql do_get: {e}")))?;
-            let endpoint_batches: Vec<RecordBatch> = stream
-                .try_collect()
-                .await
-                .map_err(|e| JammiError::Other(format!("flight sql stream: {e}")))?;
+            let ticket = endpoint.ticket.ok_or_else(|| {
+                JammiError::Internal("flight sql endpoint carried no ticket".into())
+            })?;
+            let stream = client.do_get(ticket).await.map_err(flight_error)?;
+            let endpoint_batches: Vec<RecordBatch> =
+                stream.try_collect().await.map_err(flight_error)?;
             batches.extend(endpoint_batches);
         }
         Ok(batches)
@@ -492,25 +489,20 @@ impl DataClient {
         Ok(FineTuneJobId(resp.job_id))
     }
 
-    /// Current status string for a fine-tune job, looked up by id.
-    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        Ok(self.job_status_response(&id.0).await?.status)
+    /// The current status of a fine-tune job, looked up by id.
+    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<JobStatus> {
+        Ok(self.job_status(&id.0).await?.status)
     }
 
     /// Run metrics recorded for a fine-tune job, as the raw JSON blob text
     /// nested inside the wire's terminal `JobStatus.model.metrics_json`
-    /// — the same blob the embedded `TrainingJob`'s
+    /// — the same blob the embedded job handle's
     /// catalog-backed metrics read returns. `None` for a job that has not
     /// yet recorded any metrics (still queued or running before its first
     /// stamp); this crate carries no `serde_json` dependency, so the caller
     /// decodes the returned text.
     pub async fn fine_tune_metrics(&self, id: &FineTuneJobId) -> Result<Option<String>> {
-        use jammi_wire::proto::job::job_status_response::Result as WireResult;
-        let resp = self.job_status_response(&id.0).await?;
-        Ok(match resp.result {
-            Some(WireResult::Model(m)) => m.metrics_json,
-            _ => None,
-        })
+        Ok(self.job_status(&id.0).await?.metrics_json)
     }
 
     /// GPU-acceleration determination for a fine-tune job, as the raw,
@@ -526,29 +518,24 @@ impl DataClient {
         &self,
         id: &FineTuneJobId,
     ) -> Result<Option<String>> {
-        Ok(self
-            .job_status_response(&id.0)
-            .await?
-            .acceleration_report_json)
+        Ok(self.job_status(&id.0).await?.acceleration_report_json)
     }
 
     // --- jobs (JobService; generic across every job kind) -----------------
 
-    async fn job_status_response(&self, job_id: &str) -> Result<JobStatusResponse> {
-        Ok(self
+    /// Read a job's current status by id: status, kind, progress, the output
+    /// model id (training kinds only), and once it has ended its result or
+    /// its error.
+    pub async fn job_status(&self, job_id: &str) -> Result<JobStatusInfo> {
+        let resp = self
             .job_client()
             .job_status(JobStatusRequest {
                 job_id: job_id.to_string(),
             })
             .await
             .map_err(|s| error_from_status(&s))?
-            .into_inner())
-    }
-
-    /// Read a job's current status by id: status, kind, and the resolved
-    /// output model id (training kinds only; empty for a compute kind).
-    pub async fn job_status(&self, job_id: &str) -> Result<JobStatusResponse> {
-        self.job_status_response(job_id).await
+            .into_inner();
+        job_status_info_from_proto(resp).map_err(|s| error_from_status(&s))
     }
 
     /// Stream status updates for a job until it reaches a terminal state.
@@ -570,7 +557,7 @@ impl DataClient {
     pub async fn wait_job(
         &self,
         job_id: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusInfo>> + Send>>> {
         self.wait_job_inner(job_id, None).await
     }
 
@@ -582,7 +569,7 @@ impl DataClient {
         &self,
         job_id: &str,
         timeout: Duration,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusInfo>> + Send>>> {
         self.wait_job_inner(job_id, Some(timeout)).await
     }
 
@@ -590,7 +577,7 @@ impl DataClient {
         &self,
         job_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusResponse>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<JobStatusInfo>> + Send>>> {
         use jammi_wire::proto::job::{job_event::Event, JobHandle};
         let mut request = tonic::Request::new(JobHandle {
             job_id: job_id.to_string(),
@@ -607,7 +594,9 @@ impl DataClient {
         let mapped = stream.filter_map(|item| async move {
             match item {
                 Ok(event) => match event.event {
-                    Some(Event::Done(done)) => Some(Ok(*done)),
+                    Some(Event::Done(done)) => {
+                        Some(job_status_info_from_proto(*done).map_err(|s| error_from_status(&s)))
+                    }
                     // Progress frames carry no terminal payload for this
                     // simplified surface; a caller that needs progress reads
                     // `JobStatus.progress` directly.
@@ -634,19 +623,21 @@ impl DataClient {
     }
 
     /// List jobs visible to the session tenant, most recent first.
-    pub async fn list_jobs(&self) -> Result<Vec<jammi_wire::proto::job::JobSummary>> {
-        let resp = self
-            .job_client()
+    pub async fn list_jobs(&self) -> Result<Vec<JobSummary>> {
+        self.job_client()
             .list_jobs(ListJobsRequest {})
             .await
             .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        Ok(resp.jobs)
+            .into_inner()
+            .jobs
+            .into_iter()
+            .map(|j| job_summary_from_proto(j).map_err(|s| error_from_status(&s)))
+            .collect()
     }
 
     // --- eval ------------------------------------------------------------
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     pub async fn eval_embeddings(
         &self,
         request: EmbeddingEvalRequest,
@@ -654,7 +645,7 @@ impl DataClient {
         let EmbeddingEvalRequest {
             source_id,
             embedding_table,
-            golden_source,
+            ground_truth,
             k,
             cohorts,
             method,
@@ -664,7 +655,7 @@ impl DataClient {
             .eval_embeddings(eval_pb::EvalEmbeddingsRequest {
                 source_id,
                 embedding_table: embedding_table.unwrap_or_default(),
-                golden_source,
+                ground_truth,
                 k: k as u32,
                 cohorts: cohorts_to_proto(&cohorts),
                 tenant_id: String::new(),
@@ -690,14 +681,14 @@ impl DataClient {
         Ok(resp.records.into_iter().map(Into::into).collect())
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         let resp = self
@@ -707,7 +698,7 @@ impl DataClient {
                 source_id: source_id.to_string(),
                 columns: columns.to_vec(),
                 task: eval_task_to_proto(task) as i32,
-                golden_source: golden_source.to_string(),
+                ground_truth: ground_truth.to_string(),
                 label_column: label_column.to_string(),
                 tenant_id: String::new(),
             })
@@ -722,7 +713,7 @@ impl DataClient {
         let CompareEvalRequest {
             embedding_tables,
             source_id,
-            golden_source,
+            ground_truth,
             k,
             method,
         } = request;
@@ -731,7 +722,7 @@ impl DataClient {
             .eval_compare(eval_pb::EvalCompareRequest {
                 embedding_tables,
                 source_id,
-                golden_source,
+                ground_truth,
                 k: k as u32,
                 tenant_id: String::new(),
                 method: jammi_wire::search_method_to_proto(method),
@@ -1294,8 +1285,8 @@ mod world_size_tests {
             *self.submitted.lock().unwrap() = Some(request.into_inner());
             Ok(Response::new(SubmitJobResponse {
                 job_id: "job-1".to_string(),
-                kind: "fine_tune".to_string(),
-                output_model_id: String::new(),
+                kind: jammi_wire::proto::job::JobKind::FineTune as i32,
+                output_model_id: Some("jammi:fine-tuned:job-1".to_string()),
             }))
         }
 
@@ -1665,11 +1656,11 @@ mod model_result_cache_outcome_tests {
             _request: Request<JobStatusRequest>,
         ) -> Result<Response<JobStatusResponse>, Status> {
             Ok(Response::new(JobStatusResponse {
-                status: "completed".to_string(),
-                kind: "fine_tune".to_string(),
+                status: jammi_wire::proto::job::JobStatus::Completed as i32,
+                kind: jammi_wire::proto::job::JobKind::FineTune as i32,
                 progress: None,
-                error: String::new(),
-                output_model_id: "jammi:fine-tuned:second".to_string(),
+                error: None,
+                output_model_id: Some("jammi:fine-tuned:second".to_string()),
                 result: Some(WireResult::Model(ModelResult {
                     model_id: "jammi:fine-tuned:second".to_string(),
                     artifact_path: "file:///artifacts/first".to_string(),
@@ -1757,19 +1748,29 @@ mod model_result_cache_outcome_tests {
             .await
             .expect("job_status returns the double's response");
 
-        match resp.result {
-            Some(WireResult::Model(m)) => {
-                assert_eq!(
-                    jammi_wire::cache_outcome_from_proto(m.cache_outcome).unwrap(),
-                    jammi_db::store::CacheOutcome::Reused(jammi_db::store::ReusedArtifact::Model(
-                        jammi_db::catalog::artifact_repo::ArtifactRef::parse(
-                            "file:///artifacts/first"
-                        )
+        assert_eq!(
+            resp.produced_model_id.as_deref(),
+            Some("jammi:fine-tuned:second")
+        );
+        assert_eq!(
+            resp.cache_outcome,
+            Some(jammi_db::store::CacheOutcome::Reused(
+                jammi_db::store::ReusedArtifact::Model(
+                    jammi_db::catalog::artifact_repo::ArtifactRef::parse("file:///artifacts/first")
                         .unwrap(),
-                    ))
-                );
-            }
-            other => panic!("expected a Model result, got {other:?}"),
-        }
+                )
+            ))
+        );
+    }
+}
+
+/// The engine error a Flight SQL call failed with: the server's own error,
+/// reconstructed from the status it sent ([`jammi_wire::error_from_status`]) —
+/// an unreachable server is a status too — or a stream this client could not
+/// decode.
+fn flight_error(e: arrow_flight::error::FlightError) -> JammiError {
+    match e {
+        arrow_flight::error::FlightError::Tonic(status) => jammi_wire::error_from_status(&status),
+        other => JammiError::Internal(format!("flight sql: {other}")),
     }
 }

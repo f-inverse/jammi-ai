@@ -323,7 +323,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
         .unwrap();
     job.wait().await.unwrap();
 
-    let model_source = ModelSource::parse(job.model_id());
+    let model_source = ModelSource::parse(job.output_model_id().unwrap());
 
     // The fine-tuned model is described from its published bundle — the
     // regression head's persisted form, and the identity the environment
@@ -459,8 +459,8 @@ async fn quantile_regression_serves_and_separates_groups() {
                     epochs: 120,
                     batch_size: 8,
                     lora_rank: 4,
-                    learning_rate: 1e-1,
-                    warmup: jammi_ai::fine_tune::Warmup::Steps(0),
+                    learning_rate: 3e-2,
+                    warmup: jammi_ai::fine_tune::Warmup::Steps(8),
                     lr_schedule: LrSchedule::Constant,
                     regression_loss: Some(RegressionLoss::Pinball),
                     quantile_levels: levels.clone(),
@@ -472,7 +472,7 @@ async fn quantile_regression_serves_and_separates_groups() {
             .unwrap();
         job.wait().await.unwrap();
 
-        let model_source = ModelSource::parse(job.model_id());
+        let model_source = ModelSource::parse(job.output_model_id().unwrap());
         let results_a = session
             .infer(
                 "holdout_a",
@@ -644,7 +644,7 @@ async fn untrained_regression_head_collapses_to_mu_no_separation() {
         .unwrap();
     job.wait().await.unwrap();
 
-    let model_source = ModelSource::parse(job.model_id());
+    let model_source = ModelSource::parse(job.output_model_id().unwrap());
     let a = group_strings(GROUP_A);
     let b = group_strings(GROUP_B);
 
@@ -783,7 +783,7 @@ async fn untrained_quantile_head_collapses_to_mu_no_separation() {
             .unwrap();
         job.wait().await.unwrap();
 
-        let model_source = ModelSource::parse(job.model_id());
+        let model_source = ModelSource::parse(job.output_model_id().unwrap());
         let a = group_strings(GROUP_A);
         let b = group_strings(GROUP_B);
 

@@ -4,7 +4,7 @@
 //! one shared local `artifact_dir` (a valid stand-in for a shared
 //! `result_root`: both instances read the same `file://` bundles in place).
 //! Instance B is a `[server] peer_bind` server started through the production
-//! `OssServer` path; instance A is `InferenceSession::open_with_placement` with
+//! `Server` path; instance A is `InferenceSession::open_with_placement` with
 //! a placement that maps chosen segments to B (or to a dead port), over the
 //! `GrpcPeerTransport` the session's store builder wires.
 //!
@@ -1243,7 +1243,7 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
              caller fault",
         );
     match &err {
-        JammiError::Other(msg) => {
+        JammiError::Internal(msg) => {
             assert!(msg.contains(owner_addr.as_str()), "names the owner: {msg}");
             assert!(msg.contains(&record.table_name), "names the table: {msg}");
             // The corrupted request names no segment (that IS the
@@ -1252,7 +1252,9 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
             // still a typed, present field, never an absent one.
             assert!(msg.contains("segment -1"), "names the segment: {msg}");
         }
-        other => panic!("expected JammiError::Other naming the owner and segment, got {other:?}"),
+        other => {
+            panic!("expected JammiError::Internal naming the owner and segment, got {other:?}")
+        }
     }
     assert_eq!(
         map_engine_error(err).code(),

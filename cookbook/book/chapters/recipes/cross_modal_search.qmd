@@ -23,12 +23,6 @@ Guide: [Search Text Against Images (Cross-Modal)](https://github.com/f-inverse/j
 
 The program is [`cookbook/recipes/cross_modal_search/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/cross_modal_search/example.py); its steps run here in order.
 
-An OpenCLIP-format checkpoint carries a vision tower and a text tower that
-project into one shared space, so a text query encoded by the text tower
-searches an image index directly: no separate text encoder, no projection
-bridge. The checkpoint is LAION's CLIP ViT-B/32 from the Hugging Face Hub,
-downloaded on first use (about 600 MB) and cached.
-
 ```{python}
 import math
 import tempfile

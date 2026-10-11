@@ -81,18 +81,19 @@ use candle_nn::VarMap;
 use jammi_ai::fine_tune::collective::BlockingCall;
 use jammi_ai::fine_tune::data::{TextChunk, TrainingDataLoader};
 use jammi_ai::fine_tune::source::TrainingSource;
+use jammi_ai::fine_tune::spec::fine_tuned_model_id;
 use jammi_ai::fine_tune::spec::{
     admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
 };
-use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+use jammi_ai::fine_tune::target::{AdaptedEncoderTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::{
     tokenize_and_bucket, AppliedLearningRate, KernelDispatchCount, KernelDispatches, TrainingLoop,
     TrainingLoopBuilder,
 };
-use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::{artifact_files_digest, published_artifact_digest};
 use jammi_ai::fine_tune::{
-    EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule, Warmup,
+    EarlyStoppingMetric, EmbeddingLoss, EncoderTraining, FineTuneConfig, FineTuneMethod,
+    LrSchedule, Warmup,
 };
 use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
@@ -116,6 +117,7 @@ use crate::leg::{
 };
 use crate::report::TrainRunPayload;
 use crate::vram::{device_memory_probe, VramWindow};
+use jammi_db::catalog::status::JobKind;
 
 fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
     e.to_string().into()
@@ -483,7 +485,7 @@ fn loader_token_batches(
 pub struct FinetuneRunParams {
     /// Directory holding `config.json` + `model.safetensors` (+ a tokenizer,
     /// one of `jammi_ai::model::arch::TOKENIZER_CANDIDATES` — REQUIRED for the
-    /// real `EncoderAdapters` target; see this module's doc).
+    /// real `AdaptedEncoder` target; see this module's doc).
     pub model_dir: PathBuf,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
@@ -964,8 +966,8 @@ impl Checkpoint {
     }
 }
 
-/// Build the frozen base model this run's `EncoderAdapters` target needs —
-/// ONLY for its TOKENIZER (`TrainingLoop::encode_texts`'s `EncoderAdapters`
+/// Build the frozen base model this run's `AdaptedEncoder` target needs —
+/// ONLY for its TOKENIZER (`TrainingLoop::encode_texts`'s `AdaptedEncoder`
 /// branch reads `base.tokenizer`, never `base`'s own forward; see that
 /// method's doc). Constructed via the REAL `CandleBackend::load` public
 /// trait method — the same backend a serving `InferenceSession` loads
@@ -993,7 +995,7 @@ fn load_base_model(
     let tokenizer = arch::tokenizer_source(model_dir);
     if task == Task::Text && tokenizer.is_none() {
         return Err(format!(
-            "finetune-run: {} has no tokenizer (none of {:?}) — the EncoderAdapters training \
+            "finetune-run: {} has no tokenizer (none of {:?}) — the adapted-encoder training \
              target requires a real tokenizer to turn the fixture's text pairs into token ids \
              (this tier never falls back to synthetic ids the way finetune-step does, because a \
              synthetic-id run would never touch the committed fixture's real text at all)",
@@ -1254,7 +1256,7 @@ fn build_encoder_adapters(
     // `ModernBert::builder().build(..)` /
     // `Bert::builder().build(..)` construct a FRESH encoder in EVAL mode
     // (`training: false` at construction — see each builder's own `build`)
-    // — a plain `TrainingTarget::EncoderAdapters(..)` wrap of that fresh
+    // — a plain `TrainingTarget::AdaptedEncoder(..)` wrap of that fresh
     // encoder therefore drives every forward through the EVAL attention
     // path, and `ModernBertAttention::forward`'s `self.training` gate never
     // reaches `forward_training_attention` at all, so the fused
@@ -1263,7 +1265,7 @@ fn build_encoder_adapters(
     // from a bug that always runs eval. `TrainingLoop::run()` itself never
     // calls `set_training(true)` for the ordinary (non-GradCache)
     // per-batch path either (only `mine_hard_negatives`/`run_gradcache_epoch`
-    // do, and neither applies to `EncoderAdapters`), so this call is NOT
+    // do, and neither applies to `AdaptedEncoder`), so this call is NOT
     // redundant with anything the trainer does — mirrors
     // `finetune_step.rs`'s own `build_fixture`'s `encoder.set_training(true)`
     // call EXACTLY, so this tier's fresh-per-epoch build starts from the
@@ -1387,10 +1389,12 @@ fn base_config(params: &FinetuneRunParams) -> FineTuneConfig {
         warmup: Warmup::Steps(params.warmup_steps),
         lr_schedule: params.lr_schedule,
         early_stopping_metric: params.early_stopping_metric,
-        target_modules: params.target_modules.clone(),
-        layers_to_transform: params.layers_to_transform.clone(),
+        encoder: EncoderTraining::Adapted {
+            target_modules: params.target_modules.clone(),
+            layers_to_transform: params.layers_to_transform.clone(),
+            rank_pattern: HashMap::new(),
+        },
         use_rslora: false,
-        rank_pattern: HashMap::new(),
         // The THIRD site `--lora-init` reaches: the
         // `FineTuneConfig` the trainer itself carries. `build_encoder_adapters`
         // above is what actually initializes this tier's weights, so this
@@ -1681,7 +1685,10 @@ impl std::str::FromStr for Rung {
 /// every rung reports from.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RunMetrics {
-    pub final_loss: f64,
+    pub train_loss_curve: Vec<LossPoint>,
+    /// Present only on a run that monitored the validation loss.
+    #[serde(default)]
+    pub val_loss_curve: Option<Vec<LossPoint>>,
     pub total_steps: usize,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: chrono::DateTime<chrono::Utc>,
@@ -1696,6 +1703,13 @@ pub struct RunMetrics {
     pub timeline: Option<Timeline>,
 }
 
+/// A loss curve's row, one per epoch in epoch order; the bench reads its
+/// loss.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LossPoint {
+    pub loss: f64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct KernelsDisabled {
     pub requested: Vec<String>,
@@ -1706,6 +1720,24 @@ impl RunMetrics {
     pub fn parse(json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         serde_json::from_str(json)
             .map_err(|e| format!("finetune-run: the run's metrics do not parse: {e}").into())
+    }
+
+    /// The monitored loss at the run's last epoch — the statistic the torch
+    /// twin records as its final loss.
+    pub fn final_monitored_loss(
+        &self,
+        metric: EarlyStoppingMetric,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        let curve = match metric {
+            EarlyStoppingMetric::TrainLoss => Some(&self.train_loss_curve),
+            EarlyStoppingMetric::ValLoss => self.val_loss_curve.as_ref(),
+        };
+        curve
+            .and_then(|curve| curve.last())
+            .map(|point| point.loss)
+            .ok_or_else(|| {
+                format!("finetune-run: the run's metrics carry no {metric:?} curve point").into()
+            })
     }
 
     /// The trainer's own run span: its first statement to its final adapter
@@ -1928,7 +1960,7 @@ impl RunContext {
         tokio::runtime::Handle::current()
             .block_on(catalog.claim_next(
                 RESIDENT_WORKER_ID,
-                &["fine_tune"],
+                &[JobKind::FineTune],
                 std::time::Duration::from_secs(3600),
             ))?
             .ok_or("finetune-run: the just-created training job was not claimable")?;
@@ -1976,9 +2008,10 @@ impl RunContext {
             Task::Text => Some(encoder.max_seq_length().map_err(sendify)?),
             Task::Image | Task::Audio => None,
         };
-        let target = TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        let target = TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder,
             adapter_cfg,
+            head: None,
         }));
         let training_loop = TrainingLoopBuilder::new(target, varmap.clone(), self.config.clone())
             .applied_learning_rate(params.applied_learning_rate)
@@ -2127,9 +2160,17 @@ fn train_streamed(
             cache: CachePolicy::Bypass,
         },
     }))?;
-    handle.block_on(job.wait())?;
+    let model_id = match handle.block_on(job.wait())? {
+        jammi_ai::jobs::JobResult::Model { model_id, .. } => model_id,
+        jammi_ai::jobs::JobResult::Table { table, .. } => {
+            return Err(format!(
+                "finetune-run: the fine-tune job ran to table '{table}', not a model"
+            )
+            .into())
+        }
+    };
     handle.block_on(worker.stop_and_join())?;
-    let published = handle.block_on(published_run(&session, &job.job_id, &job.model_id))?;
+    let published = handle.block_on(published_run(&session, job.job_id(), &model_id))?;
     let ran_on = RanOn {
         role: "worker".to_string(),
         ..published.ran_on
@@ -2534,7 +2575,9 @@ pub fn run(
         rung: params.rung.as_str().to_string(),
         final_epoch: params.epochs - 1,
         held_out_count: held_out.count,
-        final_loss_diagnostic: trained.metrics.final_loss,
+        final_loss_diagnostic: trained
+            .metrics
+            .final_monitored_loss(params.early_stopping_metric)?,
         train_run_wall_s: trained.metrics.train_run_wall_s(),
         media_front_end_wall_s: trained.metrics.media_front_end_wall_s,
         epoch_walls: epoch_walls.clone(),
@@ -2790,6 +2833,7 @@ mod tests {
                 .iter()
                 .map(|row| vec![(0, 0); row.len()])
                 .collect(),
+            word_ids: input_ids.iter().map(|row| vec![None; row.len()]).collect(),
             input_ids,
             attention_masks,
             seq_len,

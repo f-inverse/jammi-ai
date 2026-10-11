@@ -21,7 +21,8 @@ checkpoint works the same way — its `config.json` declares
 `audio_model.audio_encoder.*` and `audio_projection.*` tower keys, and its
 `preprocessor_config.json` holds the feature-extractor geometry. The encoder is
 read from that config, as the image recipe reads OpenCLIP's; change `MODEL` in
-the program to try another.
+the program to try another. A checkpoint directory on disk works the same way, as
+`local:<path>`.
 
 It takes a few minutes on a CPU, most of it the three training steps, and well
 under one on a GPU.
@@ -31,8 +32,8 @@ under one on a GPU.
 - `Session.generate_embeddings(*, source, model, columns, key, modality="audio")`
 - `Session.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
-- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
+- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", encoder="frozen" | target_modules=[...], ...)` → `Job`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Audio triplet schema (fine-tune input)
@@ -48,13 +49,14 @@ loader to read the three columns as encoded audio rather than text.
 
 ### Audio-tower LoRA sites
 
-`target_modules` names sites on **this** architecture. An **empty** list means
-"no tower sites" and selects the projection-head mode instead. The HTSAT-Swin
-audio tower offers `query`, `key`, `value`, `attention_output`,
+A fine-tune adapts the tower by default, at its attention `query` and `value`
+projections; `target_modules` names other sites on **this** architecture, and
+`encoder="frozen"` trains only a projection head over the frozen tower. The
+HTSAT-Swin audio tower offers `query`, `key`, `value`, `attention_output`,
 `intermediate_dense`, `output_dense`, `reduction`, `linear1` and `linear2`;
 `all-linear` selects every one. A selector matches a site name exactly or as a
-suffix of it. A **non-empty** list matching nothing fails the job with a message
-that echoes what you submitted and lists the tower's real names.
+suffix of it. A list matching nothing fails the job with a message that echoes
+what you submitted and lists the tower's real names.
 
 ## Input schema
 
@@ -69,9 +71,9 @@ the encoder per the model's `preprocessor_config.json` feature-extractor
 geometry. The audio column may also hold file-path strings instead of inline
 bytes.
 
-## Golden source shape (audio mode)
+## Ground-truth source shape (audio mode)
 
-`eval_embeddings` switches to audio-query mode when the golden source carries a
+`eval_embeddings` switches to audio-query mode when the ground-truth source carries a
 `query_audio` (binary) column instead of `query_text` / `query_image`:
 
 | column        | type   | example                          |
@@ -86,8 +88,8 @@ bytes.
   timbre families (sine / harmonic / square / saw / noise), 4 per family, plus
   a held-out query clip per family under `queries/`. Synthesised
   programmatically by `cookbook/fixtures/generate.py` — **no recorded audio**
-  (licensing), no tenant data.
-- `cookbook/fixtures/tiny_audio_golden.json` — per-query → expected corpus IDs
+  (licensing).
+- `cookbook/fixtures/tiny_audio_relevance.json` — per-query → expected corpus IDs
   (same timbre family).
 
 ## Run it

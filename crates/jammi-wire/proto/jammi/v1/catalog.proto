@@ -38,7 +38,7 @@ import "jammi/v1/embedding.proto";
 // scope, like every other verb here; `all = true` requests the cross-tenant
 // admin pass and is gated at this wire boundary ONLY by a deployment-supplied
 // admin authorizer — the engine's shipped default refuses every `all = true`
-// request, so an OSS deployment that wires nothing cannot accidentally expose
+// request, so a deployment that wires nothing cannot accidentally expose
 // it. That authorizer decision is mechanism, not policy: it decides WHO may
 // run the pass, never what the pass does.
 //
@@ -293,8 +293,9 @@ enum FileFormat {
   FILE_FORMAT_PARQUET = 1;
   FILE_FORMAT_CSV = 2;
   FILE_FORMAT_JSON = 3;
-  FILE_FORMAT_AVRO = 4;
   FILE_FORMAT_JSONL = 5;
+  reserved 4;
+  reserved "FILE_FORMAT_AVRO";
 }
 
 // Connection parameters for a source. Maps onto the engine's
@@ -713,12 +714,11 @@ message DropTopicRequest {
   bool if_exists = 2;
 }
 
+// Every topic visible to the session's tenant: the tenant scope rides on the
+// session, never the body, and the whole set comes back in one response.
 message ListTopicsRequest {
-  // AIP-132 pagination.
-  int32 page_size = 1;
-  string page_token = 2;
-  // Optional tenant scope filter.
-  string tenant_id = 3;
+  reserved 1, 2, 3;
+  reserved "page_size", "page_token", "tenant_id";
 }
 
 // A fully-materialized topic in a `ListTopics` page. Carries everything a
@@ -741,7 +741,8 @@ message Topic {
 
 message ListTopicsResponse {
   repeated Topic topics = 1;
-  string next_page_token = 2;
+  reserved 2;
+  reserved "next_page_token";
 }
 
 // === reconcile =============================================================

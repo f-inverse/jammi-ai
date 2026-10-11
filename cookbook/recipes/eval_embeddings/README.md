@@ -1,7 +1,7 @@
 # Evaluate retrieval quality
 
 Measure recall@k, precision@k, MRR, and nDCG of an embedding index against
-a golden relevance set.
+a relevance judgments.
 
 **When to use this pattern.** You have a corpus and a small set of
 (query, expected document) judgments, and you need a number that tells
@@ -11,13 +11,13 @@ same loop powers nightly regression dashboards and A/B model comparison.
 ## API surface exercised
 
 - `Session.generate_embeddings(*, source, model, columns, key, modality="text")`
-- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
 
 The returned dict carries `aggregate` (mean across queries — `recall_at_k`,
 `precision_at_k`, `mrr`, `ndcg`) and `per_query` (one entry per query with
 `query_id` and a `metrics` sub-dict of the same four names, un-averaged).
 
-## Golden source shape
+## Ground-truth source shape
 
 `eval_embeddings` requires a registered source with these columns:
 

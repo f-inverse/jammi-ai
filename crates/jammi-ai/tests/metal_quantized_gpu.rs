@@ -789,13 +789,9 @@ async fn qlora_learns_on_metal_with_gguf_base() {
         .unwrap();
 
     // (a) completes on Metal, over a Quantized (GGUF) frozen base.
-    job.wait().await.unwrap();
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(
-        record.status, "completed",
-        "Metal QLoRA job should complete, got {}",
-        record.status
-    );
+    // `wait` returns a result only for a completed job, and the job's own
+    // recorded error for any other end.
+    job.wait().await.expect("Metal QLoRA job completes");
 
     // (b) PRIMARY learning assertion: held-out avg_val_loss decreases
     // first->last epoch. This is the faithful signal at this suite's

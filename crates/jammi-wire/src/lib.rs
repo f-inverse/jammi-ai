@@ -31,13 +31,10 @@ pub mod proto;
 ///
 /// This is the authoritative, machine-readable description of the compiled
 /// `jammi.v1` wire surface — the frozen contract, decoded with
-/// [`prost_types::FileDescriptorSet`]. It describes every service and rpc
-/// *defined* in the proto set, which may exceed what a given build mounts: a
-/// contract-only service (e.g. `jammi.v1.lifecycle`, answered by a platform
-/// server, not the OSS engine) is present here yet served by no OSS handler.
-/// The tenant-isolation oracle derives its rpc inventory from this rather than a
-/// hand-maintained list, so a newly added rpc cannot escape coverage by being
-/// forgotten in a constant.
+/// [`prost_types::FileDescriptorSet`]. It describes every service and rpc the
+/// proto set defines. The tenant-isolation oracle derives its rpc inventory
+/// from this rather than a hand-maintained list, so a newly added rpc cannot
+/// escape coverage by being forgotten in a constant.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/jammi_descriptor.bin"));
 
@@ -56,6 +53,7 @@ mod channel;
 mod embedding;
 mod error;
 mod eval_wire;
+mod job;
 mod mutable_table;
 mod training;
 mod trigger;
@@ -83,11 +81,19 @@ pub use embedding::{
 };
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
-    error_from_status, status_code, trigger_error_from_status,
+    class_code, code_class, error_from_status, status_code, trigger_error_from_status,
 };
 pub use eval_wire::{
     calibration_shape_from_proto, calibration_shape_to_proto, cohorts_from_proto, cohorts_to_proto,
     eval_task_to_proto, EvalTaskFromWire,
+};
+pub use job::{
+    device_kind_from_proto, device_kind_to_proto, job_kind_from_proto, job_kind_to_proto,
+    job_kinds_from_proto, job_kinds_to_proto, job_phase_from_proto, job_phase_to_proto,
+    job_progress_from_proto, job_progress_to_proto, job_status_from_proto,
+    job_status_info_from_proto, job_status_to_proto, job_summary_from_proto,
+    worker_state_from_proto, worker_state_to_proto, worker_summary_from_proto, JobStatusInfo,
+    JobSummary, WorkerSummary,
 };
 pub use mutable_table::{
     definition_from_proto, definition_list_from_proto, definition_to_proto, parse_table_id,
@@ -231,14 +237,11 @@ mod descriptor_tests {
     use prost::Message;
     use prost_types::FileDescriptorSet;
 
-    /// The emitted descriptor covers the whole `jammi.v1` proto set — adding
-    /// `lifecycle.proto` to `build.rs`'s list extends it automatically. A
+    /// The emitted descriptor covers the whole `jammi.v1` proto set: a
     /// downstream that mounts gRPC reflection over `FILE_DESCRIPTOR_SET` covers
-    /// both the engine's own services (`jammi.v1.catalog`) and the contract-only
-    /// `jammi.v1.lifecycle` service the platform answers — the property a
-    /// single reflection registration relies on.
+    /// every engine service with one registration.
     #[test]
-    fn descriptor_covers_lifecycle_and_catalog_services() {
+    fn descriptor_covers_every_engine_service() {
         let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
             .expect("the compiled jammi.v1 descriptor must decode");
         let services: Vec<String> = set
@@ -250,13 +253,15 @@ mod descriptor_tests {
                 f.service.iter().map(move |s| format!("{pkg}.{}", s.name()))
             })
             .collect();
-        assert!(
-            services.contains(&"jammi.v1.lifecycle.LifecycleService".to_string()),
-            "descriptor must carry the lifecycle contract service: {services:?}"
-        );
-        assert!(
-            services.contains(&"jammi.v1.catalog.CatalogService".to_string()),
-            "descriptor must carry the engine's own CatalogService: {services:?}"
-        );
+        for service in [
+            "jammi.v1.catalog.CatalogService",
+            "jammi.v1.job.JobService",
+            "jammi.v1.trigger.TriggerService",
+        ] {
+            assert!(
+                services.contains(&service.to_string()),
+                "descriptor must carry {service}: {services:?}"
+            );
+        }
     }
 }

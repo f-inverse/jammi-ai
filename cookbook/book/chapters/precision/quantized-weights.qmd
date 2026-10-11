@@ -153,14 +153,14 @@ job.wait()
 metrics = job.metrics()
 held_out = [round(row["loss"], 4) for row in metrics["val_loss_curve"]]
 print(f"held-out loss per epoch: {held_out}")
-print(f"the model kept: held-out loss {metrics['final_loss']:.4f}")
+print(f"the model kept: epoch {metrics['best_epoch']}, held-out loss {metrics['best_loss']:.4f}")
 
 vector = db.encode_query(model=job.output_model_id, query="quantum computing applications")
 claim("the adapted model encodes in the base model's width", len(vector) == 384)
 claim("training over the quantized backbone lowers the held-out loss",
       min(held_out[1:]) < held_out[0], f"first {held_out[0]}, best after {min(held_out[1:])}")
 claim("the model kept is the epoch with the lowest held-out loss",
-      abs(metrics["final_loss"] - min(held_out)) < 1e-3)
+      held_out[metrics["best_epoch"]] == min(held_out))
 ```
 
 Thirty pairs are few: the held-out loss falls, then turns up again as the adapters

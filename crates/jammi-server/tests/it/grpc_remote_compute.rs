@@ -12,7 +12,7 @@
 //!
 //! * **Round-trip parity** — the same call through either transport returns the
 //!   same result against the same engine, on realistic inputs (the `tiny_bert`
-//!   test encoder over the shipped `patents` corpus, a real golden set, a
+//!   test encoder over the shipped `patents` corpus, a real ground truth, a
 //!   real mutable-table definition, a real channel).
 //! * **Error parity** — a real failure returns the *same*
 //!   `JammiError` variant + fields from both transports. The mutable case is
@@ -22,7 +22,7 @@
 //!   and the remote transport rebuilds that exact nested variant.
 //!
 //! Hermetic: local fixtures only (the `tiny_bert` encoder, the bundled
-//! `patents.parquet`, `golden_relevance.csv`); no live network, no download.
+//! `patents.parquet`, `relevance.csv`); no live network, no download.
 
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ fn file_connection(name: &str, format: FileFormat) -> SourceConnection {
     }
 }
 
-const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
+const GROUND_TRUTH: &str = "truth_rel.public.relevance";
 
 /// Connect a `DataClient` to the in-process server.
 async fn remote(server: &EngineServer) -> DataClient {
@@ -84,19 +84,19 @@ async fn add_patents(session: &Session) {
         .expect("add patents");
 }
 
-/// Register patents + the golden relevance set and generate one embedding table
+/// Register patents + the relevance judgments and generate one embedding table
 /// over `abstract` so the eval verbs have a real run to evaluate. Returns the
 /// generated table name.
-async fn embed_patents_and_golden(session: &Session) -> String {
+async fn embed_patents_and_truth(session: &Session) -> String {
     add_patents(session).await;
     session
         .add_source(
-            "golden_rel",
+            "truth_rel",
             SourceType::File,
-            file_connection("golden_relevance.csv", FileFormat::Csv),
+            file_connection("relevance.csv", FileFormat::Csv),
         )
         .await
-        .expect("add golden");
+        .expect("add truth");
     session
         .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
             source_id: "patents".to_string(),
@@ -190,7 +190,7 @@ fn retrieval_eval() -> EmbeddingEvalRequest {
     EmbeddingEvalRequest {
         source_id: "patents".into(),
         embedding_table: None,
-        golden_source: GOLDEN_SOURCE.into(),
+        ground_truth: GROUND_TRUTH.into(),
         k: 10,
         cohorts: Default::default(),
         method: SearchMethod::default(),
@@ -202,7 +202,7 @@ fn compare_eval(tables: &[String]) -> CompareEvalRequest {
     CompareEvalRequest {
         embedding_tables: tables.to_vec(),
         source_id: "patents".into(),
-        golden_source: GOLDEN_SOURCE.into(),
+        ground_truth: GROUND_TRUTH.into(),
         k: 10,
         method: SearchMethod::default(),
     }
@@ -213,7 +213,7 @@ async fn remote_eval_round_trips_like_local() {
     let server = start_engine_server().await;
     let remote = remote(&server).await;
     let local = local(&server);
-    let table = embed_patents_and_golden(&local).await;
+    let table = embed_patents_and_truth(&local).await;
 
     let remote_report = remote
         .eval_embeddings(retrieval_eval())
@@ -316,13 +316,13 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// (deferred-error) contract: submit returns `Ok` from either transport, and
 /// the worker drives the job to `failed` whichever transport submitted it.
 ///
-/// `JobStatus` now carries the worker's failure `error` (and the output
-/// `model_id`) alongside the status string, so a remote `wait()` can surface the
-/// failure reason — see the pure-Python `RemoteTrainingJob.wait`, which raises
-/// `TrainingError` with that wire message, and the verb-parity coverage in
+/// `JobStatus` carries the worker's failure `error` (and the output
+/// `model_id`) alongside the status, so a remote `wait()` can surface the
+/// failure reason — see the pure-Python `RemoteJob.wait`, which raises
+/// `JobFailed` with that wire message, and the verb-parity coverage in
 /// `crates/jammi-python/tests/test_conformance.py`. The data-plane client
-/// exposed here reads back only the status string (its `fine_tune_status`
-/// signature is status-only), so this test asserts the deferred-failure contract
+/// exposed here reads back only the status (its `fine_tune_status` returns a
+/// `JobStatus`), so this test asserts the deferred-failure contract
 /// — submit returns `Ok`, the worker drives the job to `failed` — over both
 /// transports; the error-message round-trip is exercised through the Python
 /// handle that consumes the new `error` field.
@@ -379,13 +379,13 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String>;
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus>;
     }
     impl FineTuneStatus for Session {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -393,7 +393,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -404,11 +404,12 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == jammi_db::catalog::status::JobStatus::Failed.to_string() {
+            if status == jammi_db::catalog::status::JobStatus::Failed {
                 return;
             }
             assert_ne!(
-                status, "completed",
+                status,
+                jammi_db::catalog::status::JobStatus::Completed,
                 "patents has no training-format columns — the job must fail, not complete"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -475,9 +476,9 @@ async fn add_training_pairs(session: &Session) {
 /// Parity: a completed fine-tune job's run-metrics blob round-trips
 /// over the wire, on the divergence-prone case — the multi-epoch
 /// `train_loss_curve` / `val_loss_curve` arrays, not a single scalar. The
-/// embedded surface reads the catalog's `training_jobs.metrics` column
-/// directly (the same read `jammi-python`'s `TrainingJob.metrics()`
-/// performs); the remote surface reads it back through the
+/// embedded surface reads the job's recorded result directly (the same read
+/// `jammi-python`'s `Job.metrics()` performs); the remote surface reads it
+/// back through the
 /// `JobStatus`'s result.model.metrics_json wire field.
 ///
 /// THE byte-equality parity oracle is the SAME-JOB comparison: this test
@@ -541,13 +542,13 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String>;
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus>;
     }
     impl FineTuneStatus for Session {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -555,7 +556,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
         async fn status(
             &self,
             job: &jammi_ai::local_session::FineTuneJobId,
-        ) -> jammi_db::error::Result<String> {
+        ) -> jammi_db::error::Result<jammi_db::catalog::status::JobStatus> {
             self.fine_tune_status(job).await
         }
     }
@@ -565,11 +566,12 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     ) {
         for _ in 0..600 {
             let status = session.status(job).await.expect("fine_tune_status");
-            if status == jammi_db::catalog::status::JobStatus::Completed.to_string() {
+            if status == jammi_db::catalog::status::JobStatus::Completed {
                 return;
             }
             assert_ne!(
-                status, "failed",
+                status,
+                jammi_db::catalog::status::JobStatus::Failed,
                 "the minimal LoRA fine-tune over training_pairs.csv must complete"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -580,7 +582,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     poll_until_completed(&remote, &remote_job).await;
 
     // Embedded read: straight off the catalog record, the same field
-    // `jammi-python`'s `TrainingJob.metrics()` decodes.
+    // `jammi-python`'s `Job.metrics()` decodes.
     let local_record = server
         .engine
         .catalog()
@@ -783,12 +785,9 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .expect("remote create_mutable_table");
     assert_eq!(id.as_str(), "patents_dim");
 
-    // A second create of the same id fails the same way on both transports: the
-    // backing-store unique constraint trips, surfacing
-    // `MutableTable(Backend(Constraint { .. }))`. This exercises the *nested*
-    // engine-owned `BackendError` reconstruction — the remote transport must
-    // rebuild the inner `Backend(Constraint)` faithfully, never folding the
-    // outer `MutableTable` to `Other`.
+    // A second create of the same id fails the same way on both transports:
+    // `MutableTable(AlreadyExists(id))`, the nested variant rebuilt with its
+    // id over the wire, never folded to `Remote`.
     let local_dup = local
         .create_mutable_table(patents_dim_definition())
         .await
@@ -798,21 +797,14 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .create_mutable_table(patents_dim_definition())
         .await
         .expect_err("remote re-create must fail");
-    match (&local_dup, &remote_dup) {
-        (
-            JammiError::MutableTable(MutableTableError::Backend(local_b)),
-            JammiError::MutableTable(MutableTableError::Backend(remote_b)),
-        ) => assert_eq!(
-            local_b.to_string(),
-            remote_b.to_string(),
-            "the nested Backend error crosses the wire intact"
-        ),
-        (_, JammiError::Other(_)) => {
-            panic!(
-                "REGRESSION: the nested MutableTable(Backend) error folded to Other over the wire"
-            )
-        }
-        other => panic!("remote did not reconstruct MutableTable(Backend) faithfully: {other:?}"),
+    for (transport, err) in [("local", &local_dup), ("remote", &remote_dup)] {
+        assert!(
+            matches!(
+                err,
+                JammiError::MutableTable(MutableTableError::AlreadyExists(taken)) if *taken == id
+            ),
+            "{transport} re-create: {err:?}"
+        );
     }
 
     // The remote drops it; afterwards the local session can recreate it,
@@ -880,8 +872,8 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
             local_msg, remote_msg,
             "the InvalidId message crosses the wire intact"
         ),
-        (_, JammiError::Other(_)) => panic!(
-            "REGRESSION: the MutableTable error folded to Other over the wire — the fold is not closed"
+        (_, JammiError::Remote { .. }) => panic!(
+            "REGRESSION: the MutableTable error folded to Remote over the wire — the fold is not closed"
         ),
         other => panic!("remote did not reconstruct MutableTable::InvalidId faithfully: {other:?}"),
     }

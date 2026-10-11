@@ -341,14 +341,16 @@ impl GraphSampleConfig {
     /// Validate the knobs; returns an error naming the first invalid field.
     pub fn validate(&self) -> Result<()> {
         if self.walk_length == 0 {
-            return Err(JammiError::FineTune(
-                "graph walk_length must be >= 1".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "walk_length".into(),
+                reason: "must be >= 1".into(),
+            });
         }
         if self.walks_per_node == 0 {
-            return Err(JammiError::FineTune(
-                "graph walks_per_node must be >= 1".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "walks_per_node".into(),
+                reason: "must be >= 1".into(),
+            });
         }
         // `is_finite` checked FIRST, short-circuiting `<= 0.0` (family
         // D/F): `NaN <= 0.0` is `false`, so a bare `self.return_p <= 0.0`
@@ -359,26 +361,28 @@ impl GraphSampleConfig {
         // Infinity is refused there, before `<= 0.0` (a comparison NaN
         // would make silently vacuous) ever runs.
         if !self.return_p.is_finite() || self.return_p <= 0.0 {
-            return Err(JammiError::FineTune(format!(
-                "graph return_p must be > 0 and finite (was {})",
-                self.return_p
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "return_p".into(),
+                reason: format!("must be > 0 and finite (was {})", self.return_p),
+            });
         }
         if !self.in_out_q.is_finite() || self.in_out_q <= 0.0 {
-            return Err(JammiError::FineTune(format!(
-                "graph in_out_q must be > 0 and finite (was {})",
-                self.in_out_q
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "in_out_q".into(),
+                reason: format!("must be > 0 and finite (was {})", self.in_out_q),
+            });
         }
         if self.exclude_hops == 0 {
-            return Err(JammiError::FineTune(
-                "graph exclude_hops must be >= 1 (the false-negative guard)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "exclude_hops".into(),
+                reason: "must be >= 1 (the false-negative guard)".into(),
+            });
         }
         if self.min_negatives == 0 {
-            return Err(JammiError::FineTune(
-                "graph min_negatives must be >= 1 (collapse guard)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "min_negatives".into(),
+                reason: "must be >= 1 (collapse guard)".into(),
+            });
         }
         Ok(())
     }
@@ -441,9 +445,10 @@ impl GraphSampler {
         config.validate()?;
 
         if nodes.is_empty() {
-            return Err(JammiError::FineTune(
-                "graph sampler needs at least one text-bearing node".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: "graph sampler needs at least one text-bearing node".into(),
+            });
         }
 
         // The node id is the sole ordering key a caller's
@@ -853,9 +858,13 @@ impl GraphSampler {
     /// should be impossible after `build`'s endpoint check, but the text-bearing
     /// contract is enforced, never assumed).
     fn text_of(&self, id: &str) -> Result<String> {
-        self.nodes.get(id).cloned().ok_or_else(|| {
-            JammiError::FineTune(format!("graph node '{id}' has no resolvable text"))
-        })
+        self.nodes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("graph node '{id}' has no resolvable text"),
+            })
     }
 }
 

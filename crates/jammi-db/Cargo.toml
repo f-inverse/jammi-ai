@@ -107,7 +107,6 @@ seahash.workspace = true
 bytemuck.workspace = true
 
 # Retry
-backon.workspace = true
 futures.workspace = true
 async-stream.workspace = true
 parking_lot.workspace = true

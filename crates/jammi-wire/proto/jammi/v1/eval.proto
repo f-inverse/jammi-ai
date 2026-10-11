@@ -11,7 +11,7 @@ import "jammi/v1/embedding.proto";
 // alongside CatalogService / TriggerService / EmbeddingService / Inference-
 // Service rather than on the Flight SQL surface (which carries query/result
 // only). The verbs are substrate primitives — measuring model
-// quality against golden data — and name no tenant-domain concept.
+// quality against ground-truth data — and name no tenant-domain concept.
 //
 // Each verb delegates 1:1 to the consumer-facing `Session`
 // abstraction; the service reimplements no metric, retrieval, or scan logic.
@@ -24,7 +24,7 @@ import "jammi/v1/embedding.proto";
 // `TenantResolver` (default: the `jammi-session-id` header → shared session
 // store) — the one mechanism every gRPC service and Flight SQL bind through.
 service EvalService {
-  // Evaluate embedding retrieval quality against a golden relevance set.
+  // Evaluate embedding retrieval quality against a relevance judgments.
   // Peer of the abstraction's `eval_embeddings`.
   rpc EvalEmbeddings(EvalEmbeddingsRequest) returns (EmbeddingEvalReport);
 
@@ -32,29 +32,29 @@ service EvalService {
   // abstraction's `eval_per_query`.
   rpc EvalPerQuery(EvalPerQueryRequest) returns (EvalPerQueryResponse);
 
-  // Evaluate inference (classification / NER) quality against golden labels.
+  // Evaluate inference (classification / NER) quality against ground-truth labels.
   // Peer of the abstraction's `eval_inference`.
   rpc EvalInference(EvalInferenceRequest) returns (InferenceEvalReport);
 
-  // Compare multiple embedding tables side-by-side against one golden set.
+  // Compare multiple embedding tables side-by-side against one ground truth.
   // Peer of the abstraction's `eval_compare`.
   rpc EvalCompare(EvalCompareRequest) returns (CompareEvalReport);
 
   // Evaluate whether a predictor's uncertainty is honest against a held-out
-  // golden set pairing a predictive distribution with its realised outcome.
+  // ground truth pairing a predictive distribution with its realised outcome.
   // Peer of the abstraction's `eval_calibration`.
   rpc EvalCalibration(EvalCalibrationRequest) returns (CalibrationEvalReport);
 }
 
 // Inference-evaluation task kind. Mirrors the engine's `EvalTask`: the two
-// inference tasks that carry golden labels.
+// inference tasks that carry ground-truth labels.
 enum EvalTask {
   EVAL_TASK_UNSPECIFIED = 0;
   EVAL_TASK_CLASSIFICATION = 1;
   EVAL_TASK_NER = 2;
 }
 
-// The predictive output shape an `eval_calibration` golden source carries.
+// The predictive output shape an `eval_calibration` ground-truth source carries.
 // Mirrors the engine's `EvalCalibrationShape`: the shape selects which columns
 // the runner reads and which scoring family scores them.
 enum CalibrationShape {
@@ -75,8 +75,8 @@ message EvalEmbeddingsRequest {
   // Embedding result table to evaluate; empty == the engine resolves the
   // source's most recent embedding table.
   string embedding_table = 2;
-  // Fully-qualified golden relevance source (e.g. "golden.public.relevance").
-  string golden_source = 3;
+  // Fully-qualified ground-truth relevance source (e.g. "truth.public.relevance").
+  string ground_truth = 3;
   // Retrieval cutoff k.
   uint32 k = 4;
   // Opaque per-query cohort tags: query_id → {key: value}. The substrate
@@ -111,9 +111,9 @@ message EvalInferenceRequest {
   repeated string columns = 3;
   // Inference task kind.
   EvalTask task = 4;
-  // Fully-qualified golden label source.
-  string golden_source = 5;
-  // Column in the golden source carrying the gold label.
+  // Fully-qualified ground-truth label source.
+  string ground_truth = 5;
+  // Column in the ground-truth source carrying the gold label.
   string label_column = 6;
   string tenant_id = 7;
 }
@@ -122,7 +122,7 @@ message EvalCompareRequest {
   // Embedding tables to compare; the first is the baseline. At least two.
   repeated string embedding_tables = 1;
   string source_id = 2;
-  string golden_source = 3;
+  string ground_truth = 3;
   uint32 k = 4;
   string tenant_id = 5;
   // How every table's rankings are computed, as `EvalEmbeddingsRequest.method`.
@@ -133,9 +133,9 @@ message EvalCalibrationRequest {
   // Source the held-out predictions are scored for (records the run's
   // source identity).
   string source_id = 1;
-  // Fully-qualified golden source pairing a predictive distribution with its
+  // Fully-qualified ground-truth source pairing a predictive distribution with its
   // realised `outcome`.
-  string golden_source = 2;
+  string ground_truth = 2;
   // The predictive output shape (which columns are read + which family scores).
   CalibrationShape shape = 3;
   // Opaque per-record cohort tags: record_id → {key: value}. Stored verbatim.
@@ -242,7 +242,16 @@ message NerMetrics {
   map<string, TypeMetrics> per_type = 4;
 }
 
-// A named-entity span. Mirrors `jammi_numerics::ner::Entity`.
+// A gold named-entity span: a label over a byte range. Mirrors
+// `jammi_numerics::ner::Span`.
+message Span {
+  string label = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+}
+
+// A named entity a model predicted: its span, the text it covers, and the
+// model's confidence. Mirrors `jammi_numerics::ner::Entity`.
 message Entity {
   string label = 1;
   uint64 start = 2;
@@ -271,7 +280,7 @@ message PerRecordPrediction {
   message Ner {
     string record_id = 1;
     repeated Entity predicted = 2;
-    repeated Entity gold = 3;
+    repeated Span gold = 3;
   }
   oneof prediction {
     Classification classification = 1;

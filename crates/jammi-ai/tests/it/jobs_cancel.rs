@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_ai::fine_tune::spec::fine_tuned_model_id;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::loop_test_hooks::{arm_observed, Event};
 use jammi_ai::fine_tune::worker::{training_test_hooks, EmbeddedWorker, JobWorker};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -19,7 +19,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::JobRecord;
-use jammi_db::catalog::status::JobStatus;
+use jammi_db::catalog::status::{JobKind, JobStatus};
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
@@ -78,7 +78,7 @@ async fn running_job_over(session: &InferenceSession, source: &str) -> JobRecord
         .await
         .unwrap()
         .into_iter()
-        .find(|j| j.status == JobStatus::Running.to_string() && j.spec.contains(source))
+        .find(|j| j.status == JobStatus::Running && j.spec.contains(source))
         .unwrap_or_else(|| panic!("a running job over {source} must exist while parked"))
 }
 
@@ -111,7 +111,7 @@ async fn run_now_honours_a_cancel_requested_before_dispatch() {
         "run_now must surface the honoured cancel as JobCancelled, got {outcome:?}"
     );
     let row = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    assert_eq!(row.status, JobStatus::Cancelled);
     assert!(
         row.error.as_deref().unwrap_or("").contains("cancelled"),
         "the row records why it ended, got {:?}",
@@ -145,10 +145,7 @@ async fn a_claimed_jobs_cancel_is_honoured_at_the_workers_checkpoint() {
     .unwrap();
 
     park.wait_parked().await;
-    assert_eq!(
-        handle.status().await.unwrap(),
-        JobStatus::Running.to_string()
-    );
+    assert_eq!(handle.status().await.unwrap(), JobStatus::Running);
     assert!(
         handle.cancel().await.unwrap(),
         "JobHandle::cancel records the request on a running job"
@@ -157,11 +154,11 @@ async fn a_claimed_jobs_cancel_is_honoured_at_the_workers_checkpoint() {
 
     let err = handle.wait().await.unwrap_err();
     assert!(
-        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id()),
         "wait() surfaces the honoured cancel as the typed JobCancelled, got {err:?}"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled);
     assert!(row.error.as_deref().unwrap_or("").contains("cancelled"));
     worker.stop_and_join().await.unwrap();
 }
@@ -184,11 +181,11 @@ async fn a_cancel_requested_while_queued_ends_the_job_without_a_worker() {
         .expect("the job is already terminal; nothing has to claim it")
         .unwrap_err();
     assert!(
-        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id()),
         "got {err:?}"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled);
     assert_eq!(row.attempts, 0, "no attempt was spent on it");
 }
 
@@ -205,7 +202,7 @@ async fn a_requeued_job_already_flagged_is_cancelled_right_after_the_claim() {
         .enqueue(never_dispatched_infer(&source).into(), 0)
         .await
         .unwrap();
-    let job_id_for_sql = handle.job_id.clone();
+    let job_id_for_sql = handle.job_id().to_string();
     session
         .catalog()
         .backend_arc()
@@ -231,11 +228,11 @@ async fn a_requeued_job_already_flagged_is_cancelled_right_after_the_claim() {
         .expect("the worker claims the flagged job and ends it promptly")
         .unwrap_err();
     assert!(
-        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id),
+        matches!(&err, JammiError::JobCancelled { job_id } if *job_id == handle.job_id()),
         "got {err:?}"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Cancelled.to_string());
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled);
     assert_eq!(
         row.attempts, 1,
         "the claim that met the flag was an attempt"
@@ -297,7 +294,7 @@ async fn run_now_reports_superseded_when_its_row_went_terminal_before_the_finish
         "run_now must report the missed finish CAS as JobAttemptSuperseded, got {outcome:?}"
     );
     let row = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Failed.to_string());
+    assert_eq!(row.status, JobStatus::Failed);
     assert_eq!(
         row.error.as_deref(),
         Some("operator wrote the row"),
@@ -336,7 +333,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     }
     .into();
     let handle = session.enqueue(spec, 0).await.unwrap();
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     let base_pk = session
         .catalog()
         .get_model(&canonical)
@@ -351,7 +348,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     );
     assert_eq!(
         row.output_model_id.as_deref(),
-        Some(fine_tuned_model_id(&handle.job_id).as_str()),
+        Some(fine_tuned_model_id(handle.job_id()).as_str()),
         "output_model_id is the id the finish CAS mints"
     );
     assert_eq!(
@@ -371,11 +368,11 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
         )
         .await
         .unwrap();
-    let dedicated_row = session.catalog().get_job(&dedicated.job_id).await.unwrap();
+    let dedicated_row = session.catalog().get_job(dedicated.job_id()).await.unwrap();
     assert_eq!(dedicated_row.model_ref, row.model_ref);
     assert_eq!(
         dedicated_row.output_model_id.as_deref(),
-        Some(fine_tuned_model_id(&dedicated.job_id).as_str())
+        Some(fine_tuned_model_id(dedicated.job_id()).as_str())
     );
 
     // A compute kind with a model input carries its canonical model source.
@@ -389,7 +386,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     }
     .into();
     let handle = session.enqueue(compute, 0).await.unwrap();
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(row.model_source.as_deref(), Some(canonical.as_str()));
     assert_eq!(row.model_ref, None);
     assert_eq!(row.output_model_id, None);
@@ -412,7 +409,7 @@ async fn enqueue_derives_the_model_links_like_the_dedicated_entry_points() {
     }
     .into();
     let handle = session.enqueue(asof, 0).await.unwrap();
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(row.model_source, None);
 }
 
@@ -497,7 +494,11 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
     let worker = JobWorker::new(&session).expect("this config clears the worker margin");
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .claim_next(
+            worker.worker_id(),
+            &[JobKind::FineTune],
+            Duration::from_secs(30),
+        )
         .await
         .unwrap()
         .expect("the queued job is claimable");
@@ -525,12 +526,12 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
 
     // Arm the observed-event rendezvous BEFORE requesting
     // the cancel, so the watcher's fire can never race ahead of the arm.
-    let cancel_observed = arm_observed(&handle.job_id, Event::CancelObserved);
+    let cancel_observed = arm_observed(handle.job_id(), Event::CancelObserved);
 
     assert!(
         session
             .catalog()
-            .cancel_request(&handle.job_id)
+            .cancel_request(handle.job_id())
             .await
             .unwrap(),
         "a cancel on the running training job is recorded"
@@ -563,10 +564,10 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
         )
         .unwrap();
 
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Cancelled.to_string(),
+        JobStatus::Cancelled,
         "the cancelled training job must land `cancelled`, not stay `running` or reach `completed`"
     );
     assert!(
@@ -668,12 +669,16 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
         )
         .await
         .unwrap();
-    let job_id = handle.job_id.clone();
+    let job_id = handle.job_id().to_string();
 
     let worker = JobWorker::new(&session).expect("this config clears the worker margin");
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .claim_next(
+            worker.worker_id(),
+            &[JobKind::FineTune],
+            Duration::from_secs(30),
+        )
         .await
         .unwrap()
         .expect("the queued job is claimable");
@@ -860,7 +865,11 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
     let worker = JobWorker::new(&session).expect("this config clears the worker margin");
     let claimed = session
         .catalog()
-        .claim_next(worker.worker_id(), &["fine_tune"], Duration::from_secs(30))
+        .claim_next(
+            worker.worker_id(),
+            &[JobKind::FineTune],
+            Duration::from_secs(30),
+        )
         .await
         .unwrap()
         .expect("the queued job is claimable");
@@ -908,10 +917,10 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
         )
         .unwrap();
 
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "a lease loss on the owning worker must leave the job `running` for reclaim, never \
          `failed` or `completed`"
     );

@@ -50,3 +50,29 @@ pub enum TriggerError {
     #[error("topic catalog corruption: {0}")]
     Catalog(String),
 }
+
+impl TriggerError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]), the
+    /// same whether the topic verb ran in process or behind a server.
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::TopicNotFound(_) => ErrorClass::NotFound,
+            Self::BatchSchemaMismatch(_)
+            | Self::UnsupportedSchemaType { .. }
+            | Self::PredicateParse(_)
+            | Self::PredicateUnsupported(_) => ErrorClass::InvalidArgument,
+            // A re-registration whose schema disagrees with the stored one: a
+            // conflict against the stored declaration.
+            Self::SchemaConflict { .. } => ErrorClass::FailedPrecondition,
+            Self::PublishTenantMismatch { .. } => ErrorClass::PermissionDenied,
+            Self::Driver(_) => ErrorClass::Unavailable,
+            // The topic's own backing table, the catalog underneath it, or a
+            // predicate the parser admitted failing on a row: engine faults.
+            Self::PredicateEval(_)
+            | Self::BackingTable(_)
+            | Self::Backend(_)
+            | Self::Catalog(_) => ErrorClass::Internal,
+        }
+    }
+}

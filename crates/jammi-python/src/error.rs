@@ -52,6 +52,9 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         // The end the caller asked for, distinct from a fault — the class the
         // remote client raises for a `cancelled` job (`RemoteJob.wait`).
         JammiError::JobCancelled { .. } => "JobCancelled",
+        // A job the caller waited on failed — the class the remote client
+        // raises for a `failed` job.
+        JammiError::JobFailed { .. } => "JobFailed",
         JammiError::InvalidKey { .. } => "InvalidKey",
         JammiError::NonUniqueKey { .. } => "NonUniqueKey",
         JammiError::NoQueryEncoder { .. } => "NoQueryEncoder",
@@ -73,8 +76,8 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
 /// (`MutableTableError`, `TriggerError`, …) without re-wrapping each one in a
 /// stringly-typed `JammiError::Catalog` first. The `JammiError` variant selects
 /// the taxonomy class (see [`jammi_error_class`]) so a caller catches the same
-/// class the remote client raises for the same failure — a failed training
-/// `wait()` (`JammiError::FineTune`) is a `TrainingError`, a bad argument is an
+/// class the remote client raises for the same failure — a failed job's
+/// `wait()` (`JammiError::JobFailed`) is a `JobFailed`, a bad argument is an
 /// `InvalidArgument`, a runtime/backend fault is a `BackendError`.
 pub fn to_pyerr<E: Into<JammiError>>(e: E) -> PyErr {
     let err = e.into();
@@ -109,6 +112,8 @@ fn status_class(code: Code) -> &'static str {
         Code::NotFound => "NotFound",
         Code::AlreadyExists => "AlreadyExists",
         Code::FailedPrecondition => "FailedPrecondition",
+        Code::PermissionDenied => "PermissionDenied",
+        Code::Unauthenticated => "Unauthenticated",
         Code::Unavailable => "Unavailable",
         _ => "BackendError",
     }
@@ -141,6 +146,18 @@ mod tests {
         );
     }
 
+    /// Embedded ⇄ remote parity for a topic verb: a missing topic raises the
+    /// class the server's `NOT_FOUND` raises remotely, so an `except NotFound`
+    /// holds on both transports.
+    #[test]
+    fn a_missing_topic_raises_the_class_the_remote_transport_raises() {
+        let err = JammiError::Trigger(jammi_db::trigger::TriggerError::TopicNotFound(
+            "never.registered".to_string(),
+        ));
+        assert_eq!(jammi_wire::status_code(&err), Code::NotFound);
+        assert_eq!(jammi_error_class(&err), "NotFound");
+    }
+
     /// Embedded ⇄ remote parity for the retryable condition: a stalled Hub
     /// download (`Unavailable`) raises the class the remote client raises for
     /// the `UNAVAILABLE` the server sends, so one `except Unavailable` retries
@@ -162,7 +179,7 @@ mod tests {
     #[test]
     fn a_non_caller_fault_still_classifies_as_a_backend_error() {
         assert_eq!(
-            jammi_error_class(&JammiError::Other("disk on fire".to_string())),
+            jammi_error_class(&JammiError::Internal("disk on fire".to_string())),
             status_class(Code::Internal),
         );
     }

@@ -1,5 +1,5 @@
 ---
-title: "Asymmetric binary quantization: a per-dimension threshold recovers the bits a real embedding's own anisotropy collapses"
+title: "Asymmetric binary quantization: each bit's threshold fit to the corpus"
 ---
 
 **Verbs:** `storage_precision = "binary"`'s own coarse-code fit — a per-dimension
@@ -12,15 +12,15 @@ direction nearly every representation projects onto
 binary sidecar is built over [@malkov2020hnsw] and the recall-vs-memory trade
 quantization buys [@johnson2021billion] · **Checked:** measurement (the anisotropy diagnosis
 itself — `‖μ‖/E‖v‖` and the collapsed-dimension count — plain-vs-asymmetric no-rescore
-recall@1/@10 against the engine's exact search, and the rescore companion's identity to the
+recall\@1 and recall\@10 against the engine's exact search, and the rescore companion's identity to the
 normalized input; every number measured live).
 
 `binary-precision.qmd` measured `storage_precision = "binary"`'s retrieve→rescore trade —
 one packed sign bit per dimension, Hamming-ranked, a mandatory exact rescore recovering
 most of the recall the coarse code gives up. What that chapter's own numpy oracle did NOT
 question is the packing rule itself: `sign(v)`, a threshold fixed at exactly `0`, for
-every dimension, on every corpus. That rule is silently wrong for a real transformer
-embedding. Real embeddings are **anisotropic** — nearly every row shares a large common
+every dimension, on every corpus. That rule assumes every dimension is centered at zero,
+and a real transformer embedding is not. Real embeddings are **anisotropic** — nearly every row shares a large common
 direction (measured below: at `full` scale, on ModernBERT-base, a corpus mean vector whose own
 norm is almost as large as a typical row's) — so a fixed threshold at `0` does
 not split a dimension's values into two roughly-balanced halves; on a dimension the shared
@@ -88,10 +88,10 @@ claim("a fixed-0 threshold collapses dimensions", dead["zero"] > 0,
 claim("a median threshold, splitting every dimension in half, collapses none", dead["median"] == 0)
 ```
 
-On a real, anisotropic embedding a large share of dimensions is dead under a fixed-`0` rule —
-every one contributes the same bit to every row. Centering each dimension at its own corpus
-median eliminates that collapse: not by adding information, but by putting each dimension's
-bit boundary where its values actually split.
+How many dimensions a fixed-`0` rule kills depends on the encoder; the count above is this
+scale's. A dead dimension contributes the same bit to every row. Centering each dimension at
+its own corpus median eliminates the collapse, on any encoder: not by adding information,
+but by putting each dimension's bit boundary where its values actually split.
 
 ## The fix, isolated — `sign(v)` against `sign(v − τ)`, in numpy
 
@@ -210,9 +210,9 @@ answer is computed from exact data every time.
 
 ## Honest framing — a floor raised, not a solved 1-bit code
 
-The corpus-fit threshold is a real improvement at the level it works on — the coarse,
-no-rescore ranking — and it comes entirely from reviving the dimensions the anisotropy killed,
-never from holding more information than one bit per dimension can. It does not make `binary`
+The corpus-fit threshold improves the level it works on — the coarse, no-rescore ranking —
+exactly as far as the fixed rule wasted bits: it comes entirely from reviving the dimensions
+the anisotropy killed, never from holding more information than one bit per dimension can. It does not make `binary`
 a substitute for `f32`; the mandatory rescore is still what closes the gap to the exact answer.
 
 ## Bridge note
@@ -224,9 +224,10 @@ a substitute for `f32`; the mandatory rescore is still what closes the gap to th
 > on the dimensions where it is most wrong. Fitting a per-dimension threshold from the
 > corpus itself (`sign(v − τ)`, median by default, no separate config knob — confirmed here
 > by an unsupported key being refused loud at load, never parsed and silently ignored)
-> eliminates the collapsed dimensions and
-> measurably improves no-rescore recall, both in an isolated numpy fold and through the
-> real engine's own `search()`. It stays exactly as narrow as its design claims: the
+> eliminates the collapsed dimensions; the no-rescore recall that wins back is as large as
+> the number the fixed rule killed — a clear margin on ModernBERT at full scale, next to
+> nothing on the small scale's retrieval-trained sentence encoder. It stays exactly as
+> narrow as its design claims: the
 > exact-`f32` rescore companion is confirmed to hold the same L2-normalized vectors every
 > precision's ingestion path normalizes, untouched by τ, so
 > the fix only ever changes WHICH coarse candidates retrieve→rescore considers, never how

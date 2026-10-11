@@ -315,8 +315,11 @@ claim("each batch names the one model and a measured latency",
 ```
 
 Every row the embedding run produced passed the observer exactly once, in batches, each
-tagged with the one model that ran. The observer costs nothing when none is attached —
-the engine checks for one per batch.
+tagged with the one model that ran. A batch's latency is its forward, timed after the
+model is loaded; this program runs as a debug build (`cargo run` without `--release`), so
+the number measures an unoptimized engine, not inference speed — build with `--release`
+to read that. The observer costs nothing when none is attached — the engine checks for
+one per batch.
 
 ## What this shows
 

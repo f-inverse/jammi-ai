@@ -121,8 +121,8 @@ use super::local::DEFAULT_RENDEZVOUS_TIMEOUT;
 use super::round::{self, contribution_shapes, result_shapes, Contribution, Shape};
 use super::transport::{self, Transport};
 use super::{
-    checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
-    Verb,
+    checked_gather_counts, checked_root, reason_of, BlockingCall, Collective, Descriptor,
+    TensorSignature, Verb,
 };
 
 /// Frames buffered per direction of one link before the sender waits.
@@ -1721,16 +1721,6 @@ fn fault_all(members: &[CoordinatorLink], round: u64, reason: String) -> JammiEr
         link.link.send_fault(round, &reason);
     }
     JammiError::FineTune(reason)
-}
-
-/// The words to record as a gang's fault for `error` (a
-/// [`JammiError::FineTune`]'s own message rather than its `Display`, so a
-/// fault quoted inside a later refusal does not carry a second prefix).
-fn reason_of(error: &JammiError) -> String {
-    match error {
-        JammiError::FineTune(message) => message.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// Describe a wait that ended without the frame it waited for.

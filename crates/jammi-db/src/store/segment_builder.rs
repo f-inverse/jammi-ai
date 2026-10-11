@@ -86,7 +86,7 @@ impl SegmentBuilder {
     /// starts building.
     pub async fn push(&mut self, row_ids: Vec<String>, vectors: Vec<Vec<f32>>) -> Result<()> {
         if row_ids.len() != vectors.len() {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::Internal(format!(
                 "segment builder: {} row ids for {} vectors",
                 row_ids.len(),
                 vectors.len()
@@ -114,7 +114,7 @@ impl SegmentBuilder {
         let mut build_time = Duration::ZERO;
         for build in self.builds {
             let (segment, took) = build.await.map_err(|e| {
-                JammiError::Other(format!("segment builder: a build thread failed: {e}"))
+                JammiError::Internal(format!("segment builder: a build thread failed: {e}"))
             })??;
             segments.push(segment);
             build_time += took;
@@ -132,7 +132,9 @@ impl SegmentBuilder {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
-            .map_err(|e| JammiError::Other(format!("segment builder: build slots closed: {e}")))?;
+            .map_err(|e| {
+                JammiError::Internal(format!("segment builder: build slots closed: {e}"))
+            })?;
         let (dimensions, ann, precision) = (self.dimensions, self.ann, self.precision);
         self.builds.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;

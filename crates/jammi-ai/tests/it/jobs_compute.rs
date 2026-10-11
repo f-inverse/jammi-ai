@@ -18,9 +18,9 @@ use jammi_ai::fine_tune::worker::JobWorker;
 use jammi_ai::jobs::{execute_compute, ComputeSpec, JobResult};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::jobs_repo::SubmitJobParams;
+use jammi_db::catalog::jobs_repo::{JobProgress, SubmitJobParams};
 use jammi_db::catalog::result_repo::JobAttempt;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKinds, JobPhase, JobStatus};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
@@ -111,6 +111,19 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
     );
     assert_eq!(record_a.row_count, record_b.row_count);
     assert_eq!(record_a.dimensions_raw(), record_b.dimensions_raw());
+
+    // The job's row carries what it computed: every source row read, of the
+    // total the finished stream knew.
+    let rows = record_b.row_count as u64;
+    assert_eq!(
+        session.catalog().get_job(&job_id).await.unwrap().progress,
+        Some(JobProgress {
+            phase: JobPhase::Computing,
+            done: Some(rows),
+            total: Some(rows),
+        }),
+        "a compute job reports the rows it read"
+    );
 
     let vectors_a = session
         .read_vectors(&common::pin(&session, record_a.clone()).await)
@@ -420,13 +433,14 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
     let worker = JobWorker::with_intervals_and_kinds(
         &session,
         worker_intervals,
-        vec![spec.kind().to_string()],
+        JobKinds::new(vec![spec.kind()]),
     );
     worker.run_claimed_job(&session, claimed2).await;
 
     let finished = session.catalog().get_job(&job_id).await.unwrap();
     assert_eq!(
-        finished.status, "completed",
+        finished.status,
+        JobStatus::Completed,
         "the Ready arm must finish the job directly from the adopted table"
     );
     let result_json = finished
@@ -577,15 +591,17 @@ async fn expired_compute_attempt_re_materializes_on_the_successor() {
     let worker = JobWorker::with_intervals_and_kinds(
         &session,
         session.worker_intervals().unwrap(),
-        vec![spec.kind().to_string()],
+        JobKinds::new(vec![spec.kind()]),
     );
     worker.run_claimed_job(&session, claimed2).await;
 
     let finished = session.catalog().get_job(&job_id).await.unwrap();
     assert_eq!(
-        finished.status, "completed",
+        finished.status,
+        JobStatus::Completed,
         "the successor must re-materialize, got {:?} ({:?})",
-        finished.status, finished.error
+        finished.status,
+        finished.error
     );
     let table2 = finished
         .partial_result
@@ -624,6 +640,6 @@ async fn expired_compute_attempt_re_materializes_on_the_successor() {
     let _ = attempt1.await.unwrap();
     assert_eq!(
         session.catalog().get_job(&job_id).await.unwrap().status,
-        "completed"
+        JobStatus::Completed
     );
 }

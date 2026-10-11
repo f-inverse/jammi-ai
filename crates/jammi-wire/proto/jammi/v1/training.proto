@@ -20,8 +20,8 @@ import "jammi/v1/inference.proto";
 // shape mirroring the engine's `TrainingSpec`.
 
 // Fine-tuning method. Mirrors the engine's `FineTuneMethod`; LoRA is the only
-// method, trained as either an encoder-internal adapter or a projection head
-// over a frozen base model depending on `FineTuneConfig.target_modules`.
+// method, trained inside the encoder or in a head over a frozen encoder as
+// `FineTuneConfig.encoder` says.
 enum FineTuneMethod {
   FINE_TUNE_METHOD_UNSPECIFIED = 0;
   LORA = 1;
@@ -114,6 +114,22 @@ enum BackboneDtype {
   F16 = 3;
 }
 
+// LoRA inside the encoder. Mirrors the engine's `EncoderTraining::Adapted`.
+message AdaptedEncoder {
+  // The sites, named as PEFT's `target_modules` names them; empty selects the
+  // architecture's defaults (its attention block's query and value
+  // projections, or the fused projection that holds them).
+  repeated string target_modules = 1;
+  // Unset = every layer.
+  optional LayersToTransform layers_to_transform = 2;
+  // Per-site rank overrides keyed by site-name substring.
+  map<string, uint32> rank_pattern = 3;
+}
+
+// The encoder trains frozen; a LoRA head over its pooled output carries the
+// adaptation. Mirrors the engine's `EncoderTraining::Frozen`.
+message FrozenEncoder {}
+
 // 0-based encoder layer indices that receive LoRA adapters. Wrapper message so
 // "no restriction" (field absent → all layers) is distinguishable from "an
 // empty restriction"; mirrors the engine's `Option<Vec<usize>>`.
@@ -172,14 +188,13 @@ message FineTuneConfig {
   }
   LrSchedule lr_schedule = 14;
   EarlyStoppingMetric early_stopping_metric = 15;
-  // Layer-name suffixes that receive LoRA adapters. Empty = projection head
-  // over the frozen base model; non-empty = LoRA inside the encoder.
-  repeated string target_modules = 16;
-  // Unset = all layers.
-  optional LayersToTransform layers_to_transform = 17;
+  // Where the LoRA adapters train. Unset = inside the encoder at the
+  // architecture's default sites.
+  oneof encoder {
+    AdaptedEncoder adapted = 16;
+    FrozenEncoder frozen = 17;
+  }
   optional bool use_rslora = 18;
-  // Per-module rank overrides keyed by module-name substring.
-  map<string, uint32> rank_pattern = 19;
   LoraInitMode init_lora_weights = 20;
   BackboneDtype backbone_dtype = 21;
   optional double weight_decay = 22;

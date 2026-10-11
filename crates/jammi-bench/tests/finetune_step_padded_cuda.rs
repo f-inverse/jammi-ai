@@ -189,9 +189,8 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     the pad rows' gradient path relative to the block arm (which never
 ///     compacts, so every row, pad or real, stays live in the autograd
 ///     graph throughout). No LIVE loss this fixture computes actually
-///     consumes a pad row's gradient (`ner_loss` is latent — nothing
-///     constructs `TrainingBatch::Ner` — and every pooling verb this tier
-///     uses masks pad rows out before the loss), so this asymmetry is not
+///     consumes a pad row's gradient (every pooling verb this tier uses
+///     masks pad rows out before the loss), so this asymmetry is not
 ///     itself an observable defect on this leg, but it means a bit-level
 ///     gradient comparison between the two arms would NOT be expected to
 ///     agree on pad-row gradients even in a fully correct implementation —

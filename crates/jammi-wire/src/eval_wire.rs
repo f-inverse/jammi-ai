@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::error::JammiError;
 use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
-use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span, TypeMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::Status;
 
@@ -240,6 +240,16 @@ impl From<&Entity> for pb::Entity {
     }
 }
 
+impl From<&Span> for pb::Span {
+    fn from(s: &Span) -> Self {
+        pb::Span {
+            label: s.label.clone(),
+            start: s.start as u64,
+            end: s.end as u64,
+        }
+    }
+}
+
 impl From<&InferenceAggregate> for pb::InferenceAggregate {
     fn from(a: &InferenceAggregate) -> Self {
         let aggregate = match a {
@@ -418,7 +428,7 @@ impl From<CalibrationEvalReport> for pb::CalibrationEvalReport {
 // incompatible wire payload, and fabricating the zero value (recall = 0.0, …)
 // would hand a consumer plausible-wrong result data it cannot distinguish from
 // a real score. At the network boundary the right idiom is to propagate the
-// error as a value — [`malformed`] builds a [`JammiError::Eval`] naming the
+// error as a value — [`malformed`] builds a [`JammiError::Internal`] naming the
 // missing field, and the the remote client eval verb returns it as the
 // call's `Err`. Scalar proto3 primitives keep their proto-default (0 / "");
 // only required nested messages reject. Genuinely-optional fields
@@ -426,7 +436,7 @@ impl From<CalibrationEvalReport> for pb::CalibrationEvalReport {
 
 /// Build the decode error for a required nested message that arrived `None`.
 fn malformed(field: &str) -> JammiError {
-    JammiError::Eval(format!("malformed eval report: missing {field}"))
+    JammiError::Internal(format!("malformed eval report: missing {field}"))
 }
 
 impl From<pb::AggregateMetrics> for AggregateMetrics {
@@ -556,6 +566,16 @@ impl From<pb::Entity> for Entity {
             end: e.end as usize,
             text: e.text,
             confidence: e.confidence,
+        }
+    }
+}
+
+impl From<pb::Span> for Span {
+    fn from(s: pb::Span) -> Self {
+        Span {
+            label: s.label,
+            start: s.start as usize,
+            end: s.end as usize,
         }
     }
 }
@@ -811,12 +831,12 @@ mod tests {
 
     fn assert_missing(err: JammiError, field: &str) {
         match err {
-            JammiError::Eval(msg) => assert_eq!(
+            JammiError::Internal(msg) => assert_eq!(
                 msg,
                 format!("malformed eval report: missing {field}"),
                 "decode error names the missing field"
             ),
-            other => panic!("expected JammiError::Eval, got {other:?}"),
+            other => panic!("expected JammiError::Internal, got {other:?}"),
         }
     }
 

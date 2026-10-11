@@ -16,6 +16,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 use crate::common;
+use jammi_db::catalog::status::JobStatus;
 
 fn tiny_bert() -> String {
     "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
@@ -176,15 +177,16 @@ fn training_columns() -> Vec<String> {
     ]
 }
 
-/// The cheapest real fine-tune shape: one epoch of the projection-head arm
-/// (`target_modules` empty), which is enough for a job to be claimed and to
-/// leave `queued` — the only property these tests read off it.
+/// The cheapest real fine-tune shape: one epoch over a frozen encoder, which
+/// is enough for a job to be claimed and to leave `queued` — the only
+/// property these tests read off it.
 fn cheap_fine_tune_config() -> FineTuneConfig {
     FineTuneConfig {
         epochs: 1,
         batch_size: 4,
         warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
+        encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
         ..Default::default()
     }
 }
@@ -254,7 +256,8 @@ async fn front_door_with_run_worker_false_leaves_the_job_queued_and_pending_stab
             .await
             .expect("fine_tune_status is served regardless of run_worker");
         assert_eq!(
-            status, "queued",
+            status,
+            JobStatus::Queued,
             "poll {poll}: with run_worker = false NOTHING in this process may claim the \
              job — it must still read `queued`"
         );
@@ -313,7 +316,7 @@ async fn front_door_with_the_default_config_claims_the_submitted_job() {
     let mut left_queued = None;
     for _ in 0..600 {
         let status = session.fine_tune_status(&job_id).await.expect("status");
-        if status != jammi_db::catalog::status::JobStatus::Queued.to_string() {
+        if status != jammi_db::catalog::status::JobStatus::Queued {
             left_queued = Some(status);
             break;
         }
@@ -324,7 +327,11 @@ async fn front_door_with_the_default_config_claims_the_submitted_job() {
         "CONTROL: with the default config the front door's worker must claim the submitted \
          job — it never left `queued`, which would make the run_worker = false oracle vacuous",
     );
-    assert_ne!(observed, "queued", "the claimed job has left the queue");
+    assert_ne!(
+        observed,
+        JobStatus::Queued,
+        "the claimed job has left the queue"
+    );
 }
 
 /// Dropping a `run_worker = false` front-door session must not panic or hang on
@@ -357,7 +364,7 @@ async fn dropping_a_run_worker_false_session_with_a_job_outstanding_is_immediate
     let job_id = submit(&session).await;
     assert_eq!(
         session.fine_tune_status(&job_id).await.unwrap(),
-        "queued",
+        JobStatus::Queued,
         "the job is outstanding at drop — that is the state this teardown must handle"
     );
 

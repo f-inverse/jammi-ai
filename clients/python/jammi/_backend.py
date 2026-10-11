@@ -24,16 +24,19 @@ from typing import Any, ContextManager, Dict, List, Optional, Protocol, Sequence
 from ._capability import Capability
 
 
+from ._jobs import JobKind, JobProgress, JobStatus
+
+
 @runtime_checkable
 class JobHandle(Protocol):
     """A handle to a submitted job (training or compute) — poll it, or block
     on it.
 
-    Both the embedded engine's `Job` (`jammi_native.Job`) and the remote
-    :class:`~jammi.RemoteJob` satisfy this, so a caller treats the two
+    Both :class:`~jammi.EmbeddedJob` and :class:`~jammi.RemoteJob` satisfy
+    this, so a caller treats the two
     interchangeably: read the ids, poll :meth:`status` / :meth:`progress`,
     request :meth:`cancel`, or :meth:`wait` for a terminal state (which
-    raises :class:`~jammi.errors.TrainingError` on a failed job with the
+    raises :class:`~jammi.errors.JobFailed` on a failed job with the
     executor's message) and returns the tagged terminal result.
     """
 
@@ -42,23 +45,23 @@ class JobHandle(Protocol):
         """The unique id the submit assigned this job."""
 
     @property
-    def kind(self) -> str:
-        """The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`)."""
+    def kind(self) -> "JobKind":
+        """The kind this job submitted under."""
 
     @property
-    def output_model_id(self) -> str:
-        """The deterministic output model id the trained artifact registers
-        under. Empty for a compute-kind job."""
+    def output_model_id(self) -> Optional[str]:
+        """The model a training kind registers, stamped at submission;
+        ``None`` for a compute kind."""
 
-    def status(self) -> str:
-        """The job's current status string."""
+    def status(self) -> "JobStatus":
+        """The job's current status."""
 
     def wait(self) -> Dict[str, Any]:
         """Block until a terminal state; raise on a failed job. Returns the
         tagged terminal result dict."""
 
-    def progress(self) -> Dict[str, Any]:
-        """This job's progress: `{"rows_done", "rows_total", "phase"}`."""
+    def progress(self) -> Optional["JobProgress"]:
+        """This job's latest recorded progress, or ``None`` before any."""
 
     def cancel(self) -> bool:
         """Request cancellation. `True` if the request landed on a still

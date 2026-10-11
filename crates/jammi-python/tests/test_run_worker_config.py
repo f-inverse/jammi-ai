@@ -118,7 +118,7 @@ def test_embedded_run_worker_false_accepts_the_submission_and_never_claims(
 
         started = time.monotonic()
         for poll in range(_POLL_ROUNDS):
-            assert job.status() == "queued", (
+            assert job.status() == jammi.JobStatus.QUEUED, (
                 f"poll {poll}: a `run_worker = false` process claimed a job it "
                 f"must never claim (status {job.status()!r})"
             )
@@ -154,7 +154,7 @@ def test_embedded_default_config_claims_and_completes_the_same_job(
     try:
         job = _submit(db)
         job.wait()
-        assert job.status() == "completed"
+        assert job.status() == jammi.JobStatus.COMPLETED
         # And the claimant DID record its determination, so the `pending`
         # marker above is the absence of exactly this write.
         report = job.acceleration_report()
@@ -183,7 +183,7 @@ _CLAIMING_SUCCESSOR = textwrap.dedent(
     try:
         job = db.job(sys.argv[2])
         job.wait()
-        print("STATUS " + job.status())
+        print("STATUS " + str(job.status()))
         print("REPORT_STATE " + str(job.acceleration_report()["state"]))
     finally:
         db.close()
@@ -213,7 +213,7 @@ def test_close_hands_the_queued_job_to_a_claiming_successor_process(
     job_id = job.job_id
 
     time.sleep(_IDLE_POLL_SECONDS * 2)
-    assert job.status() == "queued"
+    assert job.status() == jammi.JobStatus.QUEUED
     assert job.acceleration_report() == _PENDING
 
     # The release point: no worker was ever started here, so `close()` has none
@@ -281,12 +281,13 @@ def test_queued_job_reads_identically_on_the_remote_arm(
 
     class _QueuedStub:
         """A `JobServiceStub` double serving the row the engine actually
-        committed: the columns are carried across verbatim, never re-encoded."""
+        committed, encoded as the server encodes it: each value as the wire
+        enum member of the same name, the report blob verbatim."""
 
         def JobStatus(self, _request, metadata=None):  # noqa: N802 - gRPC name
             return job_pb2.JobStatusResponse(
-                status=embedded_status,
-                kind=job.kind,
+                status=job_pb2.JobStatus.Value(f"JOB_STATUS_{embedded_status.name}"),
+                kind=job_pb2.JobKind.Value(f"JOB_KIND_{job.kind.name}"),
                 output_model_id=job.output_model_id,
                 acceleration_report_json='{"state":"pending"}',
             )
@@ -299,7 +300,7 @@ def test_queued_job_reads_identically_on_the_remote_arm(
         output_model_id=job.output_model_id,
     )
 
-    assert embedded_status == "queued"
+    assert embedded_status is jammi.JobStatus.QUEUED
     assert embedded_report == _PENDING
     assert remote.status() == embedded_status
     assert remote.acceleration_report() == embedded_report

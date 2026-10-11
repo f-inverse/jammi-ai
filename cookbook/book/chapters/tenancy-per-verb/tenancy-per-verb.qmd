@@ -33,7 +33,7 @@ from pathlib import Path
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi.errors import BackendError, NotFound
+from jammi.errors import AlreadyExists, NotFound, PermissionDenied
 from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
 from jammi_cookbook.claims import claim
@@ -50,10 +50,13 @@ def parquet(name: str, table: pa.Table) -> str:
 
 
 def refused(action) -> bool:
+    """Whether another tenant's resource is out of reach: invisible to the
+    caller (`NotFound`), not its to act on (`PermissionDenied`), or a name that
+    is already taken (`AlreadyExists`)."""
     try:
         action()
         return False
-    except BackendError:
+    except (NotFound, PermissionDenied, AlreadyExists):
         return True
 
 
@@ -194,8 +197,8 @@ claim("and every one of A's resources survives B's attempts", all(local["survive
 ```
 
 A mutable table's name is unique across tenants, so B reusing A's name is
-refused; a topic and a channel live in per-tenant namespaces, so B's reuse makes
-B's own. And a destructive verb named by the wrong tenant resolves in that
+refused as `AlreadyExists`; a topic and a channel live in per-tenant namespaces,
+so B's reuse makes B's own. And a destructive verb named by the wrong tenant resolves in that
 tenant's namespace: B's drop of A's mutable table is a not-found, B's drop of
 A's topic touches nothing — A's resources survive.
 
@@ -257,8 +260,8 @@ and the wrong one the moment an untrusted caller can reach the port. **It is not
 trust boundary.**
 
 Verifying a caller is the consumer's job — a gateway placed **in front of** the
-engine. The engine's `grpc_byo_auth.rs` worked example shows that seam for the
-**typed gRPC verbs**; the Flight SQL lane (`db.sql()`) is a separate
+engine. The server takes a `TenantResolver` (`jammi_server::grpc::session`) for that seam on
+the **typed gRPC verbs**; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
 (by design). The client carries the channel's bearer on the **Flight SQL
 lane** as well as the typed verbs. So here is the consumer-side
@@ -319,8 +322,8 @@ Flight calls (`get_flight_info` then `do_get`), each re-presenting the bearer, s
 the gateway verifies in **both** — rejecting in `get_flight_info` short-circuits
 the whole `sql()` before any read runs. On a missing or invalid credential the
 gateway raises `FlightUnauthenticatedError`, which the jammi client surfaces
-through the `JammiError` taxonomy as `jammi.BackendError` (detail:
-`Unauthenticated`); the request reads nothing, it does not fall through
+through the `JammiError` taxonomy as `jammi.errors.Unauthenticated`; the request
+reads nothing, it does not fall through
 to an unscoped global read.
 
 ```{python}
@@ -447,7 +450,7 @@ before = len(factory.observed)
 try:
     gateway_sources(None)
     missing_rejected = False
-except jammi.BackendError:
+except jammi.errors.Unauthenticated:
     missing_rejected = True
 anon_no_bearer = all(obs is None for obs in factory.observed[before:])
 print(f"anonymous db.sql() carried no bearer: {anon_no_bearer}")
@@ -465,7 +468,7 @@ forged = f"subject-mallory.{TENANT_A}.deadbeef"
 try:
     gateway_sources(forged)
     forged_rejected = False
-except jammi.BackendError:
+except jammi.errors.Unauthenticated:
     forged_rejected = True
 legit_after = "auth_a" in gateway_sources(mint_token("subject-a", TENANT_A))
 print(f"invalid (forged) credential rejected: {forged_rejected}")
@@ -502,9 +505,8 @@ matrices are identical.
 
 A **result table** (`asof_join`, `generate_embeddings`, …) isolates the same way
 despite carrying no `tenant_id` column of its own: the catalog row's owner gates
-resolution of the bare `jammi.{name}` identifier
-(`result_schema.rs`), driven live here over the `db.sql` lane, mirroring the
-engine's own standing oracle. It is the same organizational
+resolution of the bare `jammi.{name}` identifier, driven live here over the `db.sql`
+lane. It is the same organizational
 resolution-visibility property as the rest of the chapter, not a hostile-principal
 boundary — the trusted-network + BYO-auth posture is unchanged.
 

@@ -1,6 +1,6 @@
-//! Library surface for the OSS `jammi-server` binary.
+//! Library surface for the `jammi-server` binary.
 //!
-//! The binary's orchestration entry-point is [`runtime::OssServer`].
+//! The binary's orchestration entry-point is [`runtime::Server`].
 //! The library also re-exports building blocks (`build_router`,
 //! `flight::*`, `grpc::*`) so test fixtures and downstream binaries
 //! (e.g. the `jammi` CLI's `serve` subcommand) can compose the same
@@ -11,8 +11,8 @@
 //! downstream chains [`runtime::AssembledChain::mount`] to add its own services
 //! beside the engine's on one listener, then serves — or splits via
 //! [`runtime::AssembledChain::into_axum_router`] to compose a single axum
-//! listener of its own. `serve_grpc_chain` is the thin OSS-only path over the
-//! same seam.
+//! listener of its own. `serve_grpc_chain` is the thin path over the same seam
+//! for a caller that adds nothing.
 
 pub mod error;
 pub mod flight;
@@ -46,7 +46,7 @@ use crate::runtime::{LivenessProbe, ReadinessProbe};
 ///
 /// Kept as a public struct because integration tests still wire trigger
 /// handles manually for fixtures that need to drive a stubbed broker.
-/// Production code goes through [`runtime::OssServer`] which derives
+/// Production code goes through [`runtime::Server`] which derives
 /// the same handles from the engine session.
 pub struct TriggerHandles {
     pub topic_repo: Arc<TopicRepo>,
@@ -56,7 +56,7 @@ pub struct TriggerHandles {
 
 /// Build the side-channel router with `/healthz` only — no readiness
 /// or metrics state attached. Callers that need the full surface
-/// construct the router through [`runtime::OssServer`].
+/// construct the router through [`runtime::Server`].
 pub fn build_router() -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
@@ -67,7 +67,7 @@ pub fn build_router() -> Router {
 /// Build the full side-channel router exposing `/healthz`, `/readyz`,
 /// and `/metrics`. The readiness probe, metrics registry and liveness
 /// probe are passed in as `Arc`s so test fixtures can substitute stubs;
-/// the production server (`runtime::OssServer::bind`) builds its router
+/// the production server (`runtime::Server::bind`) builds its router
 /// through this same function.
 pub fn build_health_router(
     readiness: Arc<ReadinessProbe>,

@@ -255,8 +255,9 @@ Weighted split-conformal [@tibshirani2019covariateshift] takes, for each test pa
 the quantile of the calibration nonconformity where calibration paper $i$ holds mass
 $w_i / (\sum_j w_j + w_{\text{test}})$ and the test paper's own weight sits at $+\infty$;
 with every weight one, that is exactly the marginal $\lceil (n+1)(1-\alpha) \rceil$-th
-smallest. `shift.score_coverage` is that one routine, so the two passes differ
-**only** in the weights. Its guarantee is **in expectation over the calibration
+smallest. The engine's `conformalize` takes the ratios as `weights` (one per
+calibration paper) and `test_weights` (one per test paper), so the marginal and the
+weighted pass are the same call and differ **only** in the weights. Its guarantee is **in expectation over the calibration
 draw**, and one draw of a few hundred papers swings coverage by several points
 either way — so we measure both passes over many draws, the way the theorem states
 them.
@@ -268,18 +269,27 @@ GAMMA, DRAWS = 3.0, 200
 rng = np.random.default_rng(0)
 
 
+def ratio(idx):
+    # The exact test-to-calibration likelihood ratio, 1 / π(s).
+    return (1 + np.exp(GAMMA * shift_axis[idx])).tolist()
+
+
 def draw():
     order = rng.permutation(len(nc))
     test_idx, pool_idx = order[: len(nc) // 2], order[len(nc) // 2 :]
     kept = rng.random(len(pool_idx)) < 1 / (1 + np.exp(GAMMA * shift_axis[pool_idx]))
     cal_idx = pool_idx[kept]
-    weights = shift.Weights(
-        cal=1 + np.exp(GAMMA * shift_axis[cal_idx]),
-        test=1 + np.exp(GAMMA * shift_axis[test_idx]),
+    cal = (scores.cal_scores[cal_idx].tolist(), scores.cal_labels[cal_idx].tolist())
+    test = scores.cal_scores[test_idx].tolist()
+    marginal = db.conformalize(*cal, test, alpha=alpha, score="aps")
+    weighted = db.conformalize(
+        *cal, test, alpha=alpha, score="aps",
+        weights=ratio(cal_idx), test_weights=ratio(test_idx),
     )
-    marginal = shift.score_coverage(nc[cal_idx], nc[test_idx], weights=None, alpha=alpha)
-    weighted = shift.score_coverage(nc[cal_idx], nc[test_idx], weights=weights, alpha=alpha)
-    return marginal, weighted, nc[cal_idx].mean() - nc[test_idx].mean()
+    labels = scores.cal_labels[test_idx]
+    covered = [float(np.mean([y in s for y, s in zip(labels, sets)]))
+               for sets in (marginal, weighted)]
+    return *covered, nc[cal_idx].mean() - nc[test_idx].mean()
 
 
 marginal_covs, weighted_covs, lean = np.array([draw() for _ in range(DRAWS)]).T
@@ -305,11 +315,10 @@ one draw can land on either side of 0.90 — the guarantee never promised otherw
 `small` scale the calibration pool is a few dozen papers, so the average is noisier
 still, and the restore is asserted as the full-scale finding.
 
-Note these are **client-local numpy** computations. The engine's `conformalize*`
-surface is the **marginal** one (valid under exchangeability); Mondrian / weighted
-conformal is not an OSS Python lever — the weighting here is the consumer's
-client-side construction, exactly where the conformal doctrine places the cohort
-choice.
+Both passes are the engine's `conformalize`; the weighted one only adds `weights=` and
+`test_weights=`. The engine *applies* the ratios. *Estimating* them is the caller's:
+here they are exact by construction, and on real data a caller estimates them, as the
+keystone does with its neighbourhood density ratio.
 
 The session's work is done, so it is closed. An embedded engine holds its catalog until
 `close()` returns, which is why `close()` comes before anything removes the directory the
@@ -332,5 +341,5 @@ db.close()
 > shift, positively correlated with the score, on which marginal under-covers and the
 > weighted restore [@tibshirani2019covariateshift] is real. Together they are the complete statement —
 > neither half alone is the theorem. A graph-aware, productionized version of the governed
-> cohort is out of scope here [@huang2023cfgnn]; the OSS Python surface exposes the
-> marginal `conformalize*` and leaves the cohort/weight choice to you.
+> cohort is out of scope here [@huang2023cfgnn]; `conformalize*` applies the cohort
+> (`groups=`) or the weights (`weights=`) you hand it and leaves choosing them to you.

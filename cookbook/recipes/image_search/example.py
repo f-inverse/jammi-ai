@@ -4,12 +4,6 @@ Run with `python cookbook/recipes/image_search/example.py`, or a step at a time
 as a notebook: each `# %%` cell is one step.
 """
 
-# %% [markdown]
-# The encoder is an OpenCLIP checkpoint from the Hugging Face Hub, LAION's
-# CLIP ViT-B/32, downloaded on first use (about 600 MB) and cached. Any
-# OpenCLIP-format model id, or a local directory as `local:<path>`, works the
-# same way.
-
 # %%
 import json
 import tempfile
@@ -19,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
-from jammi.errors import TrainingError
+from jammi.errors import JobFailed
 from jammi_cookbook import fixtures
 
 IMAGE_CORPUS_DIR = fixtures.path("tiny_image_corpus")
@@ -80,14 +74,14 @@ print(f"top-{results.num_rows} for q_circle: {results.column('image_id').to_pyli
 # %% [markdown]
 # ## Measure retrieval quality
 #
-# The golden set holds a held-out query image per family and the corpus images
+# The ground truth holds a held-out query image per family and the corpus images
 # of that family. A `query_image` (binary) column in place of `query_text` is
 # what switches `eval_embeddings` to image queries. Each family has four
 # drawings in the corpus, so a random ranking would recall one in four at k=5.
 
 # %%
 query_ids, query_images, relevant_ids = [], [], []
-for q in json.loads(fixtures.path("tiny_image_golden.json").read_text()):
+for q in json.loads(fixtures.path("tiny_image_relevance.json").read_text()):
     image_bytes = (IMAGE_CORPUS_DIR / q["query_image"]).read_bytes()
     for rid in q["relevant_ids"]:
         query_ids.append(q["query_id"])
@@ -101,11 +95,11 @@ pq.write_table(
             "relevant_id": pa.array(relevant_ids, type=pa.utf8()),
         }
     ),
-    home / "golden.parquet",
+    home / "truth.parquet",
 )
-db.add_source("golden", url=str(home / "golden.parquet"), format="parquet")
+db.add_source("truth", url=str(home / "truth.parquet"), format="parquet")
 
-metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
 for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
     value = metrics["aggregate"][key]
     assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
@@ -152,12 +146,13 @@ db.add_source("triplets", url=str(home / "image_triplets.parquet"), format="parq
 # %% [markdown]
 # ## Adapt the vision tower
 #
-# A non-empty `target_modules` puts LoRA inside the vision transformer itself:
-# `in_proj` is its fused query-key-value projection and `c_fc` the MLP's first
-# linear, so the tower's own representation moves. (The audio recipe shows the
-# other mode: an empty list trains a projection head on a frozen tower.) The
-# adapted model is registered under the image task, so `search` resolves it as
-# an image encoder.
+# A fine-tune puts LoRA inside the vision transformer itself — on its fused
+# query-key-value projection `in_proj` when it names no sites. Here
+# `target_modules` adds `c_fc`, the MLP's first linear, so more of the tower's
+# own representation moves. (The audio recipe also shows `encoder="frozen"`,
+# which trains a projection head on a frozen tower instead.) The adapted model
+# is registered under the image task, so `search` resolves it as an image
+# encoder.
 
 # %%
 job = db.fine_tune(
@@ -230,7 +225,7 @@ refused = db.fine_tune(
 )
 try:
     refused.wait()
-except TrainingError as error:
+except JobFailed as error:
     message = str(error)
     print(f"refused: {message}")
     assert "q_proj" in message, f"the refusal must echo the submitted selector: {message}"

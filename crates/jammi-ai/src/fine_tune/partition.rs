@@ -113,17 +113,17 @@ impl PartitionSpec {
         rule: PartitionRule,
     ) -> jammi_db::error::Result<Self> {
         if world == 0 {
-            return Err(jammi_db::error::JammiError::FineTune(format!(
+            return Err(jammi_db::error::JammiError::Internal(format!(
                 "PartitionSpec::for_gang: world must be >= 1, got {world}"
             )));
         }
         if rank >= world {
-            return Err(jammi_db::error::JammiError::FineTune(format!(
+            return Err(jammi_db::error::JammiError::Internal(format!(
                 "PartitionSpec::for_gang: rank {rank} must be < world {world}"
             )));
         }
         if batch == 0 {
-            return Err(jammi_db::error::JammiError::FineTune(
+            return Err(jammi_db::error::JammiError::Internal(
                 "PartitionSpec::for_gang: batch must be >= 1, got 0".into(),
             ));
         }

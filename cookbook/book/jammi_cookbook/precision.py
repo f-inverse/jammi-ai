@@ -45,16 +45,21 @@ class Corpus:
         return [row[0] for row in self.exact]
 
 
-def session(work: Path, storage_precision: str, oversample: int | None, extra: str = ""):
-    """A fresh engine whose tables are stamped at ``storage_precision`` — and at
-    a table-default ``oversample`` when one is given; ``None`` leaves the key out,
-    so the precision's own default applies. ``extra`` lines join
+def config_text(storage_precision: str, oversample: int | None, extra: str = "") -> str:
+    """The engine configuration that stamps new tables at ``storage_precision`` —
+    and at a table-default ``oversample`` when one is given; ``None`` leaves the
+    key out, so the precision's own default applies. ``extra`` lines join
     ``[embedding.ann]``."""
-    config = Path(tempfile.mkdtemp(dir=work)) / "jammi.toml"
     body = f'[embedding.ann]\nstorage_precision = "{storage_precision}"\n'
     if oversample is not None:
         body += f"oversample = {oversample}\n"
-    config.write_text(body + extra)
+    return body + extra
+
+
+def session(work: Path, storage_precision: str, oversample: int | None, extra: str = ""):
+    """A fresh engine opened with :func:`config_text`'s configuration."""
+    config = Path(tempfile.mkdtemp(dir=work)) / "jammi.toml"
+    config.write_text(config_text(storage_precision, oversample, extra))
     return jammi.connect(f"file://{tempfile.mkdtemp(dir=work)}", config=str(config))
 
 

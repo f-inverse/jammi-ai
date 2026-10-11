@@ -108,7 +108,7 @@ job.wait()
 
 > **Windows** is not yet supported due to a dependency on POSIX memory-mapping APIs.
 
-## Running the OSS server
+## Running the server
 
 For deployments that need a long-running Flight SQL + gRPC service rather than an embedded library, the workspace ships a Docker image:
 
@@ -129,7 +129,7 @@ public network until a terminator or reverse proxy is put in front of it.
 
 For GPU-accelerated inference, pull the CUDA variant `ghcr.io/f-inverse/jammi-ai-server-cu12:latest` and run it with `--gpus all` on a host with the NVIDIA Container Toolkit — `:latest` is the newest `v*` release; pin an exact `:X.Y.Z` tag for a reproducible deploy.
 
-The OSS server is single-tenant — the deployer's network is the auth boundary. See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) for the full guide.
+See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) for the full guide, and [Scope a Session to a Tenant](https://f-inverse.github.io/jammi-ai/multi-tenant.html) for how a session's tenant is bound.
 
 ## Documentation
 

@@ -55,6 +55,7 @@ rejected rather than meta-trained into memorisation.
 # extern crate jammi_encoders;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+# use jammi_ai::jobs::JobResult;
 # use jammi_ai::pipeline::context_predictor::{
 #     ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
 # };
@@ -84,9 +85,11 @@ let spec = ContextPredictorTrainConfig {
 // queued job and returns a handle immediately; a worker claims it, re-samples
 // the episodic meta-dataset from the spec, trains it, and registers the model.
 let job = session.train_context_predictor("patents", &spec).await?;
-job.wait().await?; // block until a worker drives the job to completion
-let model_id = job.model_id(); // the spec's `model_id`, now registered
-# let _ = model_id;
+// Block until a worker drives the job to completion; its result names the
+// model it registered — the spec's `model_id`.
+if let JobResult::Model { model_id, .. } = job.wait().await? {
+    println!("registered {model_id}");
+}
 # Ok(()) }
 ```
 
@@ -187,24 +190,26 @@ quantile head wraps with CQR over its lower/upper quantiles.
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::pipeline::context_predictor::{ConformalLevers, ServedContextPredictor};
+# use jammi_ai::pipeline::context_predictor::ServedContextPredictor;
+# use jammi_ai::predict::{Calibration, TestPoint};
 # async fn ex(
 #     session: &Arc<InferenceSession>,
 #     served: &ServedContextPredictor,
 #     held_out: &[(String, f64)], // (target_key, observed y), tasks disjoint from training
 # ) -> jammi_db::error::Result<()> {
 // Calibrate at 90% nominal coverage on the held-out set. `Marginal` is plain
-// split-conformal; governance may instead supply a Mondrian cohort or weights.
+// split-conformal; a caller may instead supply Mondrian cohorts or weights.
 let wrap = session
-    .calibrate_context_predictor_conformal(served, held_out, 0.1, ConformalLevers::Marginal)
+    .calibrate_context_predictor_conformal(served, held_out, 0.1, Calibration::Marginal)
     .await?;
 
-// Serving: turn a prediction into a coverage-guaranteed interval. The optional
-// group is the test point's Mondrian cohort (`None` for a marginal wrap).
+// Serving: turn a prediction into a coverage-guaranteed interval. The test point
+// brings what the calibration reads: nothing for a marginal wrap, its cohort
+// for a Mondrian one, its likelihood ratio for a weighted one.
 let dist = session
     .predict_with_context_predictor(served, "US-7654321")
     .await?;
-let (lower, upper) = wrap.interval(&dist, None)?;
+let (lower, upper) = wrap.interval(&dist, TestPoint::Exchangeable)?;
 # let _ = (lower, upper);
 # Ok(()) }
 ```
@@ -224,7 +229,7 @@ right tool.
 
 ```python
 # Submits a durable training job and returns its handle; an embedded worker
-# runs it. Block on `.wait()`, then read `.model_id` for the registered model.
+# runs it. Block on `.wait()`; `.output_model_id` names the registered model.
 job = db.train_context_predictor(
     "patents",
     key_column="_row_id",
@@ -236,7 +241,7 @@ job = db.train_context_predictor(
     context_k=32,
 )
 job.wait()
-model_id = job.model_id
+model_id = job.output_model_id
 
 dist = db.predict_with_context_predictor(
     model_id, source="patents", target_key="US-7654321"

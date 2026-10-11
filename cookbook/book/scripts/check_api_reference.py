@@ -86,9 +86,9 @@ REQUIRED: dict[str, list[str]] = {
     "cancel_job": ["job_id"],
     "list_workers": [],
     "prune_jobs": [],
-    "eval_embeddings": ["source", "golden_source"],
-    "eval_compare": ["embedding_tables", "source", "golden_source", "exact"],
-    "eval_inference": ["model", "source", "columns", "task", "golden_source", "label_column"],
+    "eval_embeddings": ["source", "ground_truth"],
+    "eval_compare": ["embedding_tables", "source", "ground_truth", "exact"],
+    "eval_inference": ["model", "source", "columns", "task", "ground_truth", "label_column"],
     "eval_per_query": [],
     # model catalog (control plane)
     "list_models": [],
@@ -141,7 +141,7 @@ REQUIRED: dict[str, list[str]] = {
     "conformalize": ["alpha", "score"],
     "conformalize_interval": ["alpha"],
     "conformalize_cqr": ["alpha"],
-    "eval_calibration": ["source", "golden_source", "shape"],
+    "eval_calibration": ["source", "ground_truth", "shape"],
     # provenance channels
     "register_channel": ["priority", "columns"],
     "add_channel_columns": ["columns"],

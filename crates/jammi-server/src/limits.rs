@@ -53,7 +53,7 @@
 //! tonic's own `.max_decoding_message_size(limits.max_message_bytes)` — the
 //! public chain's services in `crate::runtime::assemble_grpc_chain`, and
 //! the internal `peer_bind` listener's `PeerService` and `GangService` in
-//! `crate::runtime::OssServer::bind` — off the ONE `[server.limits]` value,
+//! `crate::runtime::Server::bind` — off the ONE `[server.limits]` value,
 //! so the invariant quantifies over listeners, not over the public chain
 //! alone: a message of exactly `max_message_bytes` encoded bytes decodes on
 //! any of them, and one of `max_message_bytes + 1` is refused naming that
@@ -99,7 +99,7 @@
 //! below). It carries no per-RPC stream budget of its own here, though: it
 //! never actually reaches [`MethodClassLayer`] in production —
 //! `GangService` is mounted only on the internal `[server] peer_bind`
-//! listener, which `crate::runtime::OssServer::bind` builds deliberately
+//! listener, which `crate::runtime::Server::bind` builds deliberately
 //! LAYER-FREE (no `[server.limits]` stack, no tenant layer — see that
 //! module's own doc, "no `[server.limits]` stack — its clients are
 //! coordinators (I-PEER)"). [`MethodClass::call`] still classifies its path
@@ -162,7 +162,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use jammi_db::config::LimitsConfig;
-use jammi_db::error::JammiError;
 use pin_project::pin_project;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
@@ -235,15 +234,8 @@ pub const DRAINING_MESSAGE: &str = "server draining";
 pub const MESSAGE_SIZE_LABEL: &str = "message_size";
 
 /// Build a refused [`Response`]: a [`tonic::Status`] carrying `code` and
-/// `message`, with the typed wire detail attached via
-/// [`jammi_wire::attach_error_detail`] — reusing [`JammiError::Config`] to
-/// carry the message. A limits refusal has no dedicated `JammiError` variant
-/// of its own (widening that shared enum for a mechanism-only wire
-/// annotation is outside this module's reach); the client-observable `code`,
-/// `message`, and `bound` label are what a caller actually reads and matches
-/// on, and those cross the wire faithfully either way. The response is then
-/// stamped with `bound` so [`RefusalStatusLayer`] counts it under the right
-/// label.
+/// `message` ([`limits_status`]), stamped with `bound` so
+/// [`RefusalStatusLayer`] counts it under the right label.
 fn refuse<ResBody: Default>(code: Code, message: String, bound: RefusedBound) -> Response<ResBody> {
     let status = limits_status(code, message);
     let mut response = status.into_http::<ResBody>();
@@ -251,15 +243,15 @@ fn refuse<ResBody: Default>(code: Code, message: String, bound: RefusedBound) ->
     response
 }
 
-/// Build the [`Status`] a limits refusal or timeout carries, with the typed
-/// wire detail attached exactly like every other refusal in this module
-/// (reusing [`JammiError::Config`] — see [`refuse`]'s doc for why). Shared so
-/// [`refuse`]'s edge refusal and [`PermitBody::Deadlined`]'s mid-stream
-/// timeout trailer both carry the SAME typed annotation a decoding client
-/// reads identically whichever path fired.
+/// Build the [`Status`] a limits refusal or timeout carries: its code and
+/// message, and no engine detail — the server's admission refused the call
+/// before any engine verb ran, so a decoding client reads it by its code
+/// ([`jammi_wire::error_from_status`] gives a `JammiError::Remote` of the
+/// code's class). Shared so [`refuse`]'s edge refusal and
+/// [`PermitBody::Deadlined`]'s mid-stream timeout trailer carry the same
+/// status whichever path fired.
 fn limits_status(code: Code, message: String) -> Status {
-    let engine_err = JammiError::Config(message.clone());
-    jammi_wire::attach_error_detail(code, message, &engine_err)
+    Status::new(code, message)
 }
 
 /// The message [`PermitBody::Deadlined`] closes a header-less stream with once

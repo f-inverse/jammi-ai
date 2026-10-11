@@ -2,6 +2,12 @@
 
 pub mod child;
 pub mod fleet;
+
+/// The echo service tests mount on the engine's gRPC chain the way a
+/// downstream mounts its own services: it reports what a call carried.
+pub mod echo {
+    tonic::include_proto!("jammi.test.echo");
+}
 pub mod meta_dataset;
 pub mod source_universe;
 
@@ -289,7 +295,7 @@ pub fn unique_suffix() -> String {
 /// floor: both hand out a port from the kernel's ephemeral range, the same
 /// range every outgoing `connect()` this test process makes (Postgres,
 /// the S3 store) draws its local port from, so the port can be taken by a client
-/// socket before the child binds it ("failed to bind OSS server listeners:
+/// socket before the child binds it ("failed to bind server listeners:
 /// Address already in use"). Ports come from a range BELOW every platform's
 /// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
 /// time, and never handed out twice by this process.
@@ -340,7 +346,7 @@ pub fn workspace_root() -> PathBuf {
 
 /// Root of the test fixtures directory (at workspace root). Houses the
 /// generic test-only fixtures (`patents.parquet`, `assignees.csv`,
-/// `golden_relevance.csv`, the tiny random-weight encoders —
+/// `relevance.csv`, the tiny random-weight encoders —
 /// `tiny_bert/`, `tiny_modernbert*/`, `tiny_open_clip/`, `htsat_clap_*/` — that
 /// exercise every model path offline, and the fine-tune bench's held-out split,
 /// `finetune_heldout/`).
@@ -350,7 +356,7 @@ pub fn fixtures_dir() -> PathBuf {
 
 /// Root of the cookbook fixtures directory (at workspace root). Houses the
 /// small data files the cookbook's recipes and chapters read
-/// (`tiny_corpus.parquet`, `tiny_golden.json`, `tiny_labels.csv`,
+/// (`tiny_corpus.parquet`, `tiny_relevance.json`, `tiny_labels.csv`,
 /// `tiny_pairs.csv`, the image and audio corpora). Integration tests that
 /// exercise the same data read from here, so the cookbook and the tests
 /// share one source of truth.

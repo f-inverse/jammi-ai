@@ -15,7 +15,7 @@ pub struct EvalRunRecord {
     /// reference a real `models(model_id)` row — the catalog enforces the FK.
     pub model_id: Option<String>,
     pub source_id: String,
-    pub golden_source: String,
+    pub ground_truth: String,
     pub k: Option<i32>,
     pub metrics_json: String,
     pub status: String,
@@ -41,7 +41,7 @@ pub struct PerQueryEvalRecord {
 }
 
 const SELECT_COLS: &str =
-    "run_id, eval_type, model_id, source_id, golden_source, k, metrics, status, created_at";
+    "run_id, eval_type, model_id, source_id, ground_truth, k, metrics, status, created_at";
 
 const PER_QUERY_SELECT_COLS: &str = "eval_run_id, query_id, cohorts, metrics";
 
@@ -60,7 +60,7 @@ fn parse_eval_row(row: &Row<'_>) -> std::result::Result<EvalRunRecord, BackendEr
         eval_type: row.get("eval_type")?,
         model_id: row.try_get("model_id")?,
         source_id: row.get("source_id")?,
-        golden_source: row.try_get("golden_source")?.unwrap_or_default(),
+        ground_truth: row.try_get("ground_truth")?.unwrap_or_default(),
         k: row.try_get::<i32>("k")?,
         metrics_json: row.get("metrics")?,
         status: row.try_get("status")?.unwrap_or_else(|| "completed".into()),
@@ -80,14 +80,14 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "eval_runs")?;
                     tx.execute(
                         "INSERT INTO eval_runs \
-                         (run_id, eval_type, model_id, source_id, golden_source, k, metrics, status, created_at, tenant_id) \
+                         (run_id, eval_type, model_id, source_id, ground_truth, k, metrics, status, created_at, tenant_id) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                         &[
                             SqlValue::TextOwned(r.eval_run_id),
                             SqlValue::TextOwned(r.eval_type),
                             SqlValue::from(r.model_id),
                             SqlValue::TextOwned(r.source_id),
-                            SqlValue::TextOwned(r.golden_source),
+                            SqlValue::TextOwned(r.ground_truth),
                             SqlValue::from(r.k.map(|v| v as i64)),
                             SqlValue::TextOwned(r.metrics_json),
                             SqlValue::TextOwned(r.status),

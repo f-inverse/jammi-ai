@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Assert the OSS engine workspace depends on no proprietary code.
+"""Assert the engine workspace links nothing from outside crates.io.
 
-The open-core boundary is one-way: a consumer may depend on Jammi; Jammi
-depends on no consumer. Every crate resolved into the shippable OSS surface is
-either a local workspace path or comes from the public crates.io registry —
-nothing from a path outside the workspace, a git source, or a private/alternate
-registry is allowed to be linked into the engine. A proprietary crate is caught
-by its SOURCE, not its name.
+References point one way: a consumer may depend on Jammi; Jammi depends on no
+consumer. Every crate resolved into the shippable engine is either a local
+workspace path or comes from the public crates.io registry — nothing from a path
+outside the workspace, a git source, or a private/alternate registry is linked
+into the engine. A crate is caught by its SOURCE, not its name.
 
 Scope is the NORMAL-dependency closure of the workspace default-members (the
-shippable OSS crates). jammi-python (a PyO3 cdylib built via maturin, not
+shippable crates). jammi-python (a PyO3 cdylib built via maturin, not
 `cargo build --workspace`) is excluded by construction because it is not a
 default-member; dev- and build-dependencies are excluded by walking only normal
-edges, because a git-sourced dev tool is not proprietary runtime linkage and
-must not produce a false positive. If runtime-vs-dev coverage ever needs to
+edges, because a git-sourced dev tool is not runtime linkage and must not
+produce a false positive. If runtime-vs-dev coverage ever needs to
 widen, the closure walk below is the single place to adjust.
 
 The enforcement is by SOURCE, which names no consumer: any crate with a non-null
 source that is not the crates.io registry is an offender. This catches any git,
 path-outside-workspace, or private/alternate-registry crate regardless of its
-name — a proprietary crate is identified by where it comes from, not by what it
-is called. (Local workspace path crates carry a null source and are allowed.)
+name — a crate is identified by where it comes from, not by what it is
+called. (Local workspace path crates carry a null source and are allowed.)
 
 Input is `cargo metadata --format-version 1` JSON on stdin. Any offender prints
 a `::error::` annotation naming the crate and its source, and the script exits
@@ -100,17 +99,17 @@ def main() -> int:
 
     for name, source in source_offenders:
         print(
-            f"::error::OSS engine dep closure contains a non-public / path / git "
-            f"/ private-registry crate '{name}' (source: {source}) — the OSS "
-            f"edition links only local workspace paths and crates.io; Jammi "
-            f"depends on no consumer"
+            f"::error::engine dep closure contains a non-public / path / git "
+            f"/ private-registry crate '{name}' (source: {source}) — the engine "
+            f"links only local workspace paths and crates.io; Jammi depends on "
+            f"no consumer"
         )
 
     if source_offenders:
         return 1
 
     print(
-        f"OK: {len(closure)} crates in the OSS default-members normal-dep "
+        f"OK: {len(closure)} crates in the default-members normal-dep "
         f"closure; all are local workspace paths or crates.io"
     )
     return 0

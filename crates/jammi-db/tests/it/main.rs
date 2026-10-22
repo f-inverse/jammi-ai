@@ -17,6 +17,8 @@ mod domain_hash_prefix_free_gate;
 mod ephemeral;
 mod eval_per_query;
 mod exact_search;
+#[cfg(feature = "live-postgres-tests")]
+mod federated_filters;
 mod foundation;
 mod freshness;
 mod gang_instance_freshness;

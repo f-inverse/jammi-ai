@@ -7,15 +7,29 @@
 //! federates only the maximal sub-plans that call none: a node that calls an
 //! engine function — anywhere beneath it, subqueries included — stays in the
 //! engine, and each of its inputs is federated on its own.
+//!
+//! A filter the engine runs above a federated sub-plan stays in the engine
+//! too: [`FederatedScanPlanner`] plans each sub-plan behind a
+//! [`FederatedScanExec`], which takes no filter from the plan above it.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::Statistics;
+use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::execution::context::SessionState;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_federation::FederationOptimizerRule;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::execution_plan::CardinalityEffect;
+use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 
 /// The names of the functions a session installed: what no remote can run.
 #[derive(Debug, Default)]
@@ -114,6 +128,136 @@ impl OptimizerRule for LocalFunctionFederation {
 
     fn name(&self) -> &str {
         "local_function_federation"
+    }
+}
+
+/// Federation's physical planner, each federated sub-plan it plans behind a
+/// [`FederatedScanExec`].
+pub(crate) struct FederatedScanPlanner(FederatedPlanner);
+
+impl fmt::Debug for FederatedScanPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FederatedScanPlanner")
+    }
+}
+
+impl FederatedScanPlanner {
+    pub(crate) fn new() -> Self {
+        Self(FederatedPlanner::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl ExtensionPlanner for FederatedScanPlanner {
+    async fn plan_extension(
+        &self,
+        planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let federated = self
+            .0
+            .plan_extension(
+                planner,
+                node,
+                logical_inputs,
+                physical_inputs,
+                session_state,
+            )
+            .await?;
+        Ok(federated.map(|plan| Arc::new(FederatedScanExec::new(plan)) as _))
+    }
+}
+
+/// A federated sub-plan, which takes no filter from the plan above it.
+///
+/// Physical filter pushdown offers a `FilterExec`'s predicate to the plan
+/// beneath it and drops the `FilterExec` once that plan takes it.
+/// `datafusion-federation`'s `VirtualExecutionPlan` takes every predicate
+/// offered and hands it to its SQL executor, and the executor
+/// `datafusion-table-providers` gives a database source ignores it: the
+/// predicate is neither in the statement the database runs nor applied to the
+/// rows it returns. A filter the engine runs above a federated sub-plan — one
+/// on a database column in a query that also joins a file — would be lost
+/// that way. Above this node it stays in its `FilterExec`: a plan takes part
+/// in filter pushdown only by opting in, and this one does not. It is
+/// otherwise its input, unchanged.
+#[derive(Debug)]
+pub(crate) struct FederatedScanExec {
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl FederatedScanExec {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self { input }
+    }
+}
+
+impl DisplayAs for FederatedScanExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "FederatedScanExec")
+    }
+}
+
+impl ExecutionPlan for FederatedScanExec {
+    fn name(&self) -> &str {
+        "FederatedScanExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children.swap_remove(0))))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.input.execute(partition, context)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    /// No filter from above reaches the federated sub-plan (see the type's
+    /// doc); written out, not left to the default, so a change to the
+    /// default cannot quietly change it.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
     }
 }
 

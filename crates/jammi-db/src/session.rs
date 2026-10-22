@@ -15,7 +15,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
-use datafusion_federation::FederatedPlanner;
 
 use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
@@ -24,7 +23,7 @@ use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
-use crate::federation::{EngineFunctions, LocalFunctionFederation};
+use crate::federation::{EngineFunctions, FederatedScanPlanner, LocalFunctionFederation};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
@@ -1293,7 +1292,7 @@ impl QueryPlanner for JammiQueryPlanner {
         session_state: &SessionState,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         DefaultPhysicalPlanner::with_extension_planners(vec![
-            Arc::new(FederatedPlanner::new()),
+            Arc::new(FederatedScanPlanner::new()),
             Arc::new(MaterializationPlanner),
             Arc::new(RowRewritePlanner),
         ])

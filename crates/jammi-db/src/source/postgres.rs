@@ -2,6 +2,8 @@
 //!
 //! Gated behind the `postgres` feature flag.
 
+mod money;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,7 +22,8 @@ const SCHEMA: &str = "public";
 /// Create table providers for all public tables in a Postgres database.
 ///
 /// Returns `(table_name, Arc<dyn TableProvider>)` pairs with filter/projection/limit
-/// pushdown handled automatically by `datafusion-table-providers`.
+/// pushdown handled automatically by `datafusion-table-providers`. A table
+/// with a `money` column is read through [`money`], as the amounts it holds.
 pub async fn create_postgres_tables(
     source_id: &str,
     connection: &SourceConnection,
@@ -36,8 +39,22 @@ pub async fn create_postgres_tables(
         .map_err(|e| failed(format!("Failed to connect to Postgres: {e}")))?;
     let pool = Arc::new(pool);
     let factory = PostgresTableFactory::new(Arc::clone(&pool));
-    database::schema_tables(source_id, pool.as_ref(), SCHEMA, |table| {
-        factory.table_provider(table)
+    let money_columns = money::money_columns(&pool, SCHEMA)
+        .await
+        .map_err(|e| failed(format!("listing the `money` columns of `{SCHEMA}`: {e}")))?;
+    let scale = if money_columns.is_empty() {
+        0
+    } else {
+        money::money_scale(&pool)
+            .await
+            .map_err(|e| failed(format!("reading the database's money scale: {e}")))?
+    };
+    let (pool, factory, money_columns) = (&pool, &factory, &money_columns);
+    database::schema_tables(source_id, pool.as_ref(), SCHEMA, move |table| async move {
+        match money_columns.get(table.table()) {
+            Some(money) => money::table_provider(pool, table, money, scale).await,
+            None => factory.table_provider(table).await,
+        }
     })
     .await
 }

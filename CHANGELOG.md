@@ -6,6 +6,15 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **A MySQL source is sent only what MySQL reads as the engine does.** Federation wrote queries
+  in SQL that MySQL accepted and answered with another meaning: `a || b` as a logical OR,
+  `DATE - DATE` as a subtraction of `YYYYMMDD` numbers, an ascending sort with NULLs first,
+  `=` on strings by a case-insensitive collation; `date_trunc` failed. A MySQL table now carries
+  an allowlist of the plan nodes and expressions MySQL runs with the engine's meaning; a node
+  outside it is not federated and runs in the engine over the rows MySQL returns, and the scan
+  takes no filter or sort it was not handed by that list. Counts, numeric filters and limits are
+  still answered by MySQL.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

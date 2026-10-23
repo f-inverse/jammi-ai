@@ -6,19 +6,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::mysql::sql_table::MySQLTable;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use secrecy::SecretString;
 use url::Url;
 
 use crate::error::{JammiError, Result};
+use crate::federation::remote::{self, Remote};
 use crate::source::{database, SourceConnection};
 
 /// The URL parameter that sets the TLS mode: the driver's own, which
 /// `mysql_async` does not parse.
 const TLS_MODE: &str = "sslmode";
 
-/// Create table providers for all tables of the MySQL database the URL names.
+/// Create table providers for all tables of the MySQL database the URL names,
+/// each handing MySQL only what it runs with the engine's meaning ([`remote`]).
 pub async fn create_mysql_tables(
     source_id: &str,
     connection: &SourceConnection,
@@ -33,9 +35,15 @@ pub async fn create_mysql_tables(
         .await
         .map_err(|e| failed(format!("Failed to connect to MySQL: {e}")))?;
     let pool = Arc::new(pool);
-    let factory = MySQLTableFactory::new(Arc::clone(&pool));
-    database::schema_tables(source_id, pool.as_ref(), &schema, |table| {
-        factory.table_provider(table)
+    let pool = &pool;
+    database::schema_tables(source_id, pool.as_ref(), &schema, |table| async move {
+        let mysql = Arc::new(MySQLTable::new(pool, table.clone()).await?);
+        Ok(remote::table_provider(
+            Remote::MySql,
+            table,
+            Arc::clone(&mysql) as _,
+            mysql,
+        ))
     })
     .await
 }

@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use super::backend::{BackendKind, SqlValue};
 use super::jobs_repo::WorkerState;
 use super::lease::{stale_before_clause, CanonicalStampColumn};
+use super::status::{JobKind, JobKinds};
 use crate::error::{JammiError, Result};
 use crate::storage::{BuilderSeeds, Scheme, StorageUrl};
 
@@ -387,7 +388,7 @@ fn canonical_local_root(root: &str, path: &str) -> Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceFact {
     /// The device kind.
-    pub kind: String,
+    pub kind: jammi_datafusion::ComputeDeviceKind,
     /// The device's ordinal within `kind`.
     pub ordinal: u32,
 }
@@ -427,12 +428,8 @@ pub fn decode_devices_json(raw: &str, row_label: &str) -> Vec<DeviceFact> {
 /// process succeeded with, or the facts an in-flight upsert is writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFacts {
-    /// The `,`-joined kind set this worker claims — the ONLY encoding: no
-    /// "otherwise producer-encoded" alternative exists.
-    /// `Catalog::list_gang_members` splits this column on `,` and trims
-    /// each token (see `Catalog::list_gang_members`, where the row's `kinds`
-    /// is matched against `listing.kind`).
-    pub kinds: String,
+    /// The kinds this worker claims.
+    pub kinds: JobKinds,
     /// The claim loop's lifecycle state at this instant.
     pub state: WorkerState,
     /// This `[worker]` process's own device inventory —
@@ -643,9 +640,8 @@ pub(crate) fn live_with_root_clause(
 /// inventory).
 #[derive(Debug, Clone, Copy)]
 pub struct GangListing<'a> {
-    /// The `workers.kinds` token this listing matches (a whole,
-    /// comma-split, trimmed token — never a substring).
-    pub kind: &'a str,
+    /// The kind a member must claim.
+    pub kind: JobKind,
     /// This caller's own `instance_id` — excluded from the result.
     pub self_instance: &'a str,
     /// This caller's own root — the [`MemberRoot`] its registration
@@ -759,12 +755,12 @@ mod tests {
         let reg = InstanceRegistration::new("i1", None, None, None, None);
         assert!(reg.worker_snapshot().is_none());
         reg.set_worker(Some(WorkerFacts {
-            kinds: "fine_tune".into(),
+            kinds: JobKinds::new(vec![JobKind::FineTune]),
             state: WorkerState::Claiming,
             devices: vec![],
         }));
         let snap = reg.worker_snapshot().unwrap();
-        assert_eq!(snap.kinds, "fine_tune");
+        assert_eq!(snap.kinds, JobKinds::new(vec![JobKind::FineTune]));
         assert_eq!(snap.state, WorkerState::Claiming);
         reg.set_worker(None);
         assert!(reg.worker_snapshot().is_none());

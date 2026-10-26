@@ -43,10 +43,7 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
         &job_id,
         None,
         "a worker claims the job and marks it running before the lease window closes",
-        |r| {
-            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
-                && r.claimed_by.is_some()
-        },
+        |r| r.status == jammi_db::catalog::status::JobStatus::Running && r.claimed_by.is_some(),
     )
     .await
     .claimed_by
@@ -70,7 +67,7 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
         &job_id,
         None,
         "the killed worker's job is reclaimed by a survivor and completed",
-        |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+        |r| r.status == jammi_db::catalog::status::JobStatus::Completed,
     )
     .await;
 

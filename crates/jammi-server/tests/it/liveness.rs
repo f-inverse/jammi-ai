@@ -1,6 +1,6 @@
 //! `/healthz` liveness — 503 within one heartbeat of the lease
 //! keeper thread dying, 503 when the claim loop task panics, 200 while
-//! draining (with `/readyz` 503) — off a full `OssServer`.
+//! draining (with `/readyz` 503) — off a full `Server`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
+use jammi_server::runtime::{Server, ServerError, ShutdownOutcome};
 use jammi_test_utils::{fixture, fixture_url, test_config};
 use tokio::sync::watch;
 
@@ -34,7 +34,7 @@ fn config(dir: &std::path::Path) -> JammiConfig {
 }
 
 async fn serve(cfg: JammiConfig) -> Served {
-    let server = OssServer::new(cfg).await.expect("OssServer::new");
+    let server = Server::new(cfg).await.expect("Server::new");
     let session = server.session();
     let bound = server.bind().await.expect("bind");
     let health_addr = bound.health_addr();
@@ -189,7 +189,7 @@ async fn healthz_stays_200_while_draining() {
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while handle.status().await.unwrap() != "running" {
+    while handle.status().await.unwrap() != jammi_db::catalog::status::JobStatus::Running {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

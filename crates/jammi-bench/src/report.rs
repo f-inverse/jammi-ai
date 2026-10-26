@@ -1090,8 +1090,9 @@ pub struct TrainRunPayload {
     /// 0-based index of the final epoch this run reached (`epochs - 1`).
     pub final_epoch: usize,
     pub held_out_count: usize,
-    /// The trainer's own `final_loss` — a minimum over epochs, for
-    /// comparison only; the leg's `held_out_example_mean` is the datum.
+    /// The monitored loss (`early_stopping_metric`) at the final epoch, on
+    /// either arm — for comparison only; the leg's `held_out_example_mean`
+    /// is the datum.
     pub final_loss_diagnostic: f64,
     /// Wall seconds inside the training loop, over every epoch.
     pub train_run_wall_s: f64,

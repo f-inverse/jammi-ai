@@ -501,7 +501,7 @@ mod tests {
     /// The adapter metadata a checkpoint carries beside its weights; opaque
     /// to everything a resume reads.
     fn fixture_config() -> serde_json::Value {
-        serde_json::json!({ "lora_rank": 2, "head_layers": ["projection"] })
+        serde_json::json!({ "encoder": "frozen", "head": { "lora_rank": 2 } })
     }
 
     /// The typed refusal `load_bundle` makes of `bundle` written to a dir,

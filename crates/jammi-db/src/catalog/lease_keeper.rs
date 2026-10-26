@@ -374,7 +374,7 @@ impl LeaseKeeper {
                     Ok(rt) => rt,
                     Err(e) => {
                         error!(error = %e, "lease keeper: failed to build its dedicated runtime");
-                        let _ = ready_tx.send(Err(JammiError::Config(format!(
+                        let _ = ready_tx.send(Err(JammiError::Internal(format!(
                             "lease keeper: failed to build its dedicated runtime: {e}"
                         ))));
                         return;
@@ -442,7 +442,7 @@ impl LeaseKeeper {
                 });
             })
             .map_err(|e| {
-                JammiError::Config(format!("lease keeper: failed to spawn its thread: {e}"))
+                JammiError::Internal(format!("lease keeper: failed to spawn its thread: {e}"))
             })?;
 
         match ready_rx.await {

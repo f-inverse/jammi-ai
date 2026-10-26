@@ -10,7 +10,7 @@ or to track regressions on the same one.
 
 ## API surface exercised
 
-- `Session.eval_inference(*, model, source, columns, task, golden_source, label_column)`
+- `Session.eval_inference(*, model, source, columns, task, ground_truth, label_column)`
 
 The returned dict carries `aggregate` (tagged by `"task"` — `"ner"` for
 this recipe) with `precision`, `recall`, `f1`, and `per_type` (one
@@ -22,7 +22,7 @@ where `predicted` and `gold` are entity-span lists, each tagged
 The `task` argument is the string form of the inference task — `"ner"`
 here. For classification, see `../eval_inference/`.
 
-## Golden source shape
+## Ground-truth source shape
 
 `eval_inference` with `task="ner"` requires a registered source with
 these columns — one row per entity span (multiple spans on the same

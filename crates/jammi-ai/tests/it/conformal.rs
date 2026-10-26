@@ -18,7 +18,7 @@ use rand::{Rng, SeedableRng};
 
 use jammi_ai::evidence::conformal::{channel_spec, contribution, ConformalOutput};
 use jammi_ai::evidence::merge_channels;
-use jammi_ai::predict::{ClassScore, ConformalModel, IntervalScore};
+use jammi_ai::predict::{Calibration, ClassScore, ConformalModel, Estimate, Estimates, TestPoint};
 use jammi_db::catalog::Catalog;
 use jammi_db::ChannelId;
 use jammi_numerics::calibration::coverage;
@@ -67,13 +67,24 @@ fn classification_coverage_meets_nominal_on_exchangeable_split() {
         let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
         let (test_probs, test_labels) = synthetic_classification(&mut rng, 5000, n_classes);
 
-        let model = ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, alpha)
-            .unwrap();
+        let model = ConformalModel::classification(
+            &cal_probs,
+            &cal_labels,
+            ClassScore::Aps,
+            &Calibration::Marginal,
+            alpha,
+        )
+        .unwrap();
 
         let hits: Vec<bool> = test_probs
             .iter()
             .zip(test_labels.iter())
-            .map(|(row, &y)| model.predict_set(row, None).unwrap().contains(&y))
+            .map(|(row, &y)| {
+                model
+                    .predict_set(row, TestPoint::Exchangeable)
+                    .unwrap()
+                    .contains(&y)
+            })
             .collect();
         let cov = coverage(&hits).unwrap();
 
@@ -94,11 +105,9 @@ fn absolute_residual_interval_coverage_meets_nominal() {
     let cal_pred = vec![0.0; 3000];
     let cal_obs: Vec<f64> = (0..3000).map(|_| dist.sample(&mut rng)).collect();
     let model = ConformalModel::regression(
-        &cal_pred,
-        &[],
-        &[],
+        Estimates::Points(&cal_pred),
         &cal_obs,
-        IntervalScore::AbsoluteResidual,
+        &Calibration::Marginal,
         alpha,
     )
     .unwrap();
@@ -106,7 +115,11 @@ fn absolute_residual_interval_coverage_meets_nominal() {
     let test_obs: Vec<f64> = (0..5000).map(|_| dist.sample(&mut rng)).collect();
     let (lower, upper): (Vec<f64>, Vec<f64>) = test_obs
         .iter()
-        .map(|_| model.predict_interval(0.0, 0.0, 0.0, None).unwrap())
+        .map(|_| {
+            model
+                .predict_interval(Estimate::Point(0.0), TestPoint::Exchangeable)
+                .unwrap()
+        })
         .unzip();
     let cov = jammi_numerics::calibration::interval_coverage(&lower, &upper, &test_obs).unwrap();
     assert!(
@@ -228,12 +241,21 @@ fn sets_are_deterministic_across_independent_calibrations() {
     let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 1500, 5);
     let (test_probs, _) = synthetic_classification(&mut rng, 300, 5);
 
-    let a = ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
-    let b = ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
+    let calibrate = || {
+        ConformalModel::classification(
+            &cal_probs,
+            &cal_labels,
+            ClassScore::Aps,
+            &Calibration::Marginal,
+            0.1,
+        )
+        .unwrap()
+    };
+    let (a, b) = (calibrate(), calibrate());
     for row in &test_probs {
         assert_eq!(
-            a.predict_set(row, None).unwrap(),
-            b.predict_set(row, None).unwrap()
+            a.predict_set(row, TestPoint::Exchangeable).unwrap(),
+            b.predict_set(row, TestPoint::Exchangeable).unwrap()
         );
     }
 }

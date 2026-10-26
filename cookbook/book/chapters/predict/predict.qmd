@@ -156,11 +156,14 @@ schemes = {
     for size in SIZES
 }
 
+weights = schemes[keystone.NEIGHBOURS]
+wt_intervals = db.conformalize_interval(
+    cal_mean.tolist(), cal_year.tolist(), test_mean.tolist(), alpha=ALPHA,
+    weights=weights.cal.tolist(), test_weights=weights.test.tolist(),
+)
+wt_reg_cov = float(np.mean([lo <= y <= hi for y, (lo, hi) in zip(test_year, wt_intervals)]))
 cal_resid = np.abs(cal_mean - cal_year)
 test_resid = np.abs(test_mean - test_year)
-wt_reg_cov = shift.score_coverage(
-    cal_resid, test_resid, weights=schemes[keystone.NEIGHBOURS], alpha=ALPHA
-)
 reg_corr = float(np.corrcoef(cal_resid, likeness)[0, 1])
 print(f"cal  mean |y−ŷ|: {cal_resid.mean():.3f}")
 print(f"test mean |y−ŷ|: {test_resid.mean():.3f}")
@@ -264,28 +267,26 @@ distributed alike in the two eras, and the diagnostic below shows why it is.
 ### Weighting has nothing to repair
 
 Weighted split-conformal (Tibshirani et al. 2019) reweights the calibration
-nonconformity toward the test era. To compare apples to apples,
-`shift.aps_coverage` is one local APS routine used for both the marginal and the
-weighted pass, so the only difference between them is the weights. Its
-admission rule excludes the class that crosses q̂, a hair more conservative
-than the engine's, so its marginal sits a little above the engine's; the
-comparison that matters is between its own two passes.
+nonconformity toward the test era. It is the same `conformalize` call with
+`weights=` (one ratio per calibration paper) and `test_weights=` (one per test
+paper) — here the neighbourhood density ratios estimated above, over three
+neighbourhood sizes. With every ratio one it is exactly the marginal pass, so
+the only difference between the two is the weights.
 
 ```{python}
-local_cov, _ = shift.aps_coverage(
-    scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
-    weights=None, alpha=ALPHA,
-)
 deltas = {}
 for size, weights in schemes.items():
-    cov, set_size = shift.aps_coverage(
-        scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
-        weights=weights, alpha=ALPHA,
+    weighted = db.conformalize(
+        scores.cal_scores.tolist(), scores.cal_labels.tolist(), scores.test_scores.tolist(),
+        alpha=ALPHA, score="aps",
+        weights=weights.cal.tolist(), test_weights=weights.test.tolist(),
     )
-    deltas[size] = cov - local_cov
-    print(f"weighted (knn-{size:<2}) coverage {cov:.3f}   Δ {cov - local_cov:+.4f}   "
+    cov = float(np.mean([y in s for y, s in zip(scores.test_labels, weighted)]))
+    set_size = float(np.mean([len(s) for s in weighted]))
+    deltas[size] = cov - marg_cov
+    print(f"weighted (knn-{size:<2}) coverage {cov:.3f}   Δ {cov - marg_cov:+.4f}   "
           f"set size {set_size:.2f}")
-print(f"local marginal coverage          {local_cov:.3f}")
+print(f"marginal coverage                {marg_cov:.3f}")
 ```
 
 ```{python}
@@ -333,15 +334,19 @@ spans what the test era needs (the conformal chapter builds that case).
 If a client-side reweight cannot restore the year interval's coverage, what does?
 A **governed, time-aware (or simply larger) calibration cohort**: choose the
 calibration set so it is exchangeable with the deployment era — a Mondrian or
-time-stratified cohort the consumer owns. The engine exposes the **marginal**
-`conformalize*`; the cohort is the consumer's choice, exactly where the doctrine
-puts it.
+time-stratified cohort the consumer owns. `conformalize*` applies whatever cohort
+(`groups=`/`test_groups=`) or weights it is handed; which calibration set is
+exchangeable with the deployment era is the consumer's choice, exactly where the
+doctrine puts it.
 
 ```{python}
 db.close()
 ```
 
-## Bridge note (a signature chapter — deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **A prediction is a context-conditioned posterior; honest coverage needs the
 > consumer to own the cohort.** The context predictor is a Neural Process
@@ -353,5 +358,4 @@ db.close()
 > al. 2023). The textbook remedy is
 > weighted / stratified conformal (Tibshirani et al. 2019; NAPS, Clarkson et al.
 > 2023; CF-GNN, Huang et al. 2023) — but it repairs only a shift the
-> nonconformity score can *see*. This is the tier with **no monograph and no
-> Neptune analogue** — the moat.
+> nonconformity score can *see*.

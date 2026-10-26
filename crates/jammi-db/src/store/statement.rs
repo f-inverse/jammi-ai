@@ -117,9 +117,9 @@ impl ResultStore {
             Some(_) if statement.or_replace => Some(name),
             Some(_) if statement.if_not_exists => return Ok(None),
             Some(_) => {
-                return Err(JammiError::Catalog(format!(
-                    "result table '{name}' already exists"
-                )))
+                return Err(JammiError::ResultTableExists {
+                    table: name.to_string(),
+                })
             }
             None => None,
         };
@@ -322,13 +322,63 @@ impl RefusedStatement {
                 format!("`{node}`: select the keys first, then name them in the predicate"),
             ),
         };
-        JammiError::Schema {
-            table: self.name.clone(),
-            column: "<statement>".to_string(),
-            expected,
-            actual,
+        JammiError::InvalidArgument {
+            argument: "sql".into(),
+            reason: format!("`{}`: {actual}; expected {expected}", self.name),
         }
     }
+}
+
+/// A statement the caller wrote that does not parse, or plans to an error of
+/// its own text — a syntax error, an unknown column or function, a type that
+/// does not fit — is the caller's `sql` argument; any other planning failure
+/// keeps its own error.
+fn caller_sql(e: DataFusionError) -> DataFusionError {
+    match e.find_root() {
+        DataFusionError::SQL(..) | DataFusionError::Plan(_) | DataFusionError::SchemaError(..) => {
+            DataFusionError::External(Box::new(JammiError::InvalidArgument {
+                argument: "sql".into(),
+                reason: e.to_string(),
+            }))
+        }
+        _ => e,
+    }
+}
+
+/// The first relation `statement` reads or writes that the session's catalogs
+/// do not hold — the condition DataFusion's planner refuses as a bare "table
+/// not found" string — so a planning failure over a missing relation surfaces
+/// as the [`JammiError::NotFound`] every other missing thing is. The relation
+/// a `CREATE TABLE` / `CREATE VIEW` defines is not one it needs to exist.
+async fn missing_relation(
+    state: &SessionState,
+    statement: &DfStatement,
+) -> DfResult<Option<String>> {
+    let defined = match statement {
+        DfStatement::Statement(inner) => match inner.as_ref() {
+            SqlStatement::CreateTable(create) => Some(create.name.to_string()),
+            SqlStatement::CreateView(view) => Some(view.name.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let catalog = &state.config_options().catalog;
+    for reference in state.resolve_table_references(statement)? {
+        if defined.as_deref() == Some(reference.to_string().as_str()) {
+            continue;
+        }
+        let resolved = reference
+            .clone()
+            .resolve(&catalog.default_catalog, &catalog.default_schema);
+        let present = match state.schema_for_ref(reference.clone()) {
+            Ok(schema) => schema.table(&resolved.table).await?.is_some(),
+            Err(_) => false,
+        };
+        if !present {
+            return Ok(Some(reference.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// The one identifier a result-table statement names, or the refusal.
@@ -348,20 +398,29 @@ impl StatementClass {
     /// whether its rows come from a join.
     pub async fn plan(state: &SessionState, sql: &str) -> DfResult<Self> {
         let dialect = state.config().options().sql_parser.dialect;
-        let plan = match state.sql_to_statement(sql, &dialect)? {
+        let statement = state.sql_to_statement(sql, &dialect).map_err(caller_sql)?;
+        let planned = match statement.clone() {
             DfStatement::Statement(statement) => match *statement {
                 SqlStatement::Update(update) if update.from.is_some() => {
-                    plan_update_from(state, update).await?
+                    plan_update_from(state, update).await
                 }
                 statement => {
                     state
                         .statement_to_plan(DfStatement::Statement(Box::new(statement)))
-                        .await?
+                        .await
                 }
             },
-            statement => state.statement_to_plan(statement).await?,
+            statement => state.statement_to_plan(statement).await,
         };
-        Self::of(plan)
+        match planned {
+            Ok(plan) => Self::of(plan),
+            Err(refusal) => Err(match missing_relation(state, &statement).await? {
+                Some(name) => DataFusionError::External(Box::new(JammiError::NotFound(
+                    crate::error::Missing::Relation { name },
+                ))),
+                None => caller_sql(refusal),
+            }),
+        }
     }
 
     /// Classify `plan`, the logical plan of one statement.
@@ -836,7 +895,7 @@ impl StoreStatementExec {
         match statement {
             StoreStatement::CreateTableAs(create) => {
                 let [query] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(input).map_err(|inputs| {
-                    JammiError::Other(format!(
+                    JammiError::Internal(format!(
                         "CreateResultTable has exactly one input, got {}",
                         inputs.len()
                     ))
@@ -1052,11 +1111,12 @@ mod tests {
                 "{sql}: the refusal names the node: {node}"
             );
             match refused.error() {
-                JammiError::Schema { table, actual, .. } => {
-                    assert_eq!(table, name);
-                    assert!(actual.contains(node_kind), "{actual}");
+                JammiError::InvalidArgument { argument, reason } => {
+                    assert_eq!(argument, "sql");
+                    assert!(reason.contains(name), "{reason}");
+                    assert!(reason.contains(node_kind), "{reason}");
                 }
-                other => panic!("expected Schema, got {other:?}"),
+                other => panic!("expected InvalidArgument, got {other:?}"),
             }
         }
     }
@@ -1167,16 +1227,19 @@ mod tests {
         }
     }
 
-    /// A refused statement's error is typed and names the table.
+    /// A refused statement is the caller's `sql` argument, naming the table.
     #[test]
-    fn a_refusal_is_the_typed_schema_error_naming_the_table() {
+    fn a_refusal_is_an_invalid_sql_argument_naming_the_table() {
         let refused = RefusedStatement {
             name: "u".into(),
             reason: RefusalReason::CreateTableWithoutQuery,
         };
         match refused.error() {
-            JammiError::Schema { table, .. } => assert_eq!(table, "u"),
-            other => panic!("expected Schema, got {other:?}"),
+            JammiError::InvalidArgument { argument, reason } => {
+                assert_eq!(argument, "sql");
+                assert!(reason.contains("`u`"), "{reason}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 }

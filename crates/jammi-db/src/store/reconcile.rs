@@ -522,12 +522,15 @@ impl ResultStore {
     /// yet a hazard the way it is the moment `apply=true` would act on it.
     fn check_apply_grace(&self, opts: &ReconcileOptions) -> Result<()> {
         if opts.apply && opts.grace < self.lease.lease() {
-            return Err(JammiError::Config(format!(
-                "reconcile: apply=true requires grace ({:?}) >= the configured lease duration \
+            return Err(JammiError::InvalidArgument {
+                argument: "grace".into(),
+                reason: format!(
+                    "({:?}) >= the configured lease duration \
                  ({:?}); a shorter grace could reclaim a live writer's still-in-progress bytes",
-                opts.grace,
-                self.lease.lease()
-            )));
+                    opts.grace,
+                    self.lease.lease()
+                ),
+            });
         }
         Ok(())
     }

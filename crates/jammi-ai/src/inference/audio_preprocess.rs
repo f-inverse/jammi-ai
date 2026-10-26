@@ -54,17 +54,26 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| JammiError::Inference(format!("Failed to probe audio container: {e}")))?;
+        .map_err(|e| JammiError::InvalidArgument {
+            argument: "content".into(),
+            reason: format!("Failed to probe audio container: {e}"),
+        })?;
 
     let mut format = probed.format;
     let track = format
         .default_track()
-        .ok_or_else(|| JammiError::Inference("Audio stream has no decodable track".into()))?;
+        .ok_or_else(|| JammiError::InvalidArgument {
+            argument: "content".into(),
+            reason: "Audio stream has no decodable track".into(),
+        })?;
     let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| JammiError::Inference(format!("Failed to construct audio decoder: {e}")))?;
+        .map_err(|e| JammiError::InvalidArgument {
+            argument: "content".into(),
+            reason: format!("Failed to construct audio decoder: {e}"),
+        })?;
 
     let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
     let mut samples: Vec<f32> = Vec::new();
@@ -81,9 +90,10 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
                 break
             }
             Err(e) => {
-                return Err(JammiError::Inference(format!(
-                    "Failed to read audio packet: {e}"
-                )))
+                return Err(JammiError::InvalidArgument {
+                    argument: "content".into(),
+                    reason: format!("Failed to read audio packet: {e}"),
+                })
             }
         };
         if packet.track_id() != track_id {
@@ -94,9 +104,10 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
             Ok(d) => d,
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
             Err(e) => {
-                return Err(JammiError::Inference(format!(
-                    "Failed to decode audio packet: {e}"
-                )))
+                return Err(JammiError::InvalidArgument {
+                    argument: "content".into(),
+                    reason: format!("Failed to decode audio packet: {e}"),
+                })
             }
         };
 
@@ -117,14 +128,16 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<DecodedAudio> {
     }
 
     if sample_rate == 0 {
-        return Err(JammiError::Inference(
-            "Audio stream reported no sample rate".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "content".into(),
+            reason: "Audio stream reported no sample rate".into(),
+        });
     }
     if samples.is_empty() {
-        return Err(JammiError::Inference(
-            "Audio stream decoded to zero samples".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "content".into(),
+            reason: "Audio stream decoded to zero samples".into(),
+        });
     }
 
     Ok(DecodedAudio {
@@ -216,8 +229,9 @@ where
         .par_iter()
         .zip(row_ids.par_iter())
         .map(|(item, &row)| {
-            decode_audio_bytes(item.as_ref()).map_err(|e| {
-                JammiError::Inference(format!("Failed to decode audio at row {row}: {e}"))
+            decode_audio_bytes(item.as_ref()).map_err(|e| JammiError::InvalidArgument {
+                argument: "content".into(),
+                reason: format!("Failed to decode audio at row {row}: {e}"),
             })
         })
         .collect())
@@ -346,51 +360,69 @@ impl ClapFrontendConfig {
     ///   band for real audio.
     pub fn validate(&self) -> Result<()> {
         if self.n_mels == 0 {
-            return Err(JammiError::Inference(format!(
-                "Audio n_mels (feature_size) must be positive, got {}",
-                self.n_mels
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio n_mels (feature_size) must be positive, got {}",
+                    self.n_mels
+                ),
+            });
         }
         if self.sample_rate == 0 {
-            return Err(JammiError::Inference(
-                "Audio sample_rate (sampling_rate) must be positive, got 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "Audio sample_rate (sampling_rate) must be positive, got 0".into(),
+            });
         }
         if self.fft_window_size < 2 || !self.fft_window_size.is_power_of_two() {
-            return Err(JammiError::Inference(format!(
-                "Audio fft_window_size ({}) must be a power of two >= 2 for the radix-2 FFT",
-                self.fft_window_size
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio fft_window_size ({}) must be a power of two >= 2 for the radix-2 FFT",
+                    self.fft_window_size
+                ),
+            });
         }
         if self.hop_length == 0 {
-            return Err(JammiError::Inference(
-                "Audio hop_length must be positive, got 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "Audio hop_length must be positive, got 0".into(),
+            });
         }
         if self.max_length_s == 0 {
-            return Err(JammiError::Inference(
-                "Audio max_length_s must be positive, got 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "Audio max_length_s must be positive, got 0".into(),
+            });
         }
         if !self.frequency_min.is_finite() || self.frequency_min < 0.0 {
-            return Err(JammiError::Inference(format!(
-                "Audio frequency_min must be finite and non-negative, got {}",
-                self.frequency_min
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio frequency_min must be finite and non-negative, got {}",
+                    self.frequency_min
+                ),
+            });
         }
         if !self.frequency_max.is_finite() || self.frequency_max <= self.frequency_min {
-            return Err(JammiError::Inference(format!(
-                "Audio frequency_max ({}) must be finite and greater than frequency_min ({})",
-                self.frequency_max, self.frequency_min
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio frequency_max ({}) must be finite and greater than frequency_min ({})",
+                    self.frequency_max, self.frequency_min
+                ),
+            });
         }
         let nyquist = self.sample_rate as f64 / 2.0;
         if self.frequency_max > nyquist {
-            return Err(JammiError::Inference(format!(
-                "Audio frequency_max ({}) must not exceed the Nyquist frequency ({nyquist}) \
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio frequency_max ({}) must not exceed the Nyquist frequency ({nyquist}) \
                  implied by sample_rate ({})",
-                self.frequency_max, self.sample_rate
-            )));
+                    self.frequency_max, self.sample_rate
+                ),
+            });
         }
         Ok(())
     }
@@ -496,9 +528,10 @@ pub fn preprocess_clap_fusion_indexed(
     // `par_chunks_mut` writer and `clap_fusion_row` stay untouched).
     for (clip, &row) in clips.iter().zip(row_ids.iter()) {
         if clip.samples.is_empty() {
-            return Err(JammiError::Inference(format!(
-                "CLAP fusion row {row}: clip has zero samples"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "content".into(),
+                reason: format!("CLAP fusion row {row}: clip has zero samples"),
+            });
         }
         // Named separately from the "rounds to zero samples" refusal below:
         // `clip.sample_rate == 0` makes `resampled_len`'s ratio `to_rate /
@@ -508,18 +541,22 @@ pub fn preprocess_clap_fusion_indexed(
         // `sample_rate == 0`, but this is a defense-in-depth check for any
         // other `DecodedAudio` producer (including this module's own tests).
         if clip.sample_rate == 0 {
-            return Err(JammiError::Inference(format!(
-                "CLAP fusion row {row}: clip has sample_rate 0"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "content".into(),
+                reason: format!("CLAP fusion row {row}: clip has sample_rate 0"),
+            });
         }
         if resampled_len(clip.samples.len(), clip.sample_rate, config.sample_rate) == 0 {
-            return Err(JammiError::Inference(format!(
-                "CLAP fusion row {row}: resampling {} sample(s) from {} Hz to {} Hz rounds to \
+            return Err(JammiError::InvalidArgument {
+                argument: "content".into(),
+                reason: format!(
+                    "CLAP fusion row {row}: resampling {} sample(s) from {} Hz to {} Hz rounds to \
                  zero samples",
-                clip.samples.len(),
-                clip.sample_rate,
-                config.sample_rate
-            )));
+                    clip.samples.len(),
+                    clip.sample_rate,
+                    config.sample_rate
+                ),
+            });
         }
     }
 

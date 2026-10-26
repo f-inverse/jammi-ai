@@ -75,7 +75,7 @@ async fn mixed_tenant_queue_completes_each_under_its_own_scope() {
             job_id,
             Some(tenant),
             "the tenant's job reaches `completed`",
-            |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
+            |r| r.status == jammi_db::catalog::status::JobStatus::Completed,
         )
         .await;
         assert_eq!(

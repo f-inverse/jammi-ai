@@ -89,21 +89,27 @@ impl BlockReadout {
             }),
             PropagationOutput::WeightedSum { weights } => {
                 if weights.len() != blocks {
-                    return Err(JammiError::Config(format!(
-                        "a weighted-sum readout over {hops} hops reads blocks 0..={hops} and \
+                    return Err(JammiError::InvalidArgument {
+                        argument: "hop_weights".into(),
+                        reason: format!(
+                            "a weighted-sum readout over {hops} hops reads blocks 0..={hops} and \
                          needs {blocks} weights, got {}",
-                        weights.len()
-                    )));
+                            weights.len()
+                        ),
+                    });
                 }
                 if let Some(bad) = weights.iter().find(|w| !w.is_finite()) {
-                    return Err(JammiError::Config(format!(
-                        "a weighted-sum readout weight must be finite, got {bad}"
-                    )));
+                    return Err(JammiError::InvalidArgument {
+                        argument: "hop_weights".into(),
+                        reason: format!("a weighted-sum readout weight must be finite, got {bad}"),
+                    });
                 }
                 if weights.iter().all(|w| *w == 0.0) {
-                    return Err(JammiError::Config(
-                        "a weighted-sum readout whose weights are all zero reads no block".into(),
-                    ));
+                    return Err(JammiError::InvalidArgument {
+                        argument: "hop_weights".into(),
+                        reason: "a weighted-sum readout whose weights are all zero reads no block"
+                            .into(),
+                    });
                 }
                 Ok(Self {
                     weights: weights.iter().map(|w| (*w != 0.0).then_some(*w)).collect(),
@@ -401,12 +407,21 @@ mod tests {
         let refuse = |weights: Vec<f64>, hops| {
             BlockReadout::lower(&PropagationOutput::WeightedSum { weights }, hops).unwrap_err()
         };
-        assert!(matches!(refuse(vec![], 0), JammiError::Config(_)));
-        assert!(matches!(refuse(vec![1.0, 1.0], 2), JammiError::Config(_)));
-        assert!(matches!(refuse(vec![0.0, 0.0], 1), JammiError::Config(_)));
+        assert!(matches!(
+            refuse(vec![], 0),
+            JammiError::InvalidArgument { .. }
+        ));
+        assert!(matches!(
+            refuse(vec![1.0, 1.0], 2),
+            JammiError::InvalidArgument { .. }
+        ));
+        assert!(matches!(
+            refuse(vec![0.0, 0.0], 1),
+            JammiError::InvalidArgument { .. }
+        ));
         assert!(matches!(
             refuse(vec![1.0, f64::NAN], 1),
-            JammiError::Config(_)
+            JammiError::InvalidArgument { .. }
         ));
     }
 }

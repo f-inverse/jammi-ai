@@ -1,5 +1,5 @@
 //! `PeerService` on `[server] peer_bind` — the owner side of the distributed
-//! data plane, over the real third listener (`OssServer::bind`).
+//! data plane, over the real third listener (`Server::bind`).
 //!
 //! - `peer_bind` unset → no third listener; set → bound, ephemeral.
 //! - `SegmentSearch` over `peer_bind` byte-equals the
@@ -118,7 +118,7 @@ async fn peer_bind_unset_means_no_third_listener() {
     cfg.server.health_listen = "127.0.0.1:0".into();
     cfg.server.flight_listen = "127.0.0.1:0".into();
     assert_eq!(cfg.server.peer_bind, None);
-    let server = jammi_server::runtime::OssServer::new(cfg).await.unwrap();
+    let server = jammi_server::runtime::Server::new(cfg).await.unwrap();
     let engine = server.session();
     let bound = server.bind().await.unwrap();
     assert_eq!(bound.peer_addr(), None, "unset = not mounted = single node");

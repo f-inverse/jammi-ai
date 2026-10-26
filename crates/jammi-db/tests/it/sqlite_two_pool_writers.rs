@@ -39,7 +39,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind, JobPhase};
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_test_utils::make_test_session;
@@ -155,7 +155,7 @@ async fn seed(catalog: &Catalog) {
         catalog
             .submit_job(SubmitJobParams {
                 job_id: &format!("job-{n}"),
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("base-model::1"),
@@ -175,7 +175,7 @@ async fn worker_loop(catalog: Arc<Catalog>, run: Arc<Run>, who: String, started:
     let mut spin: u64 = 0;
     while !run.done(started) {
         run.tick();
-        let claimed = match catalog.claim_next(&who, &["fine_tune"], LEASE).await {
+        let claimed = match catalog.claim_next(&who, &[JobKind::FineTune], LEASE).await {
             Ok(c) => c,
             Err(err) => {
                 run.record(&who, "claim_next", err.to_string());
@@ -194,9 +194,20 @@ async fn worker_loop(catalog: Arc<Catalog>, run: Arc<Run>, who: String, started:
                     return;
                 }
                 run.tick();
-                let phase = format!(r#"{{"who": "{who}", "spin": {spin}}}"#);
+                let progress = jammi_db::catalog::jobs_repo::JobProgress {
+                    phase: JobPhase::Training,
+                    done: Some(spin),
+                    total: None,
+                };
                 if let Err(err) = catalog
-                    .progress_job(&job.job_id, &who, job.attempts, None, None, Some(&phase))
+                    .progress_job(
+                        jammi_db::catalog::result_repo::JobAttempt {
+                            job_id: &job.job_id,
+                            instance_id: &who,
+                            attempts: job.attempts,
+                        },
+                        progress,
+                    )
                     .await
                 {
                     run.record(&who, "progress_job", err.to_string());

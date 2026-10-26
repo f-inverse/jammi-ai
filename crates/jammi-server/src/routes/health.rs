@@ -96,7 +96,7 @@ pub async fn readyz(State(probe): State<Arc<ReadinessProbe>>) -> Response {
 ///
 /// Encodes the shared [`MetricsRegistry`] into the standard Prometheus
 /// exposition format. The registry's lifetime is owned by the running
-/// `OssServer`; the route only reads from it.
+/// `Server`; the route only reads from it.
 pub async fn metrics(State(registry): State<Arc<MetricsRegistry>>) -> Response {
     registry.refresh_gauges();
     let metric_families = registry.inner.gather();
@@ -369,7 +369,7 @@ impl MetricsRegistry {
     /// ([`PeerFailureCounters`], owned by the engine's result store) into this
     /// registry as `jammi_peer_search_failures_total{reason}`, read at scrape.
     /// ADDITIVE: `prometheus::Registry::register` takes `&self`, so this is
-    /// called on the shared registry after construction (by `OssServer::new`,
+    /// called on the shared registry after construction (by `Server::new`,
     /// with the session's counters) and [`Self::new`]'s arity is unchanged.
     /// Installing twice on one registry is the usual name-collision error.
     /// (Named `install_*` like [`ResultStore::install_result_schema`]: it
@@ -388,7 +388,7 @@ impl MetricsRegistry {
     /// [`jammi_db::index::SegmentPlacement::ring_empty_metrics`]) into this
     /// registry as `jammi_placement_ring_empty_total`, read at scrape.
     /// ADDITIVE, same contract as [`Self::install_peer_failures`]. The
-    /// caller (`OssServer::new`) only calls this when
+    /// caller (`Server::new`) only calls this when
     /// `ResultStore::placement_ring_empty_metrics` returns `Some` — a
     /// deployment running the default `AllLocal` placement registers
     /// nothing, so its `/metrics` output is unchanged.

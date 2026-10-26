@@ -1,9 +1,9 @@
-//! Evaluation: task-specific metrics against golden datasets.
+//! Evaluation: task-specific metrics against ground-truth dataset.
 //!
 //! This module computes retrieval (recall@k, MRR, nDCG) and classification
 //! (accuracy, F1) metrics. Results are recorded in the catalog for comparison.
 
-pub mod golden;
+pub mod ground_truth;
 // The eval *runner* drives the embedded engine (it loads models and runs
 // inference/search), so it rides the `local` feature. The report shapes,
 // `EvalTask`, and `EvalCalibrationShape` are transport-neutral and live on the

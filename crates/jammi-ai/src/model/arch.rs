@@ -201,28 +201,33 @@ impl EncoderFamily {
     }
 
     /// Classify from a saved adapter's recorded
-    /// [`AdapterConfig::model_type`](jammi_lora::AdapterConfig::model_type).
-    ///
-    /// TOTAL by design, and the ONE place in this crate where an unknown
-    /// string still becomes `Bert`. That coercion is not a shortcut: a
-    /// BERT-tower adapter carries whatever `model_type` string its base
-    /// config happened to declare (including the BERT aliases `roberta` / `camembert` /
-    /// `xlm-roberta`, and anything else that parsed as a `BertConfig`). Those
-    /// adapters were trained on a BERT tower and must keep loading onto one;
-    /// refusing them here would strand shipped artifacts.
-    ///
-    /// The refusal that DOES matter is a CROSS-family one — an `open_clip`
-    /// adapter on a CLAP base, a `clap_audio_model` adapter on a BERT base —
-    /// and that is exactly what comparing this against [`Self::from_config`]
-    /// catches, because the three non-text ids map to their own families
-    /// here.
-    pub fn from_adapter_model_type(model_type: &str) -> Self {
-        match model_type {
-            "open_clip" => Self::OpenClip,
-            "clap_audio_model" => Self::ClapAudio,
-            "distilbert" => Self::DistilBert,
-            "modernbert" => Self::ModernBert,
-            _ => Self::Bert,
+    /// [`AdapterConfig::model_type`](jammi_lora::AdapterConfig::model_type) —
+    /// the inverse of [`Self::adapter_model_type`], and `None` for any id it
+    /// never writes. The serving load seam compares the result against the
+    /// base's [`Self::from_config`], so an adapter of another family, or of
+    /// none, is refused rather than installed somewhere it was not trained.
+    pub fn from_adapter_model_type(model_type: &str) -> Option<Self> {
+        [
+            Self::Bert,
+            Self::DistilBert,
+            Self::ModernBert,
+            Self::OpenClip,
+            Self::ClapAudio,
+        ]
+        .into_iter()
+        .find(|family| family.adapter_model_type() == model_type)
+    }
+
+    /// The sites an adapted encoder of this family trains when the request
+    /// names none: its attention's query and value projections, PEFT's own
+    /// default placement — the fused QKV projection where the family fuses
+    /// them (ModernBERT's `Wqkv`, OpenCLIP's `in_proj`).
+    pub fn default_lora_sites(&self) -> &'static [&'static str] {
+        match self {
+            Self::Bert | Self::ClapAudio => &["query", "value"],
+            Self::DistilBert => &["q_lin", "v_lin"],
+            Self::ModernBert => &["Wqkv"],
+            Self::OpenClip => &["in_proj"],
         }
     }
 
@@ -244,22 +249,14 @@ impl EncoderFamily {
         }
     }
 
-    /// Whether this family's checkpoint actually HAS the named tower.
-    ///
-    /// `None` means "unspecified" — the wire form every adapter written
-    /// before `AdapterConfig::tower` existed carries — and is accepted for
-    /// every family so legacy adapters keep loading. A single-tower text
-    /// family additionally accepts an explicit [`Tower::Text`]; it has no
-    /// vision or audio tower to install onto, and saying so is a typed
-    /// refusal rather than a silently-ignored field.
+    /// Whether an adapter naming `tower` installs on this family's
+    /// checkpoint. A single-tower text family's adapter names no tower; an
+    /// OpenCLIP adapter names the text or vision tower it trained, and a CLAP
+    /// adapter the audio tower — the shapes the fine-tune worker writes.
     pub fn has_tower(&self, tower: Option<Tower>) -> bool {
         matches!(
             (self, tower),
-            (_, None)
-                | (
-                    Self::Bert | Self::DistilBert | Self::ModernBert,
-                    Some(Tower::Text)
-                )
+            (Self::Bert | Self::DistilBert | Self::ModernBert, None)
                 | (Self::OpenClip, Some(Tower::Text | Tower::Vision))
                 | (Self::ClapAudio, Some(Tower::Audio))
         )
@@ -449,7 +446,7 @@ mod tests {
         ] {
             assert_eq!(
                 EncoderFamily::from_adapter_model_type(family.adapter_model_type()),
-                family,
+                Some(family),
                 "{} must classify back to its own family",
                 family.adapter_model_type()
             );
@@ -570,43 +567,33 @@ mod tests {
         );
     }
 
-    /// A cross-family adapter id never equals the base's family — the
-    /// comparison the serving load seam refuses on — while every legacy /
-    /// alias text id still lands on `Bert`, so a shipped BERT-family adapter
-    /// keeps loading.
+    /// An id the worker never writes classifies as no family: a config
+    /// alias (`roberta`) or an unknown string is refused at the load seam,
+    /// never coerced onto some family.
     #[test]
-    fn adapter_family_mapping_separates_cross_family_from_legacy_text() {
-        assert_eq!(
-            EncoderFamily::from_adapter_model_type("roberta"),
-            EncoderFamily::Bert
-        );
+    fn an_adapter_id_the_worker_never_writes_has_no_family() {
+        assert_eq!(EncoderFamily::from_adapter_model_type("roberta"), None);
         assert_eq!(
             EncoderFamily::from_adapter_model_type("something-nobody-shipped"),
-            EncoderFamily::Bert
-        );
-        assert_ne!(
-            EncoderFamily::from_adapter_model_type("clap_audio_model"),
-            EncoderFamily::Bert
-        );
-        assert_ne!(
-            EncoderFamily::from_adapter_model_type("open_clip"),
-            EncoderFamily::ClapAudio
+            None
         );
     }
 
-    /// Tower validity is per family, and an absent (legacy) `tower` is valid
-    /// everywhere.
+    /// Tower validity is per family: a text family's adapter names no tower,
+    /// a multi-tower or media family's names the one it installs on.
     #[test]
     fn has_tower_matches_the_checkpoint_structure() {
         assert!(EncoderFamily::Bert.has_tower(None));
-        assert!(EncoderFamily::Bert.has_tower(Some(Tower::Text)));
+        assert!(!EncoderFamily::Bert.has_tower(Some(Tower::Text)));
         assert!(!EncoderFamily::Bert.has_tower(Some(Tower::Vision)));
         assert!(!EncoderFamily::Bert.has_tower(Some(Tower::Audio)));
 
+        assert!(!EncoderFamily::OpenClip.has_tower(None));
         assert!(EncoderFamily::OpenClip.has_tower(Some(Tower::Text)));
         assert!(EncoderFamily::OpenClip.has_tower(Some(Tower::Vision)));
         assert!(!EncoderFamily::OpenClip.has_tower(Some(Tower::Audio)));
 
+        assert!(!EncoderFamily::ClapAudio.has_tower(None));
         assert!(EncoderFamily::ClapAudio.has_tower(Some(Tower::Audio)));
         assert!(!EncoderFamily::ClapAudio.has_tower(Some(Tower::Text)));
     }

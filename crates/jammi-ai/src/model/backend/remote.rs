@@ -203,7 +203,10 @@ impl RemoteModel {
                 Err(e) => return Err(self.refusal(&e.without_url().to_string())),
             };
             if attempt >= self.max_retries {
-                return Err(self.refusal(&format!("{} after {} attempt(s)", retry.0, attempt + 1)));
+                return Err(JammiError::Unavailable {
+                    resource: format!("remote:{} at {}", self.name, self.run.url),
+                    reason: format!("{} after {} attempt(s)", retry.0, attempt + 1),
+                });
             }
             tokio::time::sleep(retry.1.unwrap_or_else(|| backoff(attempt))).await;
             attempt += 1;
@@ -235,7 +238,10 @@ impl RemoteModel {
             .collect()
     }
 
-    /// A refusal naming this model and its endpoint — never a header.
+    /// A refusal naming this model and its endpoint — never a header: a
+    /// request the endpoint refused outright, or an answer it could not have
+    /// meant. An endpoint that stayed unreachable or overloaded through every
+    /// retry is [`JammiError::Unavailable`] instead.
     fn refusal(&self, reason: &str) -> JammiError {
         JammiError::Backend(format!(
             "remote:{} at {}: {reason}",

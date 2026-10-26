@@ -57,15 +57,15 @@ producer and its parameters.
 ## The measurement rail: propagation as a denoiser
 
 The honest test of a low-pass filter is whether it improves a *downstream*
-measurement. `eval_compare` runs the same same-subject retrieval golden (tier
+measurement. `eval_compare` runs the same same-subject retrieval ground truth (tier
 01) against both tables — queries are encoded by the model that produced the
 raw vectors, since propagation keeps their space — and reports each table's
 metrics and the delta against the first.
 
 ```{python}
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 compared = db.eval_compare(
-    embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
+    embedding_tables=[embeddings, propagated], source=arxiv.papers, ground_truth=truth, k=10
 )
 raw, prop = compared["per_table"]
 raw_precision = raw["embedding_eval"]["aggregate"]["precision_at_k"]
@@ -93,7 +93,10 @@ encoder already places most of the 400 papers by subject, and their 1,577
 citations have little to add: the delta sits within noise of zero. What
 propagation buys depends on what the graph knows that the encoder does not.
 
-## Bridge note (a signature chapter — deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **Propagation = one low-pass graph filter = one SGC/APPNP layer = the
 > vector-agg over neighbours.** One equation, three names, one
@@ -116,11 +119,6 @@ propagation buys depends on what the graph knows that the encoder does not.
 
 The same low-pass filter runs on **Air Routes**: the airport embeddings,
 propagated over the declared `route` graph (the flight network), undirected.
-
-> **Neptune-contrast.** Neptune Analytics ships `pageRank`/`degree`/`wcc` as
-> `CALL`s over the Air Routes graph; here, propagation-as-low-pass-filter is a
-> Jammi recipe — the *same* operation over the *same* route graph, expressed as
-> substrate computation.
 
 ```{python}
 air = datasets.air_routes(db)
@@ -148,26 +146,23 @@ benchmark; but the raw→propagated delta over it is a legitimate measured numbe
 
 The evaluation ranks **exactly** (`exact=True`): every vector is scored, as
 `search(exact=True)` scores them, rather than searched through the table's ANN
-index. That matters here. Airport descriptions are short, and at `small` scale the
-tiny encoder knows few of their words, so many airports embed to the same vector,
-and about half the queries have a tie at the tenth place. Among identical
-vectors an exact ranking orders by row key, the same way on every machine; an
-approximate index returns whichever of them its graph walk reaches first, which
-differs from machine to machine, and so would the measured precision.
+index, so the delta below is the propagation's alone and not mixed with what an
+approximate index gives up (the [ANN chapter](../ann-recall/ann-recall.qmd)
+measures that on its own).
 
 ```{python}
 airports = db.sql(
     f"SELECT code, desc, continent FROM {air.airports}.public.{air.airports} "
     "WHERE continent <> ''"
 ).to_pylist()
-air_golden = datasets.same_label_golden(
+air_relevance = datasets.same_label_relevance(
     db, airports, key="code", label="continent", text="desc", queries=200,
-    name="air_continent_golden",
+    name="air_continent_relevance",
 )
 air_compared = db.eval_compare(
     embedding_tables=[air_embeddings, air_propagated],
     source=air.airports,
-    golden_source=air_golden,
+    ground_truth=air_relevance,
     k=10,
     exact=True,
 )

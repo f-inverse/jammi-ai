@@ -1927,8 +1927,8 @@ async fn apply_requires_grace_at_least_the_lease_duration() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, jammi_db::error::JammiError::Config(_)),
-        "a too-short grace under apply=true must be a typed Config refusal, got: {err:?}"
+        matches!(&err, jammi_db::error::JammiError::InvalidArgument { argument, .. } if argument == "grace"),
+        "a too-short grace under apply=true must refuse the grace argument, got: {err:?}"
     );
 
     // apply=false tolerates ANY grace.

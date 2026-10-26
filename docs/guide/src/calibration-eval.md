@@ -35,9 +35,9 @@ calibration points to *also* test inflates coverage — it is the single most
 common conformal/calibration bug. The harness measures exactly the predictions
 you give it; the split discipline is yours.
 
-## Prepare a calibration golden set
+## Prepare a calibration ground truth
 
-A calibration golden set pairs a held-out predictive distribution with its
+A calibration ground truth pairs a held-out predictive distribution with its
 realised `outcome`. Two predictor shapes are supported, each reading different
 columns.
 

@@ -18,7 +18,7 @@ cross-checks every number and draws the diagnostic the aggregate summarizes.
 
 The predictor serves a mean and a standard deviation per paper; we take its
 distributions over the test era and pair each with the realised year.
-`eval_calibration` reads a *golden source* pairing each predictive distribution
+`eval_calibration` reads a *ground-truth source* pairing each predictive distribution
 with its outcome, in the Gaussian schema `(record_id, mean, sd, outcome)`.
 
 ```{python}
@@ -47,23 +47,23 @@ year = {
 y = np.array([float(year[k]) for k in test_ids])
 print(f"test-era predictive distributions: {len(test_ids)}")
 
-golden_path = f"{tempfile.mkdtemp()}/arxiv_calibration_golden.parquet"
+truth_path = f"{tempfile.mkdtemp()}/arxiv_calibration_outcomes.parquet"
 pq.write_table(
-    pa.table({"record_id": test_ids, "mean": mu, "sd": sd, "outcome": y}), golden_path
+    pa.table({"record_id": test_ids, "mean": mu, "sd": sd, "outcome": y}), truth_path
 )
-db.add_source("arxiv_calibration_golden", url=golden_path, format="parquet")
+db.add_source("arxiv_calibration_outcomes", url=truth_path, format="parquet")
 ```
 
 ## The engine's calibration report
 
 `eval_calibration(shape="gaussian")` returns the proper-score headline (`crps`,
 `nll`), the calibration diagnostic (`adaptive_ece`), `sharpness`, and central
-`coverage`. The `golden_source` is addressed by its full catalog path.
+`coverage`. The `ground_truth` is addressed by its full catalog path.
 
 ```{python}
 report = db.eval_calibration(
-    source="arxiv_calibration_golden",
-    golden_source="arxiv_calibration_golden.public.arxiv_calibration_golden",
+    source="arxiv_calibration_outcomes",
+    ground_truth="arxiv_calibration_outcomes.public.arxiv_calibration_outcomes",
     shape="gaussian",
 )
 agg = report["aggregate"]

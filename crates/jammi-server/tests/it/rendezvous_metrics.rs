@@ -2,7 +2,7 @@
 //! observable (`operability.md`, `reference-topologies.md`, the CHANGELOG,
 //! `RendezvousMetrics`'s own rustdoc) — this test proves it is ACTUALLY
 //! registered into the server's metrics registry and exported on
-//! `/metrics`, over the real `OssServer` path (`start_engine_server_from_config`,
+//! `/metrics`, over the real `Server` path (`start_engine_server_from_config`,
 //! never a hand-built registry).
 //!
 //! A real single-node server is opened with `[server] placement =

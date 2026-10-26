@@ -67,7 +67,7 @@ def test_context_manager_creates_uses_and_deletes(tmp_path):
         assert phys.num_rows == 2
 
     # After exit the session is closed; calling into it raises.
-    with pytest.raises(RuntimeError):
+    with pytest.raises(jammi.errors.FailedPrecondition):
         ephem.count_rows("query_images")
 
     # A `closed` lifecycle event with deleted_row_count == 2 was published.

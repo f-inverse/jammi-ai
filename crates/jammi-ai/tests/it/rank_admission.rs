@@ -144,7 +144,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
             .await
             .expect_err(name);
         assert!(
-            matches!(per_verb, JammiError::Config(_)),
+            matches!(per_verb, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
             "{name}: the refusal must be typed, got {per_verb:?}"
         );
         assert!(
@@ -157,12 +157,12 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         let generic = match session.enqueue(JobSpec::from(spec.clone()), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
-                handle.job_id
+                handle.job_id()
             ),
             Err(e) => e,
         };
         assert!(
-            matches!(generic, JammiError::Config(_)),
+            matches!(generic, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
             "{name}: the generic entrance must refuse the same way, got {generic:?}"
         );
         assert_eq!(
@@ -199,12 +199,15 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         ),
     ] {
         let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
-        assert!(matches!(error, JammiError::Config(_)), "{name}: {error:?}");
+        assert!(
+            matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+            "{name}: {error:?}"
+        );
         assert!(error.to_string().contains(expected), "{name}: got {error}");
         let generic = match wide.enqueue(JobSpec::from(spec), 0).await {
             Ok(handle) => panic!(
                 "{name}: the generic entrance admitted job {}",
-                handle.job_id
+                handle.job_id()
             ),
             Err(e) => e,
         };
@@ -273,7 +276,7 @@ async fn a_fine_tune_cache_use_is_admitted_through_both_entrances() {
         before + 2,
         "each entrance enqueues exactly one row"
     );
-    for job_id in [per_verb.job_id.as_str(), generic.job_id.as_str()] {
+    for job_id in [per_verb.job_id(), generic.job_id()] {
         let persisted = session.catalog().get_job(job_id).await.unwrap().spec;
         assert!(
             persisted.contains(r#""cache":"use""#),
@@ -358,7 +361,10 @@ async fn the_serialized_request_entrance_carries_the_count_to_the_same_edge() {
         .run_training_spec(decoded)
         .await
         .expect_err("a two-rank job on a serveable world of one is unservable");
-    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+        "{error:?}"
+    );
     assert_eq!(
         job_count(&session).await,
         before,
@@ -456,7 +462,10 @@ fn a_count_past_the_serveable_world_is_refused_from_configuration_alone() {
     let error = narrow
         .admit(&spec_with_world_size(2))
         .expect_err("two ranks on a serveable world of one");
-    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+        "{error:?}"
+    );
     assert!(
         error.to_string().contains("[distributed] max_world_size"),
         "the refusal names the knob that bounds it: {error}"
@@ -578,7 +587,7 @@ fn a_context_predictor_spec_has_no_rank_count_to_admit() {
 /// training_spec = &training_spec;` (bypassing admission and borrowing the
 /// spec directly — compiles fine, since nothing here forces every edge to
 /// use the witness) turns this AND
-/// `every_durable_training_submit_edge_calls_the_one_admission_function`
+/// `every_training_submit_edge_admits_then_calls_the_one_submit_tail`
 /// red: this test fails with an untyped `Catalog` error from further
 /// downstream (validation never ran) and the source oracle reports 0 calls
 /// in the edge's body.
@@ -597,8 +606,8 @@ async fn an_invalid_context_predictor_config_is_refused_through_the_real_edge() 
         .await
         .expect_err("an invalid predictor config must be refused, never enqueued");
     assert!(
-        matches!(error, JammiError::FineTune(_)),
-        "the refusal must be typed, got {error:?}"
+        matches!(&error, JammiError::InvalidArgument { argument, .. } if argument == "context_k"),
+        "an invalid configuration value is the caller's to fix, got {error:?}"
     );
     assert!(
         error.to_string().contains("context_k"),
@@ -1004,25 +1013,39 @@ fn every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_traini
     );
 }
 
-/// The context-predictor edge and `submit_fine_tune_spec_deduped` are
-/// NOT on the allow-list above: both reach
-/// `submit_admitted_training` themselves rather than calling
-/// `Catalog::submit_job_deduped` directly, so their OWN admission is pinned
-/// by this behavioural check — each calls
-/// `crate::fine_tune::spec::admit_training_spec` in its own body before
-/// calling the seam, source-verified over the two files whose training-kind row NEVER touches
-/// `Catalog::submit_job`/`submit_job_deduped` directly at all.
+/// The three in-crate training submit edges — `submit_fine_tune_spec_deduped`,
+/// `train_context_predictor_deduped` and `enqueue`'s training arm — each
+/// call `crate::fine_tune::spec::admit_training_spec` in their own body and
+/// then the session's one shared tail, `submit_training`, which is the only
+/// in-crate caller of the `submit_admitted_training` seam. None of them
+/// touches `Catalog::submit_job`/`submit_job_deduped` directly, so their
+/// admission is pinned by this source check rather than the allow-list above.
 ///
 /// Mutation (executed and reverted, never shipped): deleting the
 /// `admit_training_spec` call from `train_context_predictor_deduped` drops
 /// this file's own call count to 0 and this test fails, naming the file.
 #[test]
-fn the_two_seam_calling_edges_admit_before_calling_the_seam() {
+fn every_training_submit_edge_admits_then_calls_the_one_submit_tail() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("crates/jammi-ai has two ancestors: crates/, then the repo root")
         .to_path_buf();
+
+    const ADMIT_CALL: &str = "fine_tune::spec::admit_training_spec(";
+    const TAIL_CALL: &str = ".submit_training(";
+    const SEAM_CALL: &str = "fine_tune::spec::submit_admitted_training(";
+
+    let body_of = |path: &str, fn_sig: &str| -> String {
+        let src = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+        let fn_start = src.find(fn_sig).unwrap_or_else(|| {
+            panic!("{path} no longer defines `{fn_sig}` — this oracle's edge list is stale")
+        });
+        let after_sig = &src[fn_start..];
+        let body_end = after_sig.find("\n    }\n").unwrap_or(after_sig.len());
+        after_sig[..body_end].to_string()
+    };
 
     let edges: &[(&str, &str)] = &[
         (
@@ -1033,31 +1056,35 @@ fn the_two_seam_calling_edges_admit_before_calling_the_seam() {
             "crates/jammi-ai/src/pipeline/context_predictor.rs",
             "pub(crate) async fn train_context_predictor_deduped(",
         ),
+        ("crates/jammi-ai/src/jobs.rs", "pub async fn enqueue("),
     ];
-
-    const ADMIT_CALL: &str = "fine_tune::spec::admit_training_spec(";
-    const SEAM_CALL: &str = "fine_tune::spec::submit_admitted_training(";
-
     for (path, fn_sig) in edges {
-        let full = root.join(path);
-        let src =
-            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
-        let fn_start = src.find(fn_sig).unwrap_or_else(|| {
-            panic!("{path} no longer defines `{fn_sig}` — this oracle's edge list is stale")
-        });
-        let after_sig = &src[fn_start..];
-        let body_end = after_sig.find("\n    }\n").unwrap_or(after_sig.len());
-        let body = &after_sig[..body_end];
+        let body = body_of(path, fn_sig);
         assert_eq!(
             body.matches(ADMIT_CALL).count(),
             1,
             "{path}'s `{fn_sig}` must call `{ADMIT_CALL}` exactly once before writing a jobs row"
         );
         assert_eq!(
-            body.matches(SEAM_CALL).count(),
+            body.matches(TAIL_CALL).count(),
             1,
-            "{path}'s `{fn_sig}` must call `{SEAM_CALL}` exactly once — the seam, not a hand-built \
-             `SubmitJobParams`"
+            "{path}'s `{fn_sig}` must submit through the one shared tail `{TAIL_CALL}`"
+        );
+        assert_eq!(
+            body.matches(SEAM_CALL).count(),
+            0,
+            "{path}'s `{fn_sig}` must reach the seam only through the shared tail"
         );
     }
+
+    let tail = body_of(
+        "crates/jammi-ai/src/session.rs",
+        "pub(crate) async fn submit_training(",
+    );
+    assert_eq!(
+        tail.matches(SEAM_CALL).count(),
+        1,
+        "the shared tail must call `{SEAM_CALL}` exactly once — the seam, not a hand-built \
+         `SubmitJobParams`"
+    );
 }

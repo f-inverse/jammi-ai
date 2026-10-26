@@ -18,15 +18,16 @@ L2-normalized embeddings), downloaded from the Hugging Face Hub on first use
 OpenAI CLIP, other LAION sizes, EVA-CLIP, or one tuned on a domain's imagery,
 such as `patentclip/PatentCLIP_Vit_B` for technical drawings — the encoder is
 read from the checkpoint's `open_clip_config.json`. Change `MODEL` in the
-program to try one.
+program to try one. A checkpoint directory on disk works the same way, as
+`local:<path>`.
 
 ## API surface exercised
 
 - `Session.generate_embeddings(*, source, model, columns, key, modality="image")`
 - `Session.encode_query(*, model, query, modality="image")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
-- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
+- `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `Job`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Image triplet schema (fine-tune input)
@@ -42,9 +43,10 @@ tells the loader to read the three columns as encoded images rather than text.
 
 ### Vision-tower LoRA sites
 
-`target_modules` names sites on **this** architecture. The OpenCLIP towers
-offer `in_proj` (fused QKV), `out_proj`, `c_fc` and `c_proj`; `all-linear`
-selects every one. A selector matches a site name exactly or as a suffix of it.
+A fine-tune adapts the tower by default, at its fused QKV projection `in_proj`;
+`target_modules` names other sites on **this** architecture. The OpenCLIP
+towers offer `in_proj`, `out_proj`, `c_fc` and `c_proj`; `all-linear` selects
+every one. A selector matches a site name exactly or as a suffix of it.
 A list matching **nothing** fails the job with a message that echoes what you
 submitted and lists the tower's real names.
 
@@ -58,9 +60,9 @@ submitted and lists the tower's real names.
 Preprocessing (pad-to-square, no center crop, normalization, L2-normalized
 output) is handled inside the encoder per the model's `preprocess_cfg`.
 
-## Golden source shape (image mode)
+## Ground-truth source shape (image mode)
 
-`eval_embeddings` switches to image-query mode when the golden source carries a
+`eval_embeddings` switches to image-query mode when the ground-truth source carries a
 `query_image` (binary) column instead of `query_text`:
 
 | column        | type   | example                          |
@@ -75,7 +77,7 @@ output) is handled inside the encoder per the model's `preprocess_cfg`.
   families (circle / triangle / square / hexagon / grating), 4 per family, plus
   a held-out query image per family under `queries/`. Rendered programmatically
   by `cookbook/fixtures/generate.py` — **no real-world imagery** (licensing).
-- `cookbook/fixtures/tiny_image_golden.json` — per-query → expected corpus IDs
+- `cookbook/fixtures/tiny_image_relevance.json` — per-query → expected corpus IDs
   (same shape family).
 
 ## Run it

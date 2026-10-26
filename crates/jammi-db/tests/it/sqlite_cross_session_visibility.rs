@@ -49,7 +49,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind, JobPhase, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_test_utils::make_test_session;
@@ -79,10 +79,28 @@ async fn session_on(dir: &Path) -> JammiSession {
     make_test_session(BackendKind::Sqlite, dir).await
 }
 
-/// Read job `job_id` through `catalog` and return the `round` field of its
-/// metrics blob. Every non-observation is a panic: an
-/// `Err`, a missing row, a `NULL`/unparseable metrics blob, or a blob with no
-/// integer `round` — none of them are ever folded into "inconclusive".
+/// The attempt session B holds on job `j`.
+const VISIBILITY_ATTEMPT: jammi_db::catalog::result_repo::JobAttempt<'static> =
+    jammi_db::catalog::result_repo::JobAttempt {
+        job_id: "j",
+        instance_id: "worker-b",
+        attempts: 1,
+    };
+
+/// The progress a write of round `round` records: the round rides in
+/// `done`.
+fn round_progress(round: i64) -> jammi_db::catalog::jobs_repo::JobProgress {
+    jammi_db::catalog::jobs_repo::JobProgress {
+        phase: JobPhase::Training,
+        done: Some(round as u64),
+        total: None,
+    }
+}
+
+/// Read job `job_id` through `catalog` and return the round its progress
+/// carries (`done`). Every non-observation is a panic: an `Err`, a missing
+/// row, absent progress, or progress with no rows — none of them are ever
+/// folded into "inconclusive".
 async fn observed_round(catalog: &Catalog, job_id: &str, who: &str, round: i64) -> i64 {
     let record = must!(
         format!("{who} read of round {round}"),
@@ -92,20 +110,15 @@ async fn observed_round(catalog: &Catalog, job_id: &str, who: &str, round: i64) 
         panic!("visibility: {who} read at round {round} failed: {err}");
     });
 
-    let raw = record.progress_phase.unwrap_or_else(|| {
+    let progress = record.progress.unwrap_or_else(|| {
         panic!(
-            "visibility: {who} read at round {round} saw metrics ABSENT (expected round {round})"
+            "visibility: {who} read at round {round} saw progress ABSENT (expected round {round})"
         );
     });
-    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
-        panic!("visibility: {who} read at round {round} saw unparseable metrics {raw:?}: {err}");
+    let rows = progress.done.unwrap_or_else(|| {
+        panic!("visibility: {who} read at round {round} saw progress without rows: {progress:?}");
     });
-    parsed
-        .get("round")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_else(|| {
-            panic!("visibility: {who} read at round {round} saw metrics without an integer `round`: {raw:?}");
-        })
+    rows as i64
 }
 
 /// A read through a second live pool on one catalog file must observe every
@@ -143,7 +156,7 @@ async fn second_session_observes_every_committed_round() {
         "submit job",
         catalog_b.submit_job(SubmitJobParams {
             job_id: "j",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("base-model::1"),
@@ -157,7 +170,7 @@ async fn second_session_observes_every_committed_round() {
     // The metrics write path is lease-guarded, so B claims the job first.
     let claimed = must!(
         "claim job",
-        catalog_b.claim_next("worker-b", &["fine_tune"], Duration::from_secs(600))
+        catalog_b.claim_next("worker-b", &[JobKind::FineTune], Duration::from_secs(600))
     )
     .expect("claim transaction")
     .expect("the queued job is claimable");
@@ -169,15 +182,15 @@ async fn second_session_observes_every_committed_round() {
     // probe cannot see.
     let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
     assert_eq!(
-        warm.status, "running",
+        warm.status,
+        JobStatus::Running,
         "visibility: session A's FIRST read must already observe B's committed claim"
     );
 
     for i in 1..=ROUNDS {
-        let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
+            catalog_b.progress_job(VISIBILITY_ATTEMPT, round_progress(i))
         )
         .unwrap_or_else(|err| panic!("visibility: write of round {i} failed: {err}"));
         assert!(landed, "visibility: write of round {i} matched no row");
@@ -245,10 +258,9 @@ async fn probe_every_warm_pooled_connection_observes_the_write() {
     fanout_rounds(catalog_a, FANOUT, 0).await;
 
     for i in 1..=ROUNDS {
-        let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
+            catalog_b.progress_job(VISIBILITY_ATTEMPT, round_progress(i))
         )
         .unwrap_or_else(|err| panic!("visibility probe A: write of round {i} failed: {err}"));
         assert!(
@@ -284,7 +296,7 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
 
     seed_claimed_job(catalog_b).await;
     let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
-    assert_eq!(warm.status, "running");
+    assert_eq!(warm.status, JobStatus::Running);
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -318,10 +330,9 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
         .expect("held read transaction reached its snapshot");
 
     for i in 1..=ROUNDS {
-        let payload = format!(r#"{{"round": {i}}}"#);
         let landed = must!(
             format!("write round {i}"),
-            catalog_b.progress_job("j", "worker-b", 1, None, None, Some(&payload))
+            catalog_b.progress_job(VISIBILITY_ATTEMPT, round_progress(i))
         )
         .unwrap_or_else(|err| panic!("visibility probe B: write of round {i} failed: {err}"));
         assert!(
@@ -366,7 +377,7 @@ async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
 
     seed_claimed_job(catalog_b).await;
     let warm = must!("warm read", catalog_a.get_job("j")).expect("session A warm read");
-    assert_eq!(warm.status, "running");
+    assert_eq!(warm.status, JobStatus::Running);
 
     let db_path = dir.path().join("catalog.db");
     for i in 1..=ROUNDS {
@@ -379,12 +390,14 @@ async fn probe_foreign_connection_write_is_observed_by_a_warm_pool() {
             .connect()
             .await
             .expect("foreign connection on the shared catalog file");
-        let payload = format!(r#"{{"round": {i}}}"#);
-        sqlx::query("UPDATE jobs SET progress_phase = ?1 WHERE job_id = 'j'")
-            .bind(&payload)
-            .execute(&mut foreign)
-            .await
-            .unwrap_or_else(|err| panic!("visibility probe C: foreign write of round {i}: {err}"));
+        sqlx::query(
+            "UPDATE jobs SET progress_phase = 'training', progress_done = ?1 \
+             WHERE job_id = 'j'",
+        )
+        .bind(i)
+        .execute(&mut foreign)
+        .await
+        .unwrap_or_else(|err| panic!("visibility probe C: foreign write of round {i}: {err}"));
         foreign.close().await.expect("close foreign connection");
 
         let seen = observed_round(catalog_a, "j", "session A (warm pool)", i).await;
@@ -423,7 +436,7 @@ async fn seed_claimed_job(catalog: &Catalog) {
         "submit job",
         catalog.submit_job(SubmitJobParams {
             job_id: "j",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some("base-model::1"),
@@ -435,7 +448,7 @@ async fn seed_claimed_job(catalog: &Catalog) {
     .expect("submit job");
     let claimed = must!(
         "claim job",
-        catalog.claim_next("worker-b", &["fine_tune"], Duration::from_secs(600))
+        catalog.claim_next("worker-b", &[JobKind::FineTune], Duration::from_secs(600))
     )
     .expect("claim transaction")
     .expect("the queued job is claimable");
@@ -443,7 +456,7 @@ async fn seed_claimed_job(catalog: &Catalog) {
 }
 
 /// Issue `n` concurrent reads through `catalog` and return each one's observed
-/// round. `expect_round == 0` means "warm-up only": the metrics column is still
+/// round. `expect_round == 0` means "warm-up only": the progress is still
 /// absent, so the reads are made for their pool-warming effect and every
 /// returned round is zero (asserted, so a warm-up that accidentally races a
 /// write cannot pass silently).
@@ -456,14 +469,9 @@ async fn fanout_rounds(catalog: &Arc<Catalog>, n: usize, expect_round: i64) -> V
                 .await
                 .expect("fan-out read timed out")
                 .expect("fan-out read failed");
-            match record.progress_phase {
-                None => 0,
-                Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                    .expect("metrics parse")
-                    .get("round")
-                    .and_then(serde_json::Value::as_i64)
-                    .expect("integer round"),
-            }
+            record
+                .progress
+                .map_or(0, |progress| progress.done.expect("rows in a round") as i64)
         }));
     }
     let mut out = Vec::with_capacity(n);

@@ -148,33 +148,21 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         return err
 
 
-class PlatformNotInstalledError(JammiError):
-    """`jammi.platform` was accessed but no platform extension is installed.
-
-    `jammi` surfaces an out-of-package plug-in as `jammi.platform` through a
-    generic extension slot — an entry point named `platform` in the
-    `jammi.extensions` group. The plug-in registers itself there; it never writes
-    into the `jammi` namespace. Absent any registered extension, this build
-    carries only the open surface, and accessing `jammi.platform` raises this
-    error rather than a bare `AttributeError`. Install the platform SDK —
-    `pip install jammi-ai-platform` — and the SAME `jammi.platform` resolves to it.
+class TrainingError(JammiError, RuntimeError):
+    """A training computation failed while the caller waited on it in
+    process — the trainer refused or broke on its inputs. A queued job that
+    fails raises :class:`JobFailed` from its ``wait()`` instead. Refines
+    :class:`RuntimeError`.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "no platform extension is installed: `jammi.platform` is provided by "
-            "an out-of-package plug-in registered under the `jammi.extensions` "
-            "entry-point group — `pip install jammi-ai-platform` to surface it."
-        )
 
+class JobFailed(JammiError, RuntimeError):
+    """A job reached the ``failed`` terminal state.
 
-class TrainingError(JammiError, RuntimeError):
-    """A job reached a ``failed`` terminal state.
-
-    Carries the executor's failure message — read off ``JobStatus.error`` on
-    the remote transport, surfaced from the engine's `Job.wait` on the
-    embedded one — so a job fails for the same cause with the same message
-    regardless of where it ran. Refines :class:`RuntimeError`.
+    Raised by a job's ``wait()``, carrying the error its executor recorded —
+    read off ``JobStatus.error`` on the remote transport, off the catalog row
+    on the embedded one — so a job fails for the same cause with the same
+    message wherever it ran. Refines :class:`RuntimeError`.
     """
 
 
@@ -183,9 +171,9 @@ class JobCancelled(JammiError, RuntimeError):
 
     Raised by a job's ``wait()`` when its cancel was requested: a job no worker
     had claimed is cancelled at once, a running one at its executor's next
-    checkpoint. Distinct from :class:`TrainingError` so a caller can tell the
-    end it asked for from a fault. Refines :class:`RuntimeError`, as
-    :class:`TrainingError` does.
+    checkpoint. Distinct from :class:`JobFailed` so a caller can tell the end
+    it asked for from a fault. Refines :class:`RuntimeError`, as
+    :class:`JobFailed` does.
     """
 
 
@@ -223,6 +211,20 @@ class FailedPrecondition(BackendError):
     """The operation is valid but the state it needs does not hold — a model
     still referenced, a column redeclared with another type, a table that
     cannot refresh. ``FAILED_PRECONDITION`` on the remote transport.
+    """
+
+
+class PermissionDenied(BackendError):
+    """The caller may not act on the thing it names — a write stamped for
+    another tenant than the session's. ``PERMISSION_DENIED`` on the remote
+    transport.
+    """
+
+
+class Unauthenticated(BackendError):
+    """The request carried no credential, or one that did not verify — refused
+    by an authenticating gateway in front of the engine before any read ran.
+    ``UNAUTHENTICATED`` on the remote transport.
     """
 
 

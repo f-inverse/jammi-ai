@@ -1,6 +1,6 @@
 //! Retrieval metrics: recall@k, precision@k, MRR, nDCG with graded
 //! relevance. Includes the [`RelevanceJudgment`] type that serves both as
-//! the metric's input contract and as the standard golden-data row shape
+//! the metric's input contract and as the standard ground-truth row shape
 //! for any IR evaluation harness.
 
 use std::collections::{HashMap, HashSet};

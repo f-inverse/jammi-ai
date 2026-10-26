@@ -109,7 +109,7 @@ def assignees():
         w.writerows(rows)
 
 
-def golden_relevance():
+def relevance():
     """5 queries with known relevant patents."""
     rows = [
         ("q1", "quantum computing applications", 1),
@@ -128,17 +128,17 @@ def golden_relevance():
         ("q5", "chemical synthesis methods", 15),
         ("q5", "chemical synthesis methods", 19),
     ]
-    with open(os.path.join(OUT, "golden_relevance.csv"), "w", newline="") as f:
+    with open(os.path.join(OUT, "relevance.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["query_id", "query_text", "relevant_id"])
         w.writerows(rows)
 
 
-def golden_labels():
+def labels():
     """Ground truth categories for classification eval."""
     t = pq.read_table(os.path.join(OUT, "patents.parquet"))
     rows = list(zip(t.column("id").to_pylist(), t.column("category").to_pylist()))
-    with open(os.path.join(OUT, "golden_labels.csv"), "w", newline="") as f:
+    with open(os.path.join(OUT, "labels.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["id", "category"])
         w.writerows(rows)
@@ -223,8 +223,8 @@ if __name__ == "__main__":
     patents()
     patents_with_nulls()
     assignees()
-    golden_relevance()
-    golden_labels()
+    relevance()
+    labels()
     training_pairs()
     training_triplets()
     scores()

@@ -407,5 +407,3 @@ that acts on the verdict is the consumer's to build.
 > measured lesson: the leak is real (a strictly positive AUC inflation and a broken
 > coverage guarantee), and the as-of join closes it — with zero train/serve skew, because
 > one definition runs both paths.
-```
-

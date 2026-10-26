@@ -132,16 +132,16 @@ def subject_chance(db, arxiv: Arxiv) -> float:
     return sum((n / sum(mix)) ** 2 for n in mix)
 
 
-def subject_golden(db, arxiv: Arxiv) -> str:
-    """The same-subject retrieval golden: 200 papers asked by their titles, each
+def subject_relevance(db, arxiv: Arxiv) -> str:
+    """The same-subject relevance judgments: 200 papers asked by their titles, each
     relevant to every other paper of its subject — a target independent of any
-    embedding. Returns the golden's relation for the ``eval_*`` verbs."""
+    embedding. Returns the ground truth's relation for the ``eval_*`` verbs."""
     papers = db.sql(
         f"SELECT paper_id, title, subject FROM {arxiv.papers}.public.{arxiv.papers}"
     ).to_pylist()
-    return datasets.same_label_golden(
+    return datasets.same_label_relevance(
         db, papers, key="paper_id", label="subject", text="title", queries=200,
-        name="arxiv_subject_golden",
+        name="arxiv_subject_relevance",
     )
 
 

@@ -271,13 +271,13 @@ async fn current_state(
     let mut dups: HashMap<String, u64> = HashMap::new();
     for batch in &batches {
         let ids = arrow::compute::cast(batch.column(0), &DataType::Utf8)
-            .map_err(|e| JammiError::Other(format!("refresh: cast: {e}")))?;
+            .map_err(|e| JammiError::Internal(format!("refresh: cast: {e}")))?;
         let ids = ids
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| JammiError::Inference("_row_id is not a string column".into()))?;
         let hashes = arrow::compute::cast(batch.column(1), &DataType::Utf8)
-            .map_err(|e| JammiError::Other(format!("refresh: cast: {e}")))?;
+            .map_err(|e| JammiError::Internal(format!("refresh: cast: {e}")))?;
         let hashes = hashes
             .as_any()
             .downcast_ref::<StringArray>()
@@ -826,17 +826,6 @@ impl InferenceSession {
         ))
     }
 
-    async fn source_plan(&self, source_query: &str) -> Result<Arc<dyn ExecutionPlan>> {
-        let df = self
-            .context()
-            .sql(source_query)
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
-        df.create_physical_plan()
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))
-    }
-
     /// Step 4: drain the whole source once through `KeyCheckExec` (a null key
     /// refuses at end of input, before any classification is trusted), render
     /// the key with the runner's cast, and classify every row against the
@@ -849,7 +838,10 @@ impl InferenceSession {
         current: &HashMap<String, ContentHash>,
         deletes: DeletePolicy,
     ) -> Result<Classified> {
-        let plan = key_checked(self.source_plan(source_query).await?, &params.key_column)?;
+        let plan = key_checked(
+            self.plan_source_query(source_query).await?,
+            &params.key_column,
+        )?;
         let mut stream = plan
             .execute(0, self.context().task_ctx())
             .map_err(JammiError::from)?;
@@ -861,10 +853,13 @@ impl InferenceSession {
         while let Some(batch) = stream.next().await {
             let batch: RecordBatch = batch.map_err(JammiError::from)?;
             let keys = batch.column_by_name(&params.key_column).ok_or_else(|| {
-                JammiError::Inference(format!("key column '{}' missing", params.key_column))
+                JammiError::InvalidArgument {
+                    argument: "key".into(),
+                    reason: format!("key column '{}' missing", params.key_column),
+                }
             })?;
             let keys = arrow::compute::cast(keys, &DataType::Utf8)
-                .map_err(|e| JammiError::Other(format!("refresh: cast: {e}")))?;
+                .map_err(|e| JammiError::Internal(format!("refresh: cast: {e}")))?;
             let keys = keys
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -873,7 +868,7 @@ impl InferenceSession {
                 JammiError::Inference("_content_hash missing from the source scan".into())
             })?;
             let hashes = arrow::compute::cast(hashes, &DataType::Utf8)
-                .map_err(|e| JammiError::Other(format!("refresh: cast: {e}")))?;
+                .map_err(|e| JammiError::Internal(format!("refresh: cast: {e}")))?;
             let hashes = hashes
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -942,7 +937,7 @@ impl InferenceSession {
             params,
             definition,
         } = target;
-        let source = self.source_plan(source_query).await?;
+        let source = self.plan_source_query(source_query).await?;
         let key_schema = Arc::new(Schema::new(vec![Field::new(
             "_refresh_key",
             DataType::Utf8,
@@ -954,7 +949,7 @@ impl InferenceSession {
                 keys.iter().map(String::as_str),
             ))],
         )
-        .map_err(|e| JammiError::Other(format!("refresh: key batch: {e}")))?;
+        .map_err(|e| JammiError::Internal(format!("refresh: key batch: {e}")))?;
         let build: Arc<dyn ExecutionPlan> =
             MemorySourceConfig::try_new_exec(&[vec![key_batch]], key_schema, None)?;
         let left_key = col("_refresh_key", build.schema().as_ref())?;
@@ -1380,11 +1375,11 @@ fn coerce_to_embedding_schema(
             })?;
         columns.push(
             arrow::compute::cast(col, field.data_type())
-                .map_err(|e| JammiError::Other(format!("compaction: cast: {e}")))?,
+                .map_err(|e| JammiError::Internal(format!("compaction: cast: {e}")))?,
         );
     }
     RecordBatch::try_new(Arc::clone(schema), columns)
-        .map_err(|e| JammiError::Other(format!("compaction: build batch: {e}")))
+        .map_err(|e| JammiError::Internal(format!("compaction: build batch: {e}")))
 }
 
 #[cfg(test)]

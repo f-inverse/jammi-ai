@@ -9,7 +9,7 @@ two classifiers, or to track drift over time on the same classifier.
 
 ## API surface exercised
 
-- `Session.eval_inference(*, model, source, columns, task, golden_source, label_column)`
+- `Session.eval_inference(*, model, source, columns, task, ground_truth, label_column)`
 
 The returned dict carries `aggregate` (tagged by `"task"` — currently
 `"classification"`) with `accuracy`, `f1`, and `per_class`, plus
@@ -18,7 +18,7 @@ The returned dict carries `aggregate` (tagged by `"task"` — currently
 The `task` argument is the string form of the inference task —
 `"classification"` here. For NER, see `../eval_inference_ner/`.
 
-## Golden source shape
+## Ground-truth source shape
 
 `eval_inference` requires a registered source with these columns:
 
@@ -28,7 +28,7 @@ The `task` argument is the string form of the inference task —
 | `<label_column>`  | utf8 | `physics` |
 
 `label_column` is the kwarg you pass at call time — `label` in this
-recipe. Every `id` in the golden source must resolve to a row in the
+recipe. Every `id` in the ground-truth source must resolve to a row in the
 input source; rows without a gold label are silently dropped from the
 metric.
 

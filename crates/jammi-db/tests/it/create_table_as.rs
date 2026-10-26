@@ -10,7 +10,7 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -132,8 +132,9 @@ async fn a_create_table_without_a_query_is_refused_typed() {
         .await
         .expect_err("a result table is what a query produced; there are no empty ones");
     assert!(
-        matches!(err, JammiError::Schema { ref table, .. } if table == "empty_rows"),
-        "expected the typed Schema refusal naming the table, got {err:?}"
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`empty_rows`")),
+        "expected the sql refusal naming the table, got {err:?}"
     );
     assert!(session
         .catalog()
@@ -161,9 +162,9 @@ async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
         .await
         .expect_err("a recursive query renders to no SQL the engine can re-plan");
     assert!(
-        matches!(err, JammiError::Schema { ref table, ref actual, .. }
-            if table == "lineage" && actual.contains("RecursiveQuery")),
-        "expected the typed Schema refusal naming the table and the node, got {err:?}"
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`lineage`") && reason.contains("RecursiveQuery")),
+        "expected the sql refusal naming the table and the node, got {err:?}"
     );
     assert!(session
         .catalog()
@@ -171,6 +172,24 @@ async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// A `CREATE TABLE … AS` over a table its source does not hold is the typed
+/// NotFound naming that relation — never the table the statement
+/// defines, which is not expected to exist yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_table_as_over_a_missing_relation_names_the_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session, _store, patents) = session_with_store(dir.path()).await;
+    let missing = format!("{patents}.public.retracted");
+    let err = session
+        .sql(&format!("CREATE TABLE copied AS SELECT id FROM {missing}"))
+        .await
+        .expect_err("a query over a table its source does not hold cannot plan");
+    assert!(
+        matches!(&err, JammiError::NotFound(Missing::Relation { name }) if *name == missing),
+        "expected the typed NotFound naming the read relation, got {err:?}"
+    );
 }
 
 /// The `(id, title)` rows of `"jammi.<name>"`, by id, and the `ready`
@@ -238,7 +257,8 @@ async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
         .await
         .expect_err("a query that cannot replay refuses at planning");
     assert!(
-        matches!(err, JammiError::Schema { ref table, .. } if table == "recent"),
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`recent`")),
         "got {err:?}"
     );
 

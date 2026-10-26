@@ -1,6 +1,6 @@
 //! CLI integration tests for `jammi reconcile` over the wire.
 //!
-//! Spawns a hermetic `jammi-server` subprocess (the real OSS binary, which
+//! Spawns a hermetic `jammi-server` subprocess (the real binary, which
 //! wires the shipped `admin_authorizer: None` default) and drives the CLI
 //! against it with `--target`, exactly like the other CLI integration
 //! suites in this crate.
@@ -31,7 +31,7 @@ fn cli_reconcile_prints_the_label_shaped_report() {
         .stdout(predicates::str::contains("_global"));
 }
 
-/// `--all` against a server that never wired an admin authorizer (the OSS
+/// `--all` against a server that never wired an admin authorizer (the
 /// binary's shipped default) is refused with `PERMISSION_DENIED`, and this
 /// CLI surfaces the server's message verbatim — no special-casing on top of
 /// the ordinary `Err(e) => eprintln!("Error: {e}")` path every other verb's

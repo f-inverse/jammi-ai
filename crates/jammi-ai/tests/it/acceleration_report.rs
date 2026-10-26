@@ -37,7 +37,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::jobs_repo::{
     FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
 };
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use crate::common;
@@ -81,7 +81,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
     (session, dir)
 }
 
-/// A fast encoder-adapters config (`backbone_dtype` only takes effect on this
+/// A fast adapted-encoder config (`backbone_dtype` only takes effect on this
 /// arm) at the given precision.
 fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
     FineTuneConfig {
@@ -90,22 +90,24 @@ fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
         lora_rank: 4,
         warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
-        target_modules: vec!["Wqkv".to_string(), "Wo".to_string()],
+        encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+            "Wqkv".to_string(),
+            "Wo".to_string(),
+        ]),
         backbone_dtype,
         ..Default::default()
     }
 }
 
-/// Poll a raw (non-`TrainingJob`-handle) job to a terminal state — the same
-/// polling `jammi_ai::fine_tune::training_job::TrainingJob::wait` does, for a
-/// job this test submitted directly through the catalog rather than through
-/// `session.fine_tune`. Expects success; panics on a `failed` terminal status.
+/// Poll a job this test submitted directly through the catalog, rather than
+/// through `session.fine_tune`, to a terminal state — the polling
+/// `jammi_ai::jobs::JobHandle::wait` does. Expects success; panics on a `failed` terminal status.
 async fn wait_for_terminal(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
 ) -> jammi_db::catalog::jobs_repo::JobRecord {
     let record = wait_for_any_terminal(catalog, job_id).await;
-    if record.status != jammi_db::catalog::status::JobStatus::Completed.to_string() {
+    if record.status != jammi_db::catalog::status::JobStatus::Completed {
         panic!("job {job_id} failed unexpectedly: {:?}", record.error);
     }
     record
@@ -147,8 +149,8 @@ async fn wait_for_any_terminal(
 
 /// Read a job's record and run the tri-state oracle on it — the
 /// already-terminal peer of [`wait_for_any_terminal`], for the tests that
-/// awaited a [`jammi_ai::fine_tune::training_job::TrainingJob`] handle
-/// (`job.wait()`) rather than polling the row themselves. Every terminal
+/// awaited a [`jammi_ai::jobs::JobHandle`] (`job.wait()`) rather than
+/// polling the row themselves. Every terminal
 /// record this file reads goes through one of these two functions, so no job
 /// in the suite escapes the oracle.
 async fn terminal_record(
@@ -271,7 +273,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     // BEFORE the first training step, so it must exist regardless of whether
     // f16's own (unrelated) numeric stability on this tiny fixture later
     // converges or diverges over the eager-composed batches that follow.
-    let record1 = wait_for_any_terminal(session.catalog(), &job1.job_id).await;
+    let record1 = wait_for_any_terminal(session.catalog(), job1.job_id()).await;
     let report1 = expect_determined_report(record1.acceleration_report.as_deref());
     let ab1 = &report1["ops"]["attention_block"];
     assert_eq!(
@@ -311,7 +313,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
         )
         .await
         .unwrap();
-    let record2 = wait_for_any_terminal(session.catalog(), &job2.job_id).await;
+    let record2 = wait_for_any_terminal(session.catalog(), job2.job_id()).await;
     let report2 = expect_determined_report(record2.acceleration_report.as_deref());
     let ab2 = &report2["ops"]["attention_block"];
     assert_eq!(
@@ -333,7 +335,8 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
         "job 2 must also independently report layer_norm as genuinely admitted, got: {report2}"
     );
     assert_ne!(
-        job1.job_id, job2.job_id,
+        job1.job_id(),
+        job2.job_id(),
         "sanity: the two jobs must be distinct records"
     );
 }
@@ -368,7 +371,7 @@ async fn f32_positive_control_reports_ops_holds() {
         .await
         .unwrap();
     job.wait().await.unwrap();
-    let record = terminal_record(session.catalog(), &job.job_id, "f32 positive control").await;
+    let record = terminal_record(session.catalog(), job.job_id(), "f32 positive control").await;
     let report = expect_determined_report(record.acceleration_report.as_deref());
 
     // `attention_block` is intentionally excluded from the strict `Holds`
@@ -429,7 +432,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
         )
         .await
         .unwrap();
-    let pre_claim = session.catalog().get_job(&job.job_id).await.unwrap();
+    let pre_claim = session.catalog().get_job(job.job_id()).await.unwrap();
     let pre_claim_report: serde_json::Value =
         serde_json::from_str(pre_claim.acceleration_report.as_deref().expect(
             "submit_job must write the explicit pending marker, not leave the column \
@@ -448,7 +451,7 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
 
     let post_claim = terminal_record(
         session.catalog(),
-        &job.job_id,
+        job.job_id(),
         "pending→determined transition, post-claim",
     )
     .await;
@@ -499,7 +502,7 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     job_a.wait().await.unwrap();
     let record_a = terminal_record(
         session.catalog(),
-        &job_a.job_id,
+        job_a.job_id(),
         "transport A (embedded SDK)",
     )
     .await;
@@ -578,22 +581,22 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     );
 }
 
-/// No fabricated reason: the projection-head arm (`target_modules` empty —
-/// `backbone_dtype` never takes effect there) never builds an encoder to
+/// No fabricated reason: the frozen-encoder arm (`backbone_dtype` never
+/// takes effect there) never builds an encoder to
 /// probe at all, so its report must never claim
 /// `"reason": "probe_forward_failed"` for a probe that was NEVER attempted.
 /// `flash_compiled_device_reason`'s compiled/device short-circuits are checked FIRST regardless
 /// (`"cuda_not_compiled"` on this CPU-only scoped-gate build — legitimately true, and cheaper to
 /// state than "no probe" when flash could never hold here either way), so THIS
 /// test's own build can only prove the fabricated value is ABSENT, not that
-/// the honest `"no_encoder_to_probe_projection_head_arm"` reason is reached
+/// the honest `"no_encoder_to_probe_frozen_encoder"` reason is reached
 /// (that needs `cuda` compiled AND a real CUDA device — see
 /// `flash_report_no_probe_attempted`'s doc). `ops` must be empty regardless
 /// (never a fabricated per-op measurement for an arm that built no
 /// dtype-typed encoder).
 #[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
-async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
+async fn frozen_encoder_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
     let (session, _dir) = session_with_training_data().await;
     let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
 
@@ -609,31 +612,32 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
                 batch_size: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                // target_modules left empty (the default): the projection-head
-                // arm, which never builds an encoder to probe.
+                // A frozen encoder: the arm that never builds an encoder to
+                // probe.
+                encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
     let report = expect_determined_report(record.acceleration_report.as_deref());
 
     assert_eq!(
         report["ops"],
         serde_json::json!({}),
-        "the projection-head arm builds no encoder to probe — ops must be empty, got: {report}"
+        "the frozen-encoder arm builds no encoder to probe — ops must be empty, got: {report}"
     );
     assert_ne!(
         report["flash"]["reason"],
         serde_json::json!("probe_forward_failed"),
-        "the projection-head arm never attempts a probe at all — it must never claim the \
+        "the frozen-encoder arm never attempts a probe at all — it must never claim the \
          probe-was-attempted-and-failed reason, got: {report}"
     );
     if cfg!(feature = "cuda") && report["device"] == serde_json::json!("cuda") {
         assert_eq!(
             report["flash"]["reason"],
-            serde_json::json!("no_encoder_to_probe_projection_head_arm"),
+            serde_json::json!("no_encoder_to_probe_frozen_encoder"),
             "on a real CUDA device the honest no-probe-attempted reason must appear, got: \
              {report}"
         );
@@ -681,7 +685,7 @@ fn tiny_bert_head64_model() -> String {
 /// device-level short-circuit fires first for every architecture — so it
 /// proves the one thing THIS build can prove: a BERT-family job produces a
 /// well-formed, honestly-labelled `flash: {holds: false, reason: ..}` at all,
-/// through the SAME encoder-adapters path the ModernBERT tests above already
+/// through the SAME adapted-encoder path the ModernBERT tests above already
 /// cover, and that this build's device-level reason is never overridden by a
 /// fabricated `"flash_transport_not_wired"` it cannot actually observe.
 #[serial(acceleration_report)]
@@ -703,17 +707,20 @@ async fn bert_family_job_reports_flash_decline_honestly() {
                 lora_rank: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                // Non-empty target_modules: the encoder-adapters arm, which
-                // DOES build an encoder and run the acceleration probe (unlike the
-                // projection-head arm covered above).
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                // The adapted-encoder arm, which DOES build an encoder and run
+                // the acceleration probe (unlike the frozen-encoder arm covered
+                // above).
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 backbone_dtype: ComputePrecision::F32,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
     let report = expect_determined_report(record.acceleration_report.as_deref());
 
     assert_eq!(
@@ -853,7 +860,7 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
         // Tolerant of either terminal outcome: the report is written before
         // the first training step, so f16's own numeric stability on this
         // tiny fixture is irrelevant to what is asserted here.
-        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
         reports.push((
             precision,
             expect_determined_report(record.acceleration_report.as_deref()),
@@ -1040,7 +1047,7 @@ async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_o
             )
             .await
             .unwrap();
-        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
         let report = expect_determined_report(record.acceleration_report.as_deref());
         let ab = &report["ops"]["attention_block"];
         assert_eq!(
@@ -1177,7 +1184,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         .train_context_predictor("ctx", &predictor_spec)
         .await
         .unwrap();
-    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
     let report_json = record.acceleration_report.as_deref().expect(
         "control (iii): a missing report is a failure — a ContextPredictor job must \
          still carry a self-describing terminal marker, never the submission-time pending \
@@ -1221,7 +1228,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
         .await
         .unwrap();
     seed_job.wait().await.unwrap();
-    let seed_record = terminal_record(session.catalog(), &seed_job.job_id, "seed job").await;
+    let seed_record = terminal_record(session.catalog(), seed_job.job_id(), "seed job").await;
 
     // A raw job carrying a deliberately undeserialisable `training_spec` —
     // fails in `run_claimed_job` before `run_spec`/`run_fine_tune_blocking`
@@ -1236,7 +1243,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
         .catalog()
         .submit_job(SubmitJobParams {
             job_id: &job_id,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "this is not valid JSON at all {{{",
             model_ref: Some(&seed_model_ref),
@@ -1249,7 +1256,8 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
 
     let record = wait_for_any_terminal(session.catalog(), &job_id).await;
     assert_eq!(
-        record.status, "failed",
+        record.status,
+        JobStatus::Failed,
         "an undeserialisable training_spec must land the job failed, got {}",
         record.status
     );
@@ -1426,7 +1434,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
         .await
         .unwrap();
     seed_job.wait().await.unwrap();
-    let seed_record = terminal_record(session.catalog(), &seed_job.job_id, "seed job").await;
+    let seed_record = terminal_record(session.catalog(), seed_job.job_id(), "seed job").await;
     // Control: the seed job DID reach the probe, so the marker asserted below
     // is a real state transition and not "every job is undetermined".
     let seed_report = expect_determined_report(seed_record.acceleration_report.as_deref());
@@ -1473,7 +1481,7 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
             .catalog()
             .submit_job(SubmitJobParams {
                 job_id,
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: JobExecution::Queued,
                 spec: &spec_json,
                 model_ref: Some(&seed_model_ref),
@@ -1486,10 +1494,12 @@ async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
 
         let record = wait_for_any_terminal(session.catalog(), job_id).await;
         assert_eq!(
-            record.status, "failed",
+            record.status,
+            JobStatus::Failed,
             "{label}: the job must land terminal `failed`, never wedged `running` — got {} \
              (error: {:?})",
-            record.status, record.error
+            record.status,
+            record.error
         );
         assert!(
             record.error.is_some(),
@@ -1582,11 +1592,11 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     job.wait().await.unwrap();
     let seed_record = terminal_record(
         session.catalog(),
-        &job.job_id,
+        job.job_id(),
         "leg 1 (ordinary completed job)",
     )
     .await;
-    assert_eq!(seed_record.status, "completed");
+    assert_eq!(seed_record.status, JobStatus::Completed);
     let seed_report = expect_determined_report(seed_record.acceleration_report.as_deref());
     assert_eq!(
         seed_report["state"],
@@ -1632,7 +1642,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
             catalog
                 .submit_job(SubmitJobParams {
                     job_id,
-                    kind: "fine_tune",
+                    kind: JobKind::FineTune,
                     execution: JobExecution::Queued,
                     spec: &spec_json,
                     model_ref: Some(&model_ref),
@@ -1643,7 +1653,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                 .await
                 .unwrap();
             let claimed = catalog
-                .claim_next(WORKER, &["fine_tune"], Duration::from_secs(300))
+                .claim_next(WORKER, &[JobKind::FineTune], Duration::from_secs(300))
                 .await
                 .unwrap()
                 .expect("the worker is stopped, so this row is the only claimable one");
@@ -1739,7 +1749,8 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
     let mid_run = session.catalog().get_job(swallowed).await.unwrap();
     assert_eq!(
-        mid_run.status, "running",
+        mid_run.status,
+        JobStatus::Running,
         "the missed write must leave the row RUNNING and claimable-by-nobody-else — the \
          swallow is silent by design"
     );
@@ -1763,7 +1774,8 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     )
     .await;
     assert_eq!(
-        record.status, "completed",
+        record.status,
+        JobStatus::Completed,
         "leg 2's job must genuinely COMPLETE — the swallowed report write never fails training"
     );
     assert_terminal_report_is_undetermined(
@@ -1792,7 +1804,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
         "leg 3 (completed, report write landed)",
     )
     .await;
-    assert_eq!(record.status, "completed");
+    assert_eq!(record.status, JobStatus::Completed);
     let report = expect_determined_report(record.acceleration_report.as_deref());
     assert_eq!(
         report["state"],
@@ -1803,7 +1815,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
 }
 
-/// A MEDIA encoder-adapters job's acceleration report is a real measurement,
+/// A MEDIA adapted-encoder job's acceleration report is a real measurement,
 /// not a probe failure.
 ///
 /// A probe that hand-built a `[1, 4]` token-id batch and called
@@ -1866,16 +1878,19 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
                 lr_schedule: LrSchedule::Constant,
                 validation_fraction: 0.0,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
-                // Non-empty target_modules: the encoder-adapters arm, the only
-                // one that builds an encoder and runs the acceleration probe.
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                // The adapted-encoder arm, the only one that builds an encoder
+                // and runs the acceleration probe.
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 backbone_dtype: ComputePrecision::F32,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let record = wait_for_any_terminal(session.catalog(), job.job_id()).await;
     let report = expect_determined_report(record.acceleration_report.as_deref());
 
     let ops = report["ops"]
@@ -1883,7 +1898,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
         .unwrap_or_else(|| panic!("ops must be an object, got: {report}"));
     assert!(
         !ops.is_empty(),
-        "an audio encoder-adapters job's probe must DRIVE a real forward through the \
+        "an audio adapted-encoder job's probe must DRIVE a real forward through the \
          audio tower and measure at least one instrumented op — an empty ops map here \
          means the probe never ran the tower at all, got: {report}"
     );

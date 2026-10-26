@@ -142,13 +142,9 @@ async fn fine_tune_graph_learns_on_gpu() {
         .unwrap();
 
     // (a) completes on the GPU.
-    job.wait().await.unwrap();
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
-    assert_eq!(
-        record.status, "completed",
-        "GPU graph fine-tune should complete, got {}",
-        record.status
-    );
+    // `wait` returns a result only for a completed job, and the job's own
+    // recorded error for any other end.
+    job.wait().await.expect("GPU graph fine-tune completes");
 
     // The captured per-epoch loss curve — reported, not asserted (see the module
     // note: a stationary MNRL loss on this toy graph is a fixture artifact, not a
@@ -161,9 +157,12 @@ async fn fine_tune_graph_learns_on_gpu() {
 
     // (b) the adapter changes embeddings vs the base model — the on-device
     // learning proof. The fine-tuned model is served back through the GPU session.
+    let ft_model_id = job
+        .output_model_id()
+        .expect("a graph fine-tune stamps the model it registers");
     let ft = session
         .catalog()
-        .get_model(job.model_id())
+        .get_model(ft_model_id)
         .await
         .unwrap()
         .expect("graph fine-tune registered the model");
@@ -171,7 +170,7 @@ async fn fine_tune_graph_learns_on_gpu() {
         ft.location.is_some(),
         "graph fine-tune should publish an adapter"
     );
-    let ft_name = job.model_id().split("::").next().unwrap();
+    let ft_name = ft_model_id.split("::").next().unwrap();
     let base = session
         .encode_text_query(&model, "document about topic a0")
         .await

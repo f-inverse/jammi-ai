@@ -629,12 +629,7 @@ impl CatalogService for CatalogServer {
             .iter()
             .map(topic_to_proto)
             .collect::<Result<Vec<_>, Status>>()?;
-        Ok(Response::new(pb::ListTopicsResponse {
-            topics,
-            // Pagination is not yet implemented — `next_page_token` empty
-            // means "this is the complete result set."
-            next_page_token: String::new(),
-        }))
+        Ok(Response::new(pb::ListTopicsResponse { topics }))
     }
 
     // --- reconcile -----------------------------------------------------------

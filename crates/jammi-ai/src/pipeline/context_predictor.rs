@@ -46,8 +46,10 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::jobs_repo::{JobProgress, ProgressReporter};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::status::JobPhase;
 use jammi_db::error::{JammiError, Result};
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +70,7 @@ use crate::pipeline::context_set::{
 };
 use crate::pipeline::graph_neighbourhood::EdgeGather;
 use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig, ParallelTrainReport};
-use crate::predict::conformal::{ConformalModel, IntervalScore};
+use crate::predict::conformal::{Calibration, ConformalModel, Estimate, Estimates, TestPoint};
 use crate::session::InferenceSession;
 use jammi_datafusion::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use jammi_datafusion::inference::adapter::OutputAdapter;
@@ -198,19 +200,22 @@ impl PredictiveHead {
     fn validate(&self) -> Result<()> {
         if let PredictiveHead::Quantile { levels } = self {
             if levels.is_empty() {
-                return Err(JammiError::FineTune(
-                    "Quantile head requires at least one level".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "a quantile head needs at least one level".into(),
+                });
             }
             if levels.iter().any(|&q| !(0.0..1.0).contains(&q)) {
-                return Err(JammiError::FineTune(
-                    "Quantile levels must lie strictly in (0, 1)".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "must lie strictly in (0, 1)".into(),
+                });
             }
             if levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::FineTune(
-                    "Quantile levels must be strictly ascending".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "levels".into(),
+                    reason: "must be strictly ascending".into(),
+                });
             }
         }
         Ok(())
@@ -288,30 +293,41 @@ impl ContextPredictorTrainConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         self.head.validate()?;
         if self.context_k == 0 {
-            return Err(JammiError::FineTune("context_k must be at least 1".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "context_k".into(),
+                reason: "must be at least 1".into(),
+            });
         }
         if self.epochs == 0 {
-            return Err(JammiError::FineTune("epochs must be at least 1".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "epochs".into(),
+                reason: "must be at least 1".into(),
+            });
         }
         if !(0.0..1.0).contains(&self.test_task_fraction) || self.test_task_fraction <= 0.0 {
-            return Err(JammiError::FineTune(
-                "test_task_fraction must lie strictly in (0, 1)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "test_task_fraction".into(),
+                reason: "must lie strictly in (0, 1)".into(),
+            });
         }
         if self.min_task_count < 2 {
-            return Err(JammiError::FineTune(
-                "min_task_count must be at least 2 (one task each for train and test)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "min_task_count".into(),
+                reason: "must be at least 2 (one task each for train and test)".into(),
+            });
         }
         if matches!(
             self.architecture,
             ContextArchitecture::AttnCnp | ContextArchitecture::Tnp
         ) && (self.num_heads == 0 || !self.hidden_dim.is_multiple_of(self.num_heads))
         {
-            return Err(JammiError::FineTune(format!(
-                "num_heads ({}) must be non-zero and divide hidden_dim ({})",
-                self.num_heads, self.hidden_dim
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "num_heads".into(),
+                reason: format!(
+                    "must be non-zero and divide hidden_dim ({}), got {}",
+                    self.hidden_dim, self.num_heads
+                ),
+            });
         }
         Ok(())
     }
@@ -353,6 +369,9 @@ pub struct ContextPredictorMetrics {
     /// The objective over the held-out episodes at the same points; empty
     /// when the split held out no task.
     pub held_out_scores: Vec<f64>,
+    /// The tasks the split held out — the ones a reader evaluates the
+    /// published predictor on as unseen.
+    pub held_out_tasks: Vec<String>,
 }
 
 /// The objective over both episode sets as training moves the predictor.
@@ -410,6 +429,8 @@ pub struct SampledEpisodes {
     pub test: Vec<EpisodeBatch>,
     /// Distinct task count the meta-dataset carried (train + test).
     pub task_count: usize,
+    /// The held-out test tasks, by name: unseen at training time.
+    pub held_out_tasks: Vec<String>,
     /// The target standardiser reduced from the train tasks' outcomes — the one
     /// transform that z-scores both ends of an episode and de-standardises the
     /// served head. Engine-internal: a consumer reads the episodes, never the
@@ -556,6 +577,7 @@ impl InferenceSession {
             train,
             test,
             task_count,
+            held_out_tasks: test_tasks,
             scaler,
         })
     }
@@ -591,8 +613,7 @@ impl InferenceSession {
 
     /// Submit an episodic in-context-predictor meta-training job on
     /// `source_id`'s embedding table per `spec`, returning a
-    /// [`TrainingJob`](crate::fine_tune::training_job::TrainingJob) handle
-    /// immediately.
+    /// [`JobHandle`](crate::jobs::JobHandle) immediately.
     ///
     /// Like the fine-tune verbs, this persists a self-describing
     /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and
@@ -601,13 +622,13 @@ impl InferenceSession {
     /// (deterministic task split via the seed), drives the predictor train loop
     /// while heartbeating, and registers the trained predictor. Call
     /// `job.wait().await` to block until a worker drives it to completion;
-    /// `job.model_id()` is the model id the predictor registers under (the
-    /// spec's `model_id`).
+    /// `job.output_model_id()` is the model id the predictor registers under
+    /// (the spec's `model_id`).
     pub async fn train_context_predictor(
         self: &Arc<Self>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+    ) -> Result<crate::jobs::JobHandle> {
         self.train_context_predictor_deduped(source_id, spec, None)
             .await
     }
@@ -623,7 +644,7 @@ impl InferenceSession {
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
         idempotency_key: Option<&str>,
-    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+    ) -> Result<crate::jobs::JobHandle> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let training_spec = TrainingSpec::ContextPredictor {
             source: source_id.to_string(),
@@ -638,42 +659,8 @@ impl InferenceSession {
         // place that construction happens.
         let admitted =
             crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training_spec)?;
-        // `model_ref`/`output_model_id` come from the one derivation every
-        // training submitter shares (`InferenceSession::training_job_links`):
-        // the source's embedding model's PK, and the predictor's own id.
-        let links = self.training_job_links(admitted.spec(), &job_id).await?;
-        let submitted = crate::fine_tune::spec::submit_admitted_training(
-            self.catalog(),
-            &admitted,
-            &job_id,
-            links.model_ref.as_deref(),
-            &links.output_model_id,
-            0,
-            idempotency_key,
-        )
-        .await?;
-        let recorded_job_id = submitted.recorded_job_id;
-
-        if recorded_job_id == job_id {
-            Ok(crate::fine_tune::training_job::TrainingJob::new(
-                job_id,
-                "queued".into(),
-                links.output_model_id,
-                Arc::clone(self.catalog_arc()),
-            ))
-        } else {
-            // A concurrent or prior call already holds this idempotency key
-            // — re-read its current state rather than assuming "queued".
-            let record = self.catalog().get_job(&recorded_job_id).await?;
-            let model_id =
-                crate::fine_tune::training_job::resolve_model_id(&recorded_job_id, &record)?;
-            Ok(crate::fine_tune::training_job::TrainingJob::new(
-                recorded_job_id,
-                record.status,
-                model_id,
-                Arc::clone(self.catalog_arc()),
-            ))
-        }
+        self.submit_training(&admitted, job_id, 0, idempotency_key)
+            .await
     }
 
     /// The embedding table a context-predictor training run reads: the spec's
@@ -719,7 +706,9 @@ impl InferenceSession {
                 .await?;
         }
         let registered = self.catalog().get_model(model_id).await?.ok_or_else(|| {
-            JammiError::FineTune(format!("Base model '{model_id}' not registered in catalog"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: model_id.to_string(),
+            })
         })?;
         Ok(Some(registered.catalog_pk))
     }
@@ -744,11 +733,17 @@ impl InferenceSession {
     /// tenant-scoped: the worker runs this whole call inside the job's tenant
     /// scope, so the session's shared tenant binding resolves to the job's tenant
     /// rather than the worker's unbound default.
+    ///
+    /// The fit itself is CPU-bound, so it runs on a blocking thread; at each
+    /// epoch it reports the optimizer steps taken onto the job's row through
+    /// `progress` (the job's tenant-pinned catalog and its reporter), when
+    /// given.
     pub(crate) async fn run_context_predictor_training(
         self: &Arc<Self>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        progress: Option<(Arc<jammi_db::catalog::Catalog>, ProgressReporter)>,
     ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let sampled = self.sample_context_episodes(source_id, spec).await?;
         if sampled.train.is_empty() {
@@ -770,15 +765,41 @@ impl InferenceSession {
 
         let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
         let started_at = chrono::Utc::now();
-        let mut curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
-        let report = fit_context_predictor(
-            spec,
-            &varmap,
-            &predictor,
-            &sampled.train,
-            cancel,
-            |trained, _| curve.after_epoch(spec, trained, &sampled),
-        )?;
+        let curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
+        let sampled = Arc::new(sampled);
+        let fit_sampled = Arc::clone(&sampled);
+        let fit_spec = spec.clone();
+        let fit_varmap = varmap.clone();
+        let (report, curve) = tokio::task::spawn_blocking(move || {
+            let (mut curve, mut progress) = (curve, progress);
+            let steps_per_epoch = fit_sampled.train.len() as u64;
+            let total = Some(fit_spec.epochs as u64 * steps_per_epoch);
+            let report = fit_context_predictor(
+                &fit_spec,
+                &fit_varmap,
+                &predictor,
+                &fit_sampled.train,
+                &cancel,
+                |trained, epoch| {
+                    curve.after_epoch(&fit_spec, trained, &fit_sampled)?;
+                    match progress.as_mut() {
+                        Some((catalog, reporter)) => {
+                            let steps = JobProgress {
+                                phase: JobPhase::Training,
+                                done: Some(epoch as u64 * steps_per_epoch),
+                                total,
+                            };
+                            tokio::runtime::Handle::current()
+                                .block_on(reporter.report(catalog, steps))
+                        }
+                        None => Ok(()),
+                    }
+                },
+            )?;
+            Ok::<_, JammiError>((report, curve))
+        })
+        .await
+        .map_err(|e| JammiError::Internal(format!("context predictor training task: {e}")))??;
         let metrics = ContextPredictorMetrics {
             started_at,
             completed_at: chrono::Utc::now(),
@@ -787,6 +808,7 @@ impl InferenceSession {
             step_seconds: report.step_seconds,
             train_scores: curve.train,
             held_out_scores: curve.held_out,
+            held_out_tasks: sampled.held_out_tasks.clone(),
         };
 
         self.persist_predictor(spec, &table, &sampled.scaler, &varmap, &metrics)
@@ -1305,7 +1327,9 @@ impl InferenceSession {
         options: ContextServeOptions,
     ) -> Result<ServedContextPredictor> {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
-            JammiError::Catalog(format!("context predictor '{model_id}' not found"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: model_id.to_string(),
+            })
         })?;
         // Unlike a fine-tuned id, a context-predictor id is caller-chosen and carries
         // no reserved prefix `ModelResolver::try_catalog_lookup` can cross-check
@@ -1432,10 +1456,13 @@ impl InferenceSession {
             })?
             .get();
         if serve_dim != feature_dim {
-            return Err(JammiError::Inference(format!(
-                "context predictor '{model_id}' was trained on feature_dim {feature_dim} but \
+            return Err(JammiError::InvalidArgument {
+                argument: "source".into(),
+                reason: format!(
+                    "context predictor '{model_id}' was trained on feature_dim {feature_dim} but \
                  serving source '{source_id}' has dimension {serve_dim}"
-            )));
+                ),
+            });
         }
 
         let device = crate::model::backend::candle::select_device(self.device_config())?;
@@ -1614,11 +1641,12 @@ impl InferenceSession {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "targets".into(),
+                reason: format!(
                     "target '{target_key}' has no stored vector in '{}'",
                     pin.table_name()
-                ))
+                ),
             })?;
 
         let mut request =
@@ -1810,57 +1838,33 @@ impl ConformalContextPredictor {
     ///
     /// A Gaussian head wraps with absolute-residual conformal centred on the
     /// predictive mean; a quantile head wraps with CQR over its lower/upper
-    /// served quantiles — the score family the calibration chose. `group` is the
-    /// test target's cohort for a Mondrian (group-conditional) wrap — supplied by
-    /// governance, `None` for a marginal wrap; the engine never derives it.
+    /// served quantiles — the score family the calibration chose. `at` is what
+    /// the test target brings for the wrap's [`Calibration`]: its cohort under
+    /// Mondrian, its likelihood ratio under weighting — supplied by the caller;
+    /// the engine never derives it.
     pub fn interval(
         &self,
         prediction: &PredictedDistribution,
-        group: Option<&str>,
+        at: TestPoint<'_>,
     ) -> Result<(f64, f64)> {
-        match &self.form {
-            DistributionForm::Gaussian => {
-                self.conformal
-                    .predict_interval(prediction.point_estimate() as f64, 0.0, 0.0, group)
-            }
+        let estimate = match &self.form {
+            DistributionForm::Gaussian => Estimate::Point(prediction.point_estimate() as f64),
             DistributionForm::Quantile { .. } => {
-                let (lo, hi) = prediction.quantile_bounds().ok_or_else(|| {
-                    JammiError::Inference(
-                        "CQR conformal wrap requires a quantile-head prediction".into(),
-                    )
-                })?;
-                self.conformal
-                    .predict_interval(0.0, lo as f64, hi as f64, group)
+                let (lower, upper) =
+                    prediction
+                        .quantile_bounds()
+                        .ok_or_else(|| JammiError::InvalidArgument {
+                            argument: "conformal".into(),
+                            reason: "CQR conformal wrap requires a quantile-head prediction".into(),
+                        })?;
+                Estimate::Band {
+                    lower: lower as f64,
+                    upper: upper as f64,
+                }
             }
-        }
+        };
+        self.conformal.predict_interval(estimate, at)
     }
-}
-
-/// The conformal calibration lever a caller / governance supplies. The engine
-/// **applies** the chosen lever; it never **chooses** one. `Marginal` is the
-/// default and always serves; `Mondrian`/`Weighted` route to the group-
-/// conditional / importance-weighted [`ConformalModel`] constructors with
-/// caller-supplied cohorts / weights (one per calibration point).
-///
-/// Graph-assembled context can break the exchangeability split-conformal
-/// *marginal* coverage assumes; the levers are the honest repair — but *which*
-/// cohort or weights, and *whether* to apply them, is governance's call:
-/// choosing the cohorts is governance, not a serving output. The engine surfaces the `source` fact
-/// and applies what it is told.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConformalLevers {
-    /// Plain marginal split-conformal (the default; always serves).
-    Marginal,
-    /// Group-conditional (Mondrian): one cohort key per calibration point.
-    Mondrian {
-        /// Cohort key per calibration point, in calibration order.
-        groups: Vec<String>,
-    },
-    /// Importance-weighted: one weight per calibration point (NAPS / Barber).
-    Weighted {
-        /// Non-negative weight per calibration point, in calibration order.
-        weights: Vec<f64>,
-    },
 }
 
 impl InferenceSession {
@@ -1876,47 +1880,27 @@ impl InferenceSession {
     /// [`ConformalModel`] — it does not modify the conformal primitive, only
     /// feeds it.
     ///
-    /// `levers` is the caller / governance choice of marginal (the default,
-    /// which always serves), Mondrian (group-conditional), or weighted
-    /// (importance-weighted) calibration — *applied* here, never *chosen* here.
-    /// Graph-assembled context can break exchangeability; supplying a cohort or
-    /// weights is the honest repair, but the choice is governance's, not the
-    /// engine's.
+    /// `scheme` is the caller's choice of marginal, Mondrian (group-conditional),
+    /// or weighted calibration — *applied* here, never *chosen* here, with one
+    /// cohort or weight per calibration target. Graph-assembled context can
+    /// break exchangeability; supplying cohorts or weights is the honest repair,
+    /// but the choice is the caller's.
     pub async fn calibrate_context_predictor_conformal(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
         calibration: &[(String, f64)],
         alpha: f64,
-        levers: ConformalLevers,
+        scheme: Calibration,
     ) -> Result<ConformalContextPredictor> {
         if calibration.is_empty() {
-            return Err(JammiError::Inference(
-                "conformal calibration requires at least one held-out target".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "calibration".into(),
+                reason: "conformal calibration requires at least one held-out target".into(),
+            });
         }
-        // A supplied lever carries one cohort / weight per calibration point;
-        // a length mismatch is a typed error, never a silent misalignment.
-        match &levers {
-            ConformalLevers::Marginal => {}
-            ConformalLevers::Mondrian { groups } if groups.len() == calibration.len() => {}
-            ConformalLevers::Weighted { weights } if weights.len() == calibration.len() => {}
-            ConformalLevers::Mondrian { groups } => {
-                return Err(JammiError::Inference(format!(
-                    "Mondrian conformal needs one cohort per calibration point: \
-                     {} cohorts vs {} points",
-                    groups.len(),
-                    calibration.len()
-                )))
-            }
-            ConformalLevers::Weighted { weights } => {
-                return Err(JammiError::Inference(format!(
-                    "weighted conformal needs one weight per calibration point: \
-                     {} weights vs {} points",
-                    weights.len(),
-                    calibration.len()
-                )))
-            }
-        }
+        // Checked before the forwards run, so a misaligned cohort or weight list
+        // costs nothing.
+        scheme.check_rows(calibration.len())?;
 
         let mut predictions = Vec::with_capacity(calibration.len());
         let mut lower = Vec::with_capacity(calibration.len());
@@ -1927,11 +1911,13 @@ impl InferenceSession {
             match &served.form {
                 DistributionForm::Gaussian => predictions.push(dist.point_estimate() as f64),
                 DistributionForm::Quantile { .. } => {
-                    let (lo, hi) = dist.quantile_bounds().ok_or_else(|| {
-                        JammiError::Inference(
-                            "CQR calibration requires a quantile-head prediction".into(),
-                        )
-                    })?;
+                    let (lo, hi) =
+                        dist.quantile_bounds()
+                            .ok_or_else(|| JammiError::InvalidArgument {
+                                argument: "conformal".into(),
+                                reason: "CQR calibration requires a quantile-head prediction"
+                                    .into(),
+                            })?;
                     lower.push(lo as f64);
                     upper.push(hi as f64);
                 }
@@ -1939,37 +1925,17 @@ impl InferenceSession {
             observed.push(*y);
         }
 
-        let score = match &served.form {
-            DistributionForm::Gaussian => IntervalScore::AbsoluteResidual,
-            DistributionForm::Quantile { .. } => IntervalScore::Cqr,
+        // The head form decides which estimates carry signal: point estimates for
+        // a Gaussian head (absolute residual), quantile bounds for a quantile
+        // head (CQR).
+        let estimates = match &served.form {
+            DistributionForm::Gaussian => Estimates::Points(&predictions),
+            DistributionForm::Quantile { .. } => Estimates::Bands {
+                lower: &lower,
+                upper: &upper,
+            },
         };
-        // The score family decides which arrays carry signal (point estimates for
-        // absolute-residual, quantile bounds for CQR); the lever decides which
-        // existing `ConformalModel` constructor those feed. `Marginal` reproduces the plain
-        // split-conformal interval exactly.
-        let conformal = match &levers {
-            ConformalLevers::Marginal => {
-                ConformalModel::regression(&predictions, &lower, &upper, &observed, score, alpha)?
-            }
-            ConformalLevers::Mondrian { groups } => ConformalModel::regression_mondrian(
-                &predictions,
-                &lower,
-                &upper,
-                &observed,
-                groups,
-                score,
-                alpha,
-            )?,
-            ConformalLevers::Weighted { weights } => ConformalModel::regression_weighted(
-                &predictions,
-                &lower,
-                &upper,
-                &observed,
-                weights,
-                score,
-                alpha,
-            )?,
-        };
+        let conformal = ConformalModel::regression(estimates, &observed, &scheme, alpha)?;
 
         Ok(ConformalContextPredictor {
             conformal,

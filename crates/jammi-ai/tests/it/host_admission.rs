@@ -296,7 +296,7 @@ async fn the_claim_loop_moves_the_holder_free_probe_run_free() {
         .enqueue(never_dispatched_infer(&source).into(), 0)
         .await
         .unwrap();
-    let prologue = loop_test_hooks::arm(&handle.job_id, loop_test_hooks::ParkPoint::BeforeHold);
+    let prologue = loop_test_hooks::arm(handle.job_id(), loop_test_hooks::ParkPoint::BeforeHold);
     let dispatch = compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
     let admission = Arc::clone(session.host_admission());
     assert_eq!(admission.holder(), Holder::Free);
@@ -317,7 +317,7 @@ async fn the_claim_loop_moves_the_holder_free_probe_run_free() {
     );
     dispatch.release();
     wait_holder(&admission, |h| *h == Holder::Free, "Free after the run").await;
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
     assert!(
         row.is_terminal(),
         "the run reached a terminal state: {row:?}"
@@ -377,8 +377,8 @@ async fn an_idle_loop_never_claims_while_a_rank_is_held() {
         calls_at_hold,
         "claim_next must not be called while a rank is held"
     );
-    let row = session.catalog().get_job(&handle.job_id).await.unwrap();
-    assert_eq!(row.status, JobStatus::Queued.to_string(), "{row:?}");
+    let row = session.catalog().get_job(handle.job_id()).await.unwrap();
+    assert_eq!(row.status, JobStatus::Queued, "{row:?}");
     assert_eq!(
         admission.holder(),
         Holder::Rank {

@@ -1,4 +1,4 @@
-"""Measure recall@k, precision@k, MRR and nDCG of an embedding table against a golden set.
+"""Measure recall@k, precision@k, MRR and nDCG of an embedding table against a ground truth.
 
 Run with `python cookbook/recipes/eval_embeddings/example.py`, or a step at a
 time as a notebook: each `# %%` cell is one step.
@@ -31,7 +31,7 @@ base = db.generate_embeddings(
 )
 
 # %% [markdown]
-# ## The golden set
+# ## The ground truth
 #
 # Relevance judgments: for each query, the corpus rows that should come back.
 # `eval_embeddings` reads them as a source with one row per
@@ -39,15 +39,15 @@ base = db.generate_embeddings(
 # query with a list of relevant ids, is flattened into that shape first.
 
 # %%
-golden_csv = home / "golden.csv"
-with golden_csv.open("w", newline="") as f:
+relevance_csv = home / "truth.csv"
+with relevance_csv.open("w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["query_id", "query_text", "relevant_id"])
-    for q in json.loads(fixtures.path("tiny_golden.json").read_text()):
+    for q in json.loads(fixtures.path("tiny_relevance.json").read_text()):
         for rid in q["relevant_ids"]:
             writer.writerow([q["query_id"], q["query_text"], str(rid)])
 
-db.add_source("golden", url=str(golden_csv), format="csv")
+db.add_source("truth", url=str(relevance_csv), format="csv")
 
 # %% [markdown]
 # ## Evaluate
@@ -60,7 +60,7 @@ db.add_source("golden", url=str(golden_csv), format="csv")
 # them in its top five.
 
 # %%
-metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
 
 aggregate = metrics["aggregate"]
 for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
@@ -71,7 +71,7 @@ assert aggregate["recall_at_k"] > 0.5, "the encoder recalls far more than a rand
 
 per_query = metrics["per_query"]
 assert len(per_query) > 0, "per_query must carry one record per query"
-assert per_query[0]["query_id"], "per_query records carry the golden-set query_id"
+assert per_query[0]["query_id"], "per_query records carry the ground-truth query_id"
 print(f"per_query: {len(per_query)} records (first: {per_query[0]['query_id']})")
 
 # %% [markdown]
@@ -97,7 +97,7 @@ print(f"persisted per-query rows: {len(persisted)} (run {eval_run_id})")
 
 # %%
 tagged = db.eval_embeddings(
-    source="corpus", golden_source="golden.public.golden", k=5, cohorts={"q1": {"split": "val"}}
+    source="corpus", ground_truth="truth.public.truth", k=5, cohorts={"q1": {"split": "val"}}
 )
 by_query = {r["query_id"]: r for r in db.eval_per_query(tagged["eval_run_id"])}
 assert by_query["q1"]["cohorts"].get("split") == "val", "cohort stored verbatim"
@@ -106,7 +106,7 @@ print(f"q1 cohorts: {by_query['q1']['cohorts']}")
 # %% [markdown]
 # ## Compare two tables
 #
-# `eval_compare` scores several embedding tables on one golden set. The first
+# `eval_compare` scores several embedding tables on one ground truth. The first
 # is the baseline, and every other carries its per-metric delta against it.
 # Here the candidate is the same embeddings smoothed over the corpus's own
 # k-nearest-neighbour graph.
@@ -117,7 +117,7 @@ smoothed = db.propagate_embeddings(
     "corpus", embedding_table=base, edge_graph_table=graph, hops=1, alpha=0.5
 )
 compared = db.eval_compare(
-    embedding_tables=[base, smoothed], source="corpus", golden_source="golden.public.golden", k=5
+    embedding_tables=[base, smoothed], source="corpus", ground_truth="truth.public.truth", k=5
 )
 baseline, candidate = compared["per_table"]
 assert baseline["delta"] is None

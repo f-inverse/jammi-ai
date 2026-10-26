@@ -3,7 +3,7 @@
 //!
 //! The report types and the [`EvalTask`] / [`EvalCalibrationShape`] selectors
 //! are the terminal results an eval verb returns and the inputs that select
-//! which metric family scores a golden source. They carry no engine state, so
+//! which metric family scores a ground-truth source. They carry no engine state, so
 //! they live on the wire substrate: the embedded runner builds them, the gRPC
 //! converters encode/decode them, and the data-plane client decodes them — none
 //! reimplements the shape.
@@ -19,9 +19,9 @@ pub use report::{
 
 use serde::{Deserialize, Serialize};
 
-/// The predictive output shape an `eval_calibration` golden source carries.
+/// The predictive output shape an `eval_calibration` ground-truth source carries.
 ///
-/// A calibration golden source pairs a held-out predictive distribution with
+/// A calibration ground-truth source pairs a held-out predictive distribution with
 /// its realised outcome. The shape selects which columns the runner reads and
 /// which proper-score / diagnostic family scores them — exactly the way
 /// [`EvalTask`] selects the inference metric. Both families are scored on the
@@ -53,9 +53,10 @@ impl std::str::FromStr for EvalCalibrationShape {
         match s {
             "gaussian" => Ok(Self::Gaussian),
             "sample" => Ok(Self::Sample),
-            other => Err(jammi_db::error::JammiError::Other(format!(
-                "Unknown calibration shape '{other}'. Expected: gaussian, sample"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "calibration_shape".into(),
+                reason: format!("unknown calibration shape '{other}'; expected gaussian or sample"),
+            }),
         }
     }
 }
@@ -83,9 +84,10 @@ impl std::str::FromStr for EvalTask {
         match s {
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
-            other => Err(jammi_db::error::JammiError::Other(format!(
-                "Unknown eval task '{other}'. Expected: classification, ner"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: format!("unknown eval task '{other}'; expected classification or ner"),
+            }),
         }
     }
 }

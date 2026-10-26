@@ -13,7 +13,13 @@ arrow-flight.workspace = true
 parquet.workspace = true
 futures.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
 tempfile = "3"
 sqlx.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true

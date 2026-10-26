@@ -68,6 +68,25 @@ pub enum ChannelCatalogError {
     InvalidColumnType(String),
 }
 
+impl ChannelCatalogError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]). A
+    /// same-type redeclare and a duplicate channel are both `AlreadyExists`
+    /// (the resource is present); a different-type redeclare conflicts with
+    /// the stored declaration; a bad slug or column-type token is the caller's
+    /// input.
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::AlreadyExists(_) | Self::ColumnAlreadyDeclared { .. } => {
+                ErrorClass::AlreadyExists
+            }
+            Self::NotRegistered(_) => ErrorClass::NotFound,
+            Self::ColumnConflict { .. } => ErrorClass::FailedPrecondition,
+            Self::InvalidId(_) | Self::InvalidColumnType(_) => ErrorClass::InvalidArgument,
+        }
+    }
+}
+
 /// A column-type token (`"Float32"`, `"Utf8"`, …) that is not one of the closed
 /// set of PascalCase Arrow names. A neutral parse outcome carrying the offending
 /// token, with no caller-vs-corruption verdict baked in: [`ChannelColumnType::
@@ -115,9 +134,10 @@ impl ChannelColumnType {
             DataType::Int64 => Ok(Self::Int64),
             DataType::Utf8 => Ok(Self::Utf8),
             DataType::Boolean => Ok(Self::Boolean),
-            other => Err(JammiError::Catalog(format!(
-                "unsupported channel column type: {other:?}"
-            ))),
+            other => Err(JammiError::InvalidArgument {
+                argument: "columns".into(),
+                reason: format!("unsupported channel column type: {other:?}"),
+            }),
         }
     }
 
@@ -775,7 +795,9 @@ mod tests {
     #[test]
     fn from_arrow_rejects_unsupported_type() {
         let err = ChannelColumnType::from_arrow(&DataType::UInt16).unwrap_err();
-        assert!(matches!(err, JammiError::Catalog(_)));
+        assert!(
+            matches!(err, JammiError::InvalidArgument { ref argument, .. } if argument == "columns")
+        );
     }
 
     #[test]

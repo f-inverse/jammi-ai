@@ -59,9 +59,12 @@ pub(crate) fn served_width(
     match dimensions {
         None => Ok(native),
         Some(width) if (1..=native).contains(&width) => Ok(width),
-        Some(width) => Err(JammiError::Config(format!(
+        Some(width) => Err(JammiError::InvalidArgument {
+            argument: "dimensions".into(),
+            reason: format!(
             "cannot serve {width} dimensions of '{model_id}', whose embeddings are {native} wide"
-        ))),
+        ),
+        }),
     }
 }
 
@@ -102,16 +105,7 @@ pub async fn build_embedding_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let table_name = session.find_table_name(source_id).await?;
     let query = session.build_source_query(source_id, &table_name, key_column, columns);
-
-    let df = session
-        .context()
-        .sql(&query)
-        .await
-        .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
-    let input_plan = df
-        .create_physical_plan()
-        .await
-        .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+    let input_plan = session.plan_source_query(&query).await?;
     // The source scan's `_content_hash` projection rides through to the sink
     // as the table's fifth column.
     let inference = &session.inner_config().inference;
@@ -162,7 +156,7 @@ impl<'a> EmbeddingPipeline<'a> {
     ///
     /// `cache` opts into memoization. Embeddings anchor their source as
     /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
-    /// — a raw source has no version surface in open-core — so an `Use` request
+    /// — a raw source has no version surface — so an `Use` request
     /// is honestly **always** a miss (`probe_cache` short-circuits any unpinned
     /// anchor): the cache is off here until sources expose a version surface. The
     /// returned [`CacheOutcome`] is therefore always `Computed`; the probe still

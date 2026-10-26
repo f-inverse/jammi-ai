@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 import jammi
-from jammi.errors import BackendError
+from jammi.errors import ModelReferenced
 from jammi_cookbook import fixtures
 
 BASE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -83,7 +83,7 @@ assert described is not None and described["model_id"] == tuned
 try:
     db.delete_model(tuned)
     raise AssertionError("a referenced model must not delete")
-except BackendError as refused:
+except ModelReferenced as refused:
     print(f"delete while referenced: refused ({refused})")
 
 db.delete_model("jammi:fine-tuned:absent", if_exists=True)

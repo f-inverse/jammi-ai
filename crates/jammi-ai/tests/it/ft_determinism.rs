@@ -39,6 +39,7 @@ use jammi_ai::fine_tune::{
     EarlyStoppingMetric, FineTuneConfig,
 };
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::status::JobKind;
 
 /// Catalog + claimed-job boilerplate so a `TrainingLoop` can run (it stamps
 /// lease-guarded run-start metrics). Mirrors `ft_correctness_sweep`'s setup.
@@ -62,7 +63,7 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
     catalog
         .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
             job_id: tag,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: jammi_db::catalog::status::JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&format!("{model_id}::1")),
@@ -75,7 +76,7 @@ async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catalog>, tempfi
     catalog
         .claim_next(
             &format!("{tag}-worker"),
-            &["fine_tune"],
+            &[JobKind::FineTune],
             std::time::Duration::from_secs(60),
         )
         .await
@@ -136,7 +137,7 @@ async fn run_and_capture_adapter_bytes(tag: &str, seed: u64) -> Vec<u8> {
 
     let (catalog, dir) = claimed_loop_env(tag).await;
 
-    let mut tl = TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+    let mut tl = TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
         .job_id(tag.to_string())
         .catalog(Arc::clone(&catalog))
         .artifact_dir(dir.path().to_path_buf())
@@ -206,7 +207,7 @@ async fn seeded_init_is_reproducible_and_seed_sensitive() {
             ..Default::default()
         };
         let head = build_projection_head(8, &cfg, &varmap, &vb).unwrap();
-        let w = TrainingTarget::ProjectionHead { head }
+        let w = TrainingTarget::FrozenEncoder { head }
             .named_trainable_weights()
             .unwrap();
         let a: Vec<f32> = w["projection.lora_a"]

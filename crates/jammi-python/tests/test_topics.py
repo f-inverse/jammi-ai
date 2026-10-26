@@ -101,10 +101,9 @@ def test_register_inherits_session_tenant(tmp_path):
 
 
 def test_drop_missing_without_if_exists_raises(tmp_path):
-    """`drop_topic` over an unknown name raises — the binding rejects with
-    `ValueError`."""
+    """`drop_topic` over an unknown name raises the typed `NotFound`."""
     db = jammi.connect(f"file://{tmp_path}")
-    with pytest.raises((ValueError, RuntimeError)) as info:
+    with pytest.raises(jammi.errors.NotFound) as info:
         db.drop_topic("never.registered")
     msg = str(info.value).lower()
     assert "not found" in msg, (

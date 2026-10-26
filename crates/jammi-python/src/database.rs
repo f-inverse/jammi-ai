@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_arrow::{PySchema, PyTable};
@@ -19,7 +18,7 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
-use jammi_db::trigger::{Offset, Predicate};
+use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
@@ -138,7 +137,7 @@ impl PyDatabase {
         })
     }
 
-    /// `Err` (the same typed `BackendError` [`PyDatabase::close`] raises for
+    /// `Err` (the same typed `FailedPrecondition` [`PyDatabase::close`] raises for
     /// every later call) once `close()` has run; `Ok(())` otherwise. Every
     /// pymethod but `close()` and `attach`'s target `job` calls this
     /// first, so a caller who keeps using a handle after `close()` gets a
@@ -146,9 +145,10 @@ impl PyDatabase {
     /// state the worker/session were left in.
     fn check_open(&self) -> PyResult<()> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(to_pyerr(JammiError::Catalog(
+            return Err(crate::error::client_error(
+                "FailedPrecondition",
                 "Database is closed".to_string(),
-            )));
+            ));
         }
         Ok(())
     }
@@ -362,11 +362,8 @@ impl PyDatabase {
     /// read itself.
     fn job(&self, job_id: &str) -> PyResult<PyJob> {
         self.check_open()?;
-        PyJob::attach(
-            job_id.to_string(),
-            Arc::clone(&self.runtime),
-            Arc::clone(&self.session),
-        )
+        let handle = crate::released(&self.runtime, self.session.job(job_id)).map_err(to_pyerr)?;
+        Ok(PyJob::new(handle, Arc::clone(&self.runtime)))
     }
 
     /// List every job visible to the current tenant, most recent first. Each
@@ -377,11 +374,9 @@ impl PyDatabase {
     /// answers plus the submit-time identity, not a progress surface: read
     /// [`PyJob::progress`] on the individual handle for that.
     ///
-    /// `output_model_id` is stamped at submission for a training kind (and
-    /// always empty for a compute kind) and `error` is empty unless it
-    /// failed — the same two conventions `JobService.ListJobs` relays,
-    /// reproduced here rather than mapping absence onto `None` on one
-    /// transport only.
+    /// `output_model_id` names the model the job produced — `None` until a
+    /// training kind completes, and always for a compute kind — and each
+    /// other absent value is `None`, as `JobService.ListJobs` states it.
     ///
     /// Tenant-scoped by the catalog read itself
     /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
@@ -395,16 +390,13 @@ impl PyDatabase {
         for record in &records {
             let entry = PyDict::new(py);
             entry.set_item("job_id", &record.job_id)?;
-            entry.set_item("kind", &record.kind)?;
-            entry.set_item("status", &record.status)?;
-            entry.set_item("base_model_id", record.model_ref.as_deref().unwrap_or(""))?;
-            entry.set_item(
-                "output_model_id",
-                record.output_model_id.as_deref().unwrap_or(""),
-            )?;
+            entry.set_item("kind", record.kind.to_string())?;
+            entry.set_item("status", record.status.to_string())?;
+            entry.set_item("base_model_id", record.model_ref.as_deref())?;
+            entry.set_item("output_model_id", record.produced_model_id())?;
             entry.set_item("created_at", &record.created_at)?;
-            entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
-            entry.set_item("claimed_by", record.claimed_by.as_deref().unwrap_or(""))?;
+            entry.set_item("error", record.error.as_deref())?;
+            entry.set_item("claimed_by", record.claimed_by.as_deref())?;
             entry.set_item("ranks", &record.ranks)?;
             list.append(entry)?;
         }
@@ -433,10 +425,17 @@ impl PyDatabase {
         for w in &records {
             let entry = PyDict::new(py);
             entry.set_item("instance_id", &w.instance_id)?;
-            entry.set_item("label", w.label.as_deref().unwrap_or(""))?;
-            entry.set_item("host", w.host.as_deref().unwrap_or(""))?;
-            entry.set_item("kinds", &w.kinds)?;
-            entry.set_item("state", &w.state)?;
+            entry.set_item("label", w.label.as_deref())?;
+            entry.set_item("host", w.host.as_deref())?;
+            entry.set_item(
+                "kinds",
+                w.kinds
+                    .as_slice()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )?;
+            entry.set_item("state", w.state.to_string())?;
             entry.set_item("started_at", &w.started_at)?;
             entry.set_item("last_seen_at", &w.last_seen_at)?;
             list.append(entry)?;
@@ -817,20 +816,14 @@ impl PyDatabase {
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
-            })?;
-        let (batches, _schema) = batch.into_inner();
+            .ok_or_else(|| to_pyerr(TriggerError::TopicNotFound(topic.to_string())))?;
+        let (batches, schema) = batch.into_inner();
         // The publisher accepts one RecordBatch per call; concatenate the
         // streamed chunks so a multi-chunk pyarrow.Table publishes as one
         // logical event.
-        let concatenated = if batches.len() == 1 {
-            batches
-                .into_iter()
-                .next()
-                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("publish batch was empty"))?
+        let concatenated = if let [single] = batches.as_slice() {
+            single.clone()
         } else {
-            let schema = batches[0].schema();
             arrow::compute::concat_batches(&schema, batches.iter())
                 .map_err(|e| to_pyerr(datafusion::error::DataFusionError::from(e)))?
         };
@@ -866,19 +859,19 @@ impl PyDatabase {
             (true, bound) => bound,
             (false, Some(bound)) => Some(bound),
             (false, None) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "a collect that follows the live tail (replay_only=False) needs \
-                     max_batches: the tail never ends on its own",
-                ))
+                return Err(to_pyerr(JammiError::InvalidArgument {
+                    argument: "max_batches".into(),
+                    reason: "a collect that follows the live tail (replay_only=False) needs \
+                             one: the tail never ends on its own"
+                        .into(),
+                }))
             }
         };
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
-            })?;
+            .ok_or_else(|| to_pyerr(TriggerError::TopicNotFound(topic.to_string())))?;
         let predicate = Predicate::from_sql(
             self.session.context(),
             Arc::clone(&topic_def.schema),
@@ -1229,7 +1222,7 @@ impl PyDatabase {
                 Ok(())
             }
             None if if_exists => Ok(()),
-            None => Err(PyValueError::new_err(format!("topic '{name}' not found"))),
+            None => Err(to_pyerr(TriggerError::TopicNotFound(name.to_string()))),
         }
     }
 
@@ -1291,19 +1284,13 @@ impl PyDatabase {
         self.check_open()?;
         let spec =
             jammi_ai::wire::training_spec_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let kind = spec.kind().to_string();
         let key = idempotency_key.filter(|k| !k.is_empty());
-        let job = crate::released(
+        let handle = crate::released(
             &self.runtime,
             self.session.run_training_spec_deduped(spec, key),
         )
         .map_err(to_pyerr)?;
-        Ok(PyJob::new(
-            job,
-            kind,
-            Arc::clone(&self.runtime),
-            Arc::clone(&self.session),
-        ))
+        Ok(PyJob::new(handle, Arc::clone(&self.runtime)))
     }
 
     /// Predict a target's distribution with a trained context predictor by
@@ -1421,7 +1408,7 @@ impl PyDatabase {
     /// eval-embeddings paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::eval_embeddings_from_bytes`). Returns a dict with
     /// `aggregate` (mean over all queries) and `per_query` (one record per
-    /// golden-set query) keys — byte-identical to the report the kwargs surface
+    /// ground truth query) keys — byte-identical to the report the kwargs surface
     /// produced. A malformed or invalid body raises `ValueError`.
     fn _eval_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
@@ -1486,7 +1473,7 @@ impl PyDatabase {
                 &args.source_id,
                 &args.columns,
                 args.task,
-                &args.golden_source,
+                &args.ground_truth,
                 &args.label_column,
             ),
         )
@@ -1530,7 +1517,7 @@ impl PyDatabase {
             &self.runtime,
             self.session.eval_calibration(
                 &args.source_id,
-                &args.golden_source,
+                &args.ground_truth,
                 args.shape,
                 &args.cohorts,
             ),
@@ -1749,121 +1736,6 @@ impl PyDatabase {
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
 
-    /// Conformalize a classification predictor into prediction sets.
-    ///
-    /// Split (inductive) conformal: `calibration` holds one row of per-class
-    /// probabilities per held-out example and `true_labels[i]` is the realised
-    /// class for row `i`; the calibration scores yield the finite-sample
-    /// `⌈(n+1)(1-alpha)⌉` quantile, which is applied to every row of `test` to
-    /// emit a prediction set with marginal coverage `>= 1 - alpha`.
-    ///
-    /// `score` selects the nonconformity family: `"lac"`, `"aps"` (default), or
-    /// `"raps"` (regularized APS). For `"raps"`, `raps_params` is the
-    /// `(lambda, k_reg)` regularization pair — the penalty weight and the 1-based
-    /// rank past which it applies; it is ignored by `"lac"`/`"aps"` and defaults
-    /// to `(0.0, 1)`. The calibration set must be disjoint from both the
-    /// training set and `test` — reusing test points inflates coverage. Pure and
-    /// deterministic: identical inputs yield identical sets.
-    ///
-    /// Returns one list of admitted class indices per row of `test`.
-    #[pyo3(signature = (calibration, true_labels, test, *, alpha, score=None, raps_params=None))]
-    fn conformalize(
-        &self,
-        calibration: Vec<Vec<f64>>,
-        true_labels: Vec<usize>,
-        test: Vec<Vec<f64>>,
-        alpha: f64,
-        score: Option<&str>,
-        raps_params: Option<(f64, usize)>,
-    ) -> PyResult<Vec<Vec<usize>>> {
-        self.check_open()?;
-        let (raps_lambda, raps_k_reg) = raps_params.unwrap_or((0.0, 1));
-        let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
-        let model = jammi_ai::predict::ConformalModel::classification(
-            &calibration,
-            &true_labels,
-            score,
-            alpha,
-        )
-        .map_err(to_pyerr)?;
-        test.iter()
-            .map(|row| model.predict_set(row, None).map_err(to_pyerr))
-            .collect()
-    }
-
-    /// Conformalize an absolute-residual regression predictor into
-    /// constant-width prediction intervals.
-    ///
-    /// The calibration nonconformity is `|y - ŷ|` over the `predictions`/
-    /// `observed` held-out pairs; the finite-sample quantile `q̂` then yields
-    /// `[ŷ - q̂, ŷ + q̂]` around each `test_predictions` point, with marginal
-    /// coverage `>= 1 - alpha`. The calibration set must be disjoint from the
-    /// training set and the test points.
-    ///
-    /// Returns one `(lower, upper)` tuple per test row.
-    #[pyo3(signature = (predictions, observed, test_predictions, *, alpha))]
-    fn conformalize_interval(
-        &self,
-        predictions: Vec<f64>,
-        observed: Vec<f64>,
-        test_predictions: Vec<f64>,
-        alpha: f64,
-    ) -> PyResult<Vec<(f64, f64)>> {
-        self.check_open()?;
-        use jammi_ai::predict::{ConformalModel, IntervalScore};
-        let model = ConformalModel::regression(
-            &predictions,
-            &[],
-            &[],
-            &observed,
-            IntervalScore::AbsoluteResidual,
-            alpha,
-        )
-        .map_err(to_pyerr)?;
-        test_predictions
-            .iter()
-            .map(|&p| model.predict_interval(p, 0.0, 0.0, None).map_err(to_pyerr))
-            .collect()
-    }
-
-    /// Conformalize a Conformalized Quantile Regression (CQR) predictor into
-    /// adaptive-width prediction intervals.
-    ///
-    /// The calibration nonconformity is `max(q_lo - y, y - q_hi)` over the
-    /// `lower`/`upper` quantile estimates and `observed` targets; the
-    /// finite-sample quantile `q̂` then yields `[q_lo - q̂, q_hi + q̂]` around
-    /// each `test_lower`/`test_upper` band, so interval width tracks the
-    /// predictor's local uncertainty. The calibration set must be disjoint from
-    /// the training set and the test points.
-    ///
-    /// Returns one `(lower, upper)` tuple per test row.
-    #[pyo3(signature = (lower, upper, observed, test_lower, test_upper, *, alpha))]
-    fn conformalize_cqr(
-        &self,
-        lower: Vec<f64>,
-        upper: Vec<f64>,
-        observed: Vec<f64>,
-        test_lower: Vec<f64>,
-        test_upper: Vec<f64>,
-        alpha: f64,
-    ) -> PyResult<Vec<(f64, f64)>> {
-        self.check_open()?;
-        use jammi_ai::predict::{ConformalModel, IntervalScore};
-        if test_lower.len() != test_upper.len() {
-            return Err(PyValueError::new_err(
-                "cqr conformal: 'test_lower' and 'test_upper' must have equal length",
-            ));
-        }
-        let model =
-            ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, alpha)
-                .map_err(to_pyerr)?;
-        test_lower
-            .iter()
-            .zip(test_upper.iter())
-            .map(|(&l, &u)| model.predict_interval(0.0, l, u, None).map_err(to_pyerr))
-            .collect()
-    }
-
     /// Fuse several ranked retrieval lists into one by reciprocal-rank fusion.
     ///
     /// `ranked_lists` is a list of best-first `_row_id` lists — typically the
@@ -1945,16 +1817,16 @@ pub struct PyTenantScope {
 impl PyTenantScope {
     fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
         let this = slf.borrow(py);
-        let mut slot = this
-            .prior
-            .lock()
-            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?;
+        let mut slot = this.prior.lock().map_err(|_| {
+            crate::error::client_error("BackendError", "tenant scope lock poisoned".into())
+        })?;
         // One scope object enters once: a second `__enter__` would clobber the
         // captured prior and lose it on exit. Nesting uses a fresh object per
         // `with`, matching the remote generator's raise-on-reenter semantics.
         if slot.is_some() {
-            return Err(PyValueError::new_err(
-                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`",
+            return Err(crate::error::client_error(
+                "FailedPrecondition",
+                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`".into(),
             ));
         }
         *slot = Some(this.session.tenant());
@@ -1974,7 +1846,9 @@ impl PyTenantScope {
         let prior = self
             .prior
             .lock()
-            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?
+            .map_err(|_| {
+                crate::error::client_error("BackendError", "tenant scope lock poisoned".into())
+            })?
             .take();
         // `Some(Some(t))` restores the prior tenant, `Some(None)` restores the
         // unscoped state, and `None` (never entered) is a no-op — collapsing the
@@ -2015,9 +1889,10 @@ fn edge_gather_from_kwargs(
         Some("in") => EdgeDirection::In,
         Some("undirected") => EdgeDirection::Undirected,
         Some(o) => {
-            return Err(PyValueError::new_err(format!(
-                "edge_direction must be 'out', 'in', or 'undirected' (got '{o}')"
-            )))
+            return Err(to_pyerr(JammiError::InvalidArgument {
+                argument: "edge_direction".into(),
+                reason: format!("must be one of ['in', 'out', 'undirected'] (got '{o}')"),
+            }))
         }
     };
     let mut gather = EdgeGather::new(EdgeSourceRef::Registered {
@@ -2049,33 +1924,5 @@ fn context_source_tag(kind: ContextSourceKind) -> &'static str {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    // A bad format token is unambiguously a caller argument error, so surface it
-    // as `InvalidArgument` — matching the remote client, which rejects an unknown
-    // format client-side as the same class. The `FileFormat` parse error is the
-    // generic `JammiError::Other`, which would otherwise land in the backend
-    // bucket, so the classification is pinned here at the caller-facing seam.
-    s.parse::<FileFormat>()
-        .map_err(|e| crate::error::client_error("InvalidArgument", e.to_string()))
-}
-
-/// Parse a classification conformal score family from its snake-case name.
-/// `"raps"` carries the regularization parameters; `"lac"` and `"aps"` ignore
-/// them.
-fn parse_class_score(
-    score: &str,
-    raps_lambda: f64,
-    raps_k_reg: usize,
-) -> PyResult<jammi_ai::predict::ClassScore> {
-    use jammi_ai::predict::ClassScore;
-    match score {
-        "lac" => Ok(ClassScore::Lac),
-        "aps" => Ok(ClassScore::Aps),
-        "raps" => Ok(ClassScore::Raps {
-            lambda: raps_lambda,
-            k_reg: raps_k_reg,
-        }),
-        other => Err(PyValueError::new_err(format!(
-            "unknown classification conformal score '{other}', expected 'lac', 'aps', or 'raps'"
-        ))),
-    }
+    s.parse::<FileFormat>().map_err(crate::error::to_pyerr)
 }

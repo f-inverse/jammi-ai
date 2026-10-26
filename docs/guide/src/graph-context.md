@@ -178,11 +178,12 @@ A graph-conditioned prediction is decoded and
 one, and it **always serves**. But graph correlation can break the
 exchangeability that *marginal* split-conformal coverage assumes — so the served
 prediction carries the assembly **`source` fact** and its member keys, and the
-coverage claim is attributed, never silently presented as a guarantee. Choosing
-whether to apply a group-conditional (Mondrian) or importance-weighted lever, and
-which cohort or weights to use, is a governance decision the serving layer
-*applies* but never *makes*. The engine surfaces the fact; governance chooses the
-lever.
+coverage claim is attributed, never silently presented as a guarantee. Whether
+to calibrate group-conditionally (Mondrian) or with importance weights, and with
+which cohorts or weights, is the caller's decision; the engine *applies* the
+[calibration scheme](./conformal-prediction.md#calibration-under-known-structure)
+it is handed but never *chooses* one. The engine surfaces the fact; the caller
+chooses the scheme.
 
 ## Tenancy
 

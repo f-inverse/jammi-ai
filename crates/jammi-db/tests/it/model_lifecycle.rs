@@ -27,7 +27,7 @@ use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
@@ -103,7 +103,7 @@ async fn submit_referencing_job(
 ) {
     cat.submit_job(SubmitJobParams {
         job_id,
-        kind: "fine_tune",
+        kind: JobKind::FineTune,
         execution: JobExecution::Queued,
         spec: "{}",
         model_ref,
@@ -309,7 +309,7 @@ async fn delete_blocked_by_job_model_source_name_edge_until_terminal_and_aged(
         .unwrap();
     cat.submit_job(SubmitJobParams {
         job_id: "job-model-source",
-        kind: "infer",
+        kind: JobKind::Infer,
         execution: JobExecution::Inline,
         spec: "{}",
         model_ref: None,
@@ -441,7 +441,7 @@ async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
         eval_type: "embedding".into(),
         model_id: Some(pk),
         source_id: "src".into(),
-        golden_source: "golden".into(),
+        ground_truth: "truth".into(),
         k: Some(10),
         metrics_json: "{}".into(),
         status: "completed".into(),

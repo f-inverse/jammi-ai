@@ -4,7 +4,7 @@ Join sources, filter, and run a model over a relation — in one statement the
 engine plans — embedded or against a `jammi-server` over Flight SQL.
 
 **When to use this pattern.** You want results enriched with context from
-other sources (who holds a patent, which category it is in) and with model
+other sources (which organisation wrote a paper, which category it is in) and with model
 output computed inside the query, without a per-row round-trip. `search`
 returns a bounded top-k; anything caller-shaped rides SQL, where the
 `annotate(...)` table function runs a model over a relation.

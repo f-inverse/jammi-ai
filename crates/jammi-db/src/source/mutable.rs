@@ -90,7 +90,8 @@ impl MutableTableRegistry {
                     Ok(())
                 })
             })
-            .await?;
+            .await
+            .map_err(|e| MutableTableError::from_insert(e, &def.id))?;
 
         Ok(Arc::new(MutableTableProvider::new(
             def,

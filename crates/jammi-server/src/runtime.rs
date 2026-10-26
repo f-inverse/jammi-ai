@@ -1,7 +1,7 @@
-//! `OssServer` — the single orchestration entry-point for the OSS
-//! `jammi-server` binary.
+//! `Server` — the single orchestration entry-point for the `jammi-server`
+//! binary.
 //!
-//! One `OssServer` wires together:
+//! One `Server` wires together:
 //!
 //! - the engine [`InferenceSession`] (catalog, mutable tables, broker)
 //! - a [`SessionStore`] shared between Flight SQL and the gRPC services
@@ -33,7 +33,6 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{oneshot, watch};
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
@@ -66,7 +65,7 @@ use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
 use crate::trace_context_layer::TraceContextLayer;
 
-/// Errors `OssServer::run` can surface to the binary's `main`.
+/// Errors `Server::run` can surface to the binary's `main`.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("config error: {0}")]
@@ -422,11 +421,11 @@ impl LivenessCheck for EngineLiveness {
     }
 }
 
-/// The OSS server instance. Constructed via [`Self::new`] and consumed
+/// The server instance. Constructed via [`Self::new`] and consumed
 /// by [`Self::run`]. Holds every long-lived dependency the binary
 /// orchestrates — bind addresses, the engine session, the shared
 /// SessionStore, the metrics registry, and the readiness probe.
-pub struct OssServer {
+pub struct Server {
     flight_addr: SocketAddr,
     health_addr: SocketAddr,
     /// `[server] peer_bind`: the internal peer listener's address, `Some`
@@ -439,8 +438,8 @@ pub struct OssServer {
     tiers: TierSet,
 }
 
-impl OssServer {
-    /// Build an OSS server from `JammiConfig`. Validates the server
+impl Server {
+    /// Build a server from `JammiConfig`. Validates the server
     /// configuration up front (parses both bind addresses, rejects two
     /// identical FIXED bind addresses — identical `:0` ephemeral addresses
     /// are allowed, since each resolves to a distinct port at bind),
@@ -581,7 +580,7 @@ impl OssServer {
                 // `GangServer::fresh_instance` needs
                 // the `[lease]` window this deployment runs with — read once,
                 // here, from the already-validated config
-                // (`OssServer::new`'s own `config.lease.intervals()` call
+                // (`Server::new`'s own `config.lease.intervals()` call
                 // already rejected an invalid pair at construction, so this
                 // one cannot fail in practice; still handled, never
                 // `.unwrap()`ed, since a config reload between `new` and
@@ -696,7 +695,7 @@ impl OssServer {
     /// Assemble the engine's [`GrpcChain`] from this server's config and engine
     /// session. Derives the event-tier trigger handles (only when the event
     /// tier is mounted) and the engine-default `jammi-session-id` tenant
-    /// resolver — the OSS-cooperative multitenancy binder.
+    /// resolver — the cooperative multitenancy binder.
     fn build_grpc_chain(&self) -> GrpcChain {
         // The event tier (`TriggerService`) is mounted only when the deployment
         // selected it; the handles are derived from the same engine session.
@@ -717,15 +716,13 @@ impl OssServer {
             engine: Some(Arc::clone(&self.session)),
             tiers: self.tiers.clone(),
             metrics: Arc::clone(&self.metrics),
-            // The OSS binary binds tenants with the engine-default
-            // `jammi-session-id` resolver — the OSS-cooperative multitenancy
-            // behavior, now a first-class resolver rather than an implicit
-            // interceptor.
+            // The binary binds tenants with the engine-default
+            // `jammi-session-id` resolver — cooperative multitenancy.
             tenant_resolver: SessionIdTenantResolver::arc(self.session_store.clone()),
             // The shipped default: no admin authorizer wired, so `Reconcile`'s
             // `all = true` cross-tenant admin pass is refused outright. A
             // downstream that needs it supplies its own `AdminAuthorizer` by
-            // constructing `GrpcChain` directly (this OSS binary's own
+            // constructing `GrpcChain` directly (this binary's own
             // orchestration path has no seam to configure one yet).
             admin_authorizer: None,
             // `[server.limits]` from the SAME config the engine session was
@@ -736,8 +733,8 @@ impl OssServer {
     }
 }
 
-/// An [`OssServer`] with both listeners bound and held live — the eager-bind
-/// half of the serve seam. Returned by [`OssServer::bind`]. The gRPC + Flight
+/// An [`Server`] with both listeners bound and held live — the eager-bind
+/// half of the serve seam. Returned by [`Server::bind`]. The gRPC + Flight
 /// SQL surface and the HTTP side-channel are already listening:
 /// [`Self::flight_addr`] / [`Self::health_addr`] report the ACTUAL bound
 /// addresses (the real ports even when the config requested `:0`), and neither
@@ -755,7 +752,7 @@ pub struct BoundServer {
     peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>,
     /// The ACTUAL peer listener address (the real port for a `:0` request).
     peer_addr: Option<SocketAddr>,
-    /// The engine session, kept alive past [`OssServer::bind`] so
+    /// The engine session, kept alive past [`Server::bind`] so
     /// [`Self::serve_with_signals`] can release its catalog connections
     /// (including the lease keeper's own) once the serve loop has fully
     /// drained — the graceful-shutdown release point a `SIGTERM`'d
@@ -949,7 +946,7 @@ fn release_outcome(attempt: ReleaseAttempt) -> ShutdownOutcome {
 impl BoundServer {
     /// The ACTUAL address the gRPC + Flight SQL surface is bound to. When the
     /// config requested `:0`, this is the ephemeral port the kernel assigned —
-    /// resolved at [`OssServer::bind`] and held.
+    /// resolved at [`Server::bind`] and held.
     pub fn flight_addr(&self) -> SocketAddr {
         self.grpc.addr()
     }
@@ -1082,7 +1079,7 @@ impl BoundServer {
                     address = ?peer_addr,
                     "peer listener listening (jammi.v1.peer.PeerService)"
                 );
-                Server::builder()
+                tonic::transport::Server::builder()
                     .layer(MetricsLayer::new(registry))
                     .add_routes(routes)
                     .serve_with_incoming_shutdown(
@@ -1382,7 +1379,7 @@ impl BoundServer {
 ///
 /// Grouped into one options object (rather than a long positional argument list)
 /// so callers name what they pass and the mount surface has one place to grow.
-/// `OssServer` builds this from the engine session; test fixtures construct it
+/// `Server` builds this from the engine session; test fixtures construct it
 /// directly.
 pub struct GrpcChain {
     /// Bind address for the combined gRPC + Flight SQL surface.
@@ -1409,8 +1406,8 @@ pub struct GrpcChain {
     /// The one tenant-binding resolver. Every engine service (and Flight SQL)
     /// binds its request's tenant through THIS resolver via the async
     /// [`crate::tenant_resolver_layer::TenantResolverLayer`] — the single binder,
-    /// no interceptor path. Production and the OSS binary pass
-    /// [`SessionIdTenantResolver::arc`] (the OSS-cooperative `jammi-session-id`
+    /// no interceptor path. The binary passes
+    /// [`SessionIdTenantResolver::arc`] (the cooperative `jammi-session-id`
     /// default); a downstream composing the seam passes its own authenticating
     /// resolver to unify the composability seam with its BYO-auth seam. Only the
     /// services `assemble_grpc_chain` itself builds are bound by it — downstream
@@ -1879,7 +1876,7 @@ impl BoundChain {
                 std::future::pending::<()>().await;
             }
         };
-        let mut server = Server::builder()
+        let mut server = tonic::transport::Server::builder()
             .accept_http1(true)
             .layer(MetricsLayer::new(self.metrics))
             .layer(TraceContextLayer::new())
@@ -1936,11 +1933,7 @@ impl BoundChain {
 /// transport + core handshake. The `tiers` argument is what the
 /// `CatalogService.GetServerInfo` handshake advertises, so it must agree with
 /// what is actually mounted — the caller is responsible for that agreement
-/// (production goes through [`OssServer`], which derives both from one config).
-///
-/// The engine mounts NO `LifecycleService` — the `jammi.v1.lifecycle` contract
-/// is answered by a platform server, not the OSS engine; an OSS server answers
-/// `UNIMPLEMENTED` for those verbs.
+/// (production goes through [`Server`], which derives both from one config).
 pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerError> {
     let GrpcChain {
         addr,
@@ -1981,8 +1974,8 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // wraps every engine service uniformly — no branch, no separate interceptor,
     // so nothing can double-bind or clobber the resolved tenant. MUST-FIX 1 — the
     // wrapping applies only to the services THIS function builds; downstream
-    // services mounted via `AssembledChain::mount` (a platform's own pre-auth
-    // `Login`/`Bootstrap`, etc.) stay un-gated by the engine resolver.
+    // services mounted via `AssembledChain::mount` (a downstream's own
+    // pre-authentication verbs) stay un-gated by the engine resolver.
     let resolver_layer = TenantResolverLayer::new(tenant_resolver);
 
     // Bind one engine service onto `routes` under the resolver layer. `$server`
@@ -2143,7 +2136,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
 }
 
 /// Build and serve the engine's gRPC chain on `chain.addr` in one call — the
-/// OSS-only convenience for a caller serving straight from a configured address.
+/// convenience for a caller serving straight from a configured address.
 ///
 /// A thin composition of the seam: `assemble_grpc_chain(chain)?.serve(...)`,
 /// which binds the listener eagerly ([`AssembledChain::bind`]) and serves on it.

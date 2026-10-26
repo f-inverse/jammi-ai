@@ -18,8 +18,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import grpc
 import pyarrow as pa
@@ -70,6 +69,7 @@ from ._assembly import (
     expiry_report_to_dict,
 )
 from ._capability import Capability
+from ._jobs import JobKind, JobPhase, JobProgress, JobStatus, WorkerState, from_wire
 from ._sessions import register as _register_session
 from ._sessions import unregister as _unregister_session
 from ._credentials import (
@@ -96,7 +96,10 @@ from .errors import (
     NotRefreshable,
     NotSupportedOnBackend,
     JobCancelled,
+    JobFailed,
+    PermissionDenied,
     TrainingError,
+    Unauthenticated,
     Unavailable,
     VersionUnavailable,
 )
@@ -127,6 +130,9 @@ MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
 # The leaf class each typed engine error detail raises — the same class the
 # embedded engine raises for that error, so one `except` holds on both transports.
 _DETAIL_CLASS = {
+    "fine_tune": TrainingError,
+    "job_cancelled": JobCancelled,
+    "job_failed": JobFailed,
     "invalid_key": InvalidKey,
     "non_unique_key": NonUniqueKey,
     "no_query_encoder": NoQueryEncoder,
@@ -148,38 +154,40 @@ _CODE_CLASS = {
     grpc.StatusCode.UNAVAILABLE: Unavailable,
     grpc.StatusCode.ALREADY_EXISTS: AlreadyExists,
     grpc.StatusCode.FAILED_PRECONDITION: FailedPrecondition,
+    grpc.StatusCode.PERMISSION_DENIED: PermissionDenied,
+    grpc.StatusCode.UNAUTHENTICATED: Unauthenticated,
 }
 
 
-def _error_detail(exc: grpc.RpcError) -> Optional[str]:
-    """The typed engine detail a server attached to a failed call — the
-    `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
-    trailer's `google.rpc.Status` envelope, as `variant` or, for a variant that
-    names a case of its own (`not_found`), `variant.case` — or None when it
-    carries none."""
+def _status_bytes(exc: grpc.RpcError) -> Optional[bytes]:
+    """The `google.rpc.Status` envelope a server attached to a failed gRPC call
+    (its `grpc-status-details-bin` trailer), or None when it carries none."""
     trailers = exc.trailing_metadata() if hasattr(exc, "trailing_metadata") else None
-    for key, value in trailers or ():
-        if key != "grpc-status-details-bin":
-            continue
-        for packed in error_pb2.RpcStatus.FromString(value).details:
-            detail = error_pb2.JammiErrorDetail()
-            if packed.Unpack(detail):
-                variant = detail.WhichOneof("variant")
-                if variant == "not_found":
-                    return f"not_found.{detail.not_found.WhichOneof('missing')}"
-                return variant
+    return next((value for key, value in trailers or () if key == "grpc-status-details-bin"), None)
+
+
+def _error_detail(status: error_pb2.RpcStatus) -> Optional[str]:
+    """The typed engine detail a status envelope packs — the `JammiErrorDetail`
+    variant, as `variant` or, for a variant that names a case of its own
+    (`not_found`), `variant.case` — or None when it carries none."""
+    for packed in status.details:
+        detail = error_pb2.JammiErrorDetail()
+        if packed.Unpack(detail):
+            variant = detail.WhichOneof("variant")
+            if variant == "not_found":
+                return f"not_found.{detail.not_found.WhichOneof('missing')}"
+            return variant
     return None
 
 
-def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
-    """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy.
+def _status_to_jammi(code: grpc.StatusCode, message: str, envelope: Optional[bytes]) -> JammiError:
+    """The :class:`JammiError` a failed remote call raises, whichever lane
+    carried it: the typed gRPC verbs, or the Flight SQL lane, whose errors keep
+    the same `google.rpc.Status` envelope.
 
-    So every remote failure — not only the client-constructed validation and
-    malformed-response ones, but a live transport fault — descends from
-    ``JammiError``, and one ``except JammiError`` catches the whole remote
-    surface. A typed engine detail on the status raises its leaf class — the
-    class the embedded engine raises for the same error. Otherwise the status
-    code decides:
+    A typed engine detail on the status raises its leaf class — the class the
+    embedded engine raises for the same error. Otherwise the status code
+    decides:
 
     * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — a server-detected bad
       argument, the SAME class the embedded engine raises for the same rejection.
@@ -195,15 +203,41 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
     attribute so the few call-sites that branch on ``NOT_FOUND`` (``describe_*``
     → ``None``; ``*if_exists*`` drops → no-op) keep working after the remap.
     """
-    code = exc.code()
-    detail = exc.details() or str(exc)
-    leaf = _DETAIL_CLASS.get(_error_detail(exc))
-    if leaf is not None:
-        mapped: JammiError = leaf(detail)
-    else:
-        mapped = _CODE_CLASS.get(code, BackendError)(detail)
+    leaf = _DETAIL_CLASS.get(_error_detail(error_pb2.RpcStatus.FromString(envelope))) if envelope else None
+    mapped: JammiError = (leaf or _CODE_CLASS.get(code, BackendError))(message)
     mapped.code = code
     return mapped
+
+
+def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
+    """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy,
+    so every remote failure — a live transport fault included — descends from
+    ``JammiError`` and one ``except JammiError`` catches the whole remote
+    surface (see :func:`_status_to_jammi`)."""
+    return _status_to_jammi(exc.code(), exc.details() or str(exc), _status_bytes(exc))
+
+
+def _flight_to_jammi(exc: "pa.ArrowException") -> JammiError:
+    """Map a Flight SQL lane failure onto the :class:`JammiError` taxonomy. A
+    statement the engine refused carries the engine's `google.rpc.Status`
+    envelope as the Flight error's extra info — the server sends Arrow's status
+    trailer for exactly this — and classifies as the typed lane does. A failure
+    with no envelope is the transport's own: an unreachable server is
+    :class:`Unavailable`, a refused credential :class:`Unauthenticated` or
+    :class:`PermissionDenied`, anything else a :class:`BackendError`."""
+    envelope = getattr(exc, "extra_info", None) or None
+    if envelope is not None:
+        status = error_pb2.RpcStatus.FromString(envelope)
+        code = next((c for c in grpc.StatusCode if c.value[0] == status.code), grpc.StatusCode.UNKNOWN)
+        return _status_to_jammi(code, status.message or str(exc), envelope)
+    for flight_error, code in (
+        (pa.flight.FlightUnavailableError, grpc.StatusCode.UNAVAILABLE),
+        (pa.flight.FlightUnauthenticatedError, grpc.StatusCode.UNAUTHENTICATED),
+        (pa.flight.FlightUnauthorizedError, grpc.StatusCode.PERMISSION_DENIED),
+    ):
+        if isinstance(exc, flight_error):
+            return _status_to_jammi(code, str(exc), None)
+    return _status_to_jammi(grpc.StatusCode.UNKNOWN, str(exc), None)
 
 
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
@@ -246,29 +280,31 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _present(message, field: str) -> Optional[str]:
+    """A `jammi.v1` optional field's value, or ``None`` when the peer left it
+    absent."""
+    return getattr(message, field) if message.HasField(field) else None
+
+
 def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
     """Project a wire `JobSummary` into the job dict a caller reads.
 
-    Every field the message carries and nothing else — the embedded
-    `list_jobs` builds the same nine keys at its FFI boundary from the
-    catalog record, applying the same conventions this message documents:
-    `output_model_id` is the model a training kind registers under, stamped
-    at submission (always empty for a compute kind), `error` is empty unless
-    it failed,
-    `claimed_by` is empty while queued, and `ranks` (the instance that ran
-    each rank of the latest training attempt, in rank order) is an empty list
-    for a compute kind and until an attempt records it. No arm maps any of
-    them onto `None`, so a caller branches on one thing on both transports.
+    The embedded `list_jobs` builds the same keys from the catalog record:
+    ``kind`` and ``status`` typed; ``output_model_id`` the model the job
+    produced, present only once it completed; ``base_model_id`` absent for a
+    compute kind; ``error`` absent unless it failed; ``claimed_by`` absent
+    while queued; ``ranks`` empty for a compute kind and until a training
+    attempt records them.
     """
     return {
         "job_id": j.job_id,
-        "kind": j.kind,
-        "status": j.status,
-        "base_model_id": j.base_model_id,
-        "output_model_id": j.output_model_id,
+        "kind": from_wire(JobKind, job_pb2.JobKind, j.kind),
+        "status": from_wire(JobStatus, job_pb2.JobStatus, j.status),
+        "base_model_id": _present(j, "base_model_id"),
+        "output_model_id": _present(j, "output_model_id"),
         "created_at": j.created_at,
-        "error": j.error,
-        "claimed_by": j.claimed_by,
+        "error": _present(j, "error"),
+        "claimed_by": _present(j, "claimed_by"),
         "ranks": list(j.ranks),
     }
 
@@ -492,8 +528,13 @@ def _inference_aggregate_to_dict(agg: eval_pb2.InferenceAggregate) -> Dict[str, 
     raise BackendError("InferenceEvalReport carried no aggregate")
 
 
+def _span_to_dict(s: eval_pb2.Span) -> Dict[str, Any]:
+    """Project a wire gold `Span` into the embed wheel's span dict."""
+    return {"label": s.label, "start": s.start, "end": s.end}
+
+
 def _entity_to_dict(e: eval_pb2.Entity) -> Dict[str, Any]:
-    """Project a wire `Entity` span into the embed wheel's entity dict."""
+    """Project a wire predicted `Entity` into the embed wheel's entity dict."""
     return {
         "label": e.label,
         "start": e.start,
@@ -526,7 +567,7 @@ def _per_record_prediction_to_dict(
             "task": "ner",
             "record_id": n.record_id,
             "predicted": [_entity_to_dict(e) for e in n.predicted],
-            "gold": [_entity_to_dict(e) for e in n.gold],
+            "gold": [_span_to_dict(s) for s in n.gold],
         }
     raise BackendError("PerRecordPrediction carried no prediction")
 
@@ -648,23 +689,6 @@ def _calibration_report_to_dict(
 # decodes a wire column's `data_type` back to the same token `register_channel`
 # accepts, matching the embed binding's `ChannelColumnType::as_str`.
 _CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
-
-# Terminal job states, matching the engine's `JobStatus::ALL` filtered by
-# `JobStatus::is_terminal` (`crates/jammi-db/src/catalog/status.rs:70-78`) —
-# the ONE Rust-side terminality predicate; this set must stay equal to it.
-_TERMINAL_STATES = {"completed", "failed", "cancelled"}
-# The terminal-unsuccessful subset (mirrors `JobStatus::is_terminal_unsuccessful`),
-# kept as its own named set rather than bare literals so a status joining the
-# vocabulary is one edit here, not a hunt for every literal compare.
-_TERMINAL_UNSUCCESSFUL_STATES = {"failed", "cancelled"}
-# `JobStatus::Cancelled`'s rendered spelling: the one terminal-unsuccessful
-# status a waiter reports as its own exception (`JobCancelled`).
-_CANCELLED_STATE = "cancelled"
-# `JobStatus::Queued`'s rendered spelling — the ONE place a caller (this
-# module or a test) that needs the exact "freshly submitted, unclaimed"
-# literal reads it from, instead of hand-typing `"queued"` again.
-_QUEUED_STATE = "queued"
-
 
 def _verify_verdict_to_dict(
     resp: "catalog_pb2.VerifyMaterializationResponse",
@@ -828,6 +852,33 @@ def _job_result_to_dict(resp: job_pb2.JobStatusResponse) -> Dict[str, Any]:
     raise BackendError("JobStatusResponse carried no terminal result")
 
 
+class _TenantScope:
+    """A remote connection's tenant for one ``with`` block — the remote peer of
+    the embedded engine's tenant scope, with the same entry rules."""
+
+    _UNENTERED = object()
+
+    def __init__(self, db: "RemoteDatabase", tenant_id: str) -> None:
+        self._db = db
+        self._tenant_id = tenant_id
+        self._prior: Any = self._UNENTERED
+
+    def __enter__(self) -> "RemoteDatabase":
+        if self._prior is not self._UNENTERED:
+            raise FailedPrecondition(
+                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`"
+            )
+        self._prior = self._db.tenant()
+        self._db.set_tenant(self._tenant_id)
+        return self._db
+
+    def __exit__(self, *_exc: Any) -> bool:
+        prior, self._prior = self._prior, self._UNENTERED
+        if prior is not self._UNENTERED:
+            self._db.set_tenant(prior or "")
+        return False
+
+
 class RemoteJob:
     """Handle to a remote job (training or compute), polled over `JobService`.
 
@@ -836,9 +887,9 @@ class RemoteJob:
     poll, a ``progress()`` read, a ``cancel()`` request, and a ``wait()``
     that blocks until a terminal state and returns the tagged terminal result
     (raising on failure with the wire error). `output_model_id` is the
-    deterministic output id `SubmitJob` returned at submit time; `wait()`
-    polls `JobStatus` and, on ``failed``, raises :class:`jammi.TrainingError`
-    carrying the worker's error message — mirroring the embedded `Job.wait`.
+    output id `SubmitJob` returned at submit time; `wait()` polls `JobStatus`
+    and, on ``failed``, raises :class:`jammi.JobFailed` carrying the worker's
+    error message — mirroring the embedded `Job.wait`.
     """
 
     # Poll interval for `wait()`. Matches the embedded `Job.wait`'s 100ms
@@ -851,8 +902,8 @@ class RemoteJob:
         metadata,
         *,
         job_id: str,
-        kind: str,
-        output_model_id: str,
+        kind: JobKind,
+        output_model_id: Optional[str],
     ) -> None:
         self._stub = stub
         self._metadata = metadata
@@ -866,14 +917,14 @@ class RemoteJob:
         return self._job_id
 
     @property
-    def kind(self) -> str:
-        """The `jobs.kind` tag this job submitted under (e.g. `"fine_tune"`)."""
+    def kind(self) -> JobKind:
+        """The kind this job submitted under."""
         return self._kind
 
     @property
-    def output_model_id(self) -> str:
-        """The deterministic output model id the trained artifact registers
-        under. Empty for a compute-kind job."""
+    def output_model_id(self) -> Optional[str]:
+        """The model a training kind registers, stamped at submission;
+        ``None`` for a compute kind."""
         return self._output_model_id
 
     def _status_response(self) -> job_pb2.JobStatusResponse:
@@ -885,25 +936,24 @@ class RemoteJob:
         except grpc.RpcError as exc:
             # A transport fault while polling maps onto the taxonomy, like every
             # other remote hop; a `failed` terminal status (not an RpcError) is
-            # surfaced as `TrainingError` by `wait()`.
+            # surfaced as `JobFailed` by `wait()`.
             raise _rpc_to_jammi(exc) from exc
 
-    def status(self) -> str:
-        """The job's current status string. Maps to `JobService.JobStatus`."""
-        return self._status_response().status
+    def status(self) -> JobStatus:
+        """The job's current status. Maps to `JobService.JobStatus`."""
+        return from_wire(JobStatus, job_pb2.JobStatus, self._status_response().status)
 
-    def progress(self) -> Dict[str, Any]:
-        """This job's progress: `{"rows_done", "rows_total", "phase"}` —
-        `rows_done`/`rows_total` are `None` until the executor has recorded
-        any (a legal `0` is distinguished from "not recorded yet"); `phase`
-        is the empty string until the producer names one. Mirrors the
-        embedded `Job.progress`'s shape field-for-field."""
+    def progress(self) -> Optional[JobProgress]:
+        """This job's latest recorded progress, or ``None`` before the executor
+        records any. Mirrors the embedded `EmbeddedJob.progress`."""
         p = self._status_response().progress
-        return {
-            "rows_done": p.rows_done if p.HasField("rows_done") else None,
-            "rows_total": p.rows_total if p.HasField("rows_total") else None,
-            "phase": p.phase,
-        }
+        if p.phase == job_pb2.JOB_PHASE_UNSPECIFIED:
+            return None
+        return JobProgress(
+            phase=from_wire(JobPhase, job_pb2.JobPhase, p.phase),
+            done=p.done if p.HasField("done") else None,
+            total=p.total if p.HasField("total") else None,
+        )
 
     def cancel(self) -> bool:
         """Request cancellation. `True` when the request landed on a still
@@ -924,18 +974,21 @@ class RemoteJob:
 
         Polls `JobStatus` until ``completed`` (returns the result) or a
         terminal-unsuccessful status, raising :class:`jammi.JobCancelled` for a
-        ``cancelled`` job and :class:`jammi.TrainingError` with the wire error
-        message for a ``failed`` one — the remote peer of the embedded
-        `Job.wait`, which raises the same classes for the same ends.
+        ``cancelled`` job and :class:`jammi.JobFailed` for a ``failed`` one,
+        each carrying the error the job recorded — the remote peer of the
+        embedded `Job.wait`, which raises the same classes for the same ends.
         """
+        ends = {JobStatus.CANCELLED: JobCancelled, JobStatus.FAILED: JobFailed}
         while True:
             resp = self._status_response()
-            if resp.status == "completed":
+            status = from_wire(JobStatus, job_pb2.JobStatus, resp.status)
+            if status is JobStatus.COMPLETED:
                 return _job_result_to_dict(resp)
-            if resp.status == _CANCELLED_STATE:
-                raise JobCancelled(resp.error or "job cancelled")
-            if resp.status in _TERMINAL_UNSUCCESSFUL_STATES:
-                raise TrainingError(resp.error or "job failed")
+            if status in ends:
+                error = _present(resp, "error")
+                if error is None:
+                    raise BackendError(f"job '{self._job_id}' ended {status} with no recorded error")
+                raise ends[status](error)
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
     def metrics(self) -> Dict[str, Any]:
@@ -945,8 +998,8 @@ class RemoteJob:
         `JobStatusResponse.model.metrics_json` field the server fills
         verbatim from the catalog's tagged `jobs.result` payload — the
         run-summary blob the trainer hands the worker at completion
-        (`final_loss`, `early_stopping_metric`, `total_steps`, `started_at`,
-        `completed_at`, and the per-epoch `train_loss_curve` /
+        (`best_epoch`, `best_loss`, `early_stopping_metric`, `total_steps`,
+        `started_at`, `completed_at`, and the per-epoch `train_loss_curve` /
         `val_loss_curve` arrays). Returns ``{}`` for a job that has not yet
         recorded any metrics (e.g. still queued or running before
         completion, or a compute-kind job, which carries no `model` result at
@@ -1093,7 +1146,7 @@ class RemoteDatabase:
     # --- The closed-session guard -----------------------------------------------
 
     def _check_open(self) -> None:
-        """Raise the typed :class:`BackendError` once :meth:`close` has run.
+        """Raise the typed :class:`FailedPrecondition` once :meth:`close` has run.
 
         The remote peer of the embedded engine's FFI-boundary guard
         (`_NativeDatabase::check_open`), and the reason a closed
@@ -1111,7 +1164,7 @@ class RemoteDatabase:
         all, so there is no per-verb list to drift.
         """
         if self._closed:
-            raise BackendError("Database is closed")
+            raise FailedPrecondition("Database is closed")
 
     # --- The single wire choke point --------------------------------------------
 
@@ -1185,8 +1238,7 @@ class RemoteDatabase:
             catalog_pb2.SetTenantRequest(tenant=catalog_pb2.Tenant(id=tenant_id)),
         )
 
-    @contextmanager
-    def tenant_scope(self, tenant_id: str) -> Iterator["RemoteDatabase"]:
+    def tenant_scope(self, tenant_id: str) -> "_TenantScope":
         """Scope this connection to ``tenant_id`` for the duration of a ``with``
         block, restoring the prior tenant on exit.
 
@@ -1199,17 +1251,14 @@ class RemoteDatabase:
 
         Nesting restores correctly — after an inner ``with db.tenant_scope("b")``
         block exits, the outer ``"a"`` scope is back in effect. The remote tenant
-        lives server-side (keyed by this session id); the client captures the
-        prior tenant locally via `CatalogService.GetTenant` on entry and rebinds
-        it (or clears, if the prior scope was unscoped) on exit, rather than
-        blindly clearing to unscoped.
+        lives server-side (keyed by this session id); the scope captures the
+        prior tenant via `CatalogService.GetTenant` on entry and rebinds it (or
+        clears, if the prior scope was unscoped) on exit. One scope object is
+        entered once at a time, as the embedded one is: a second ``__enter__``
+        raises :class:`~jammi.errors.FailedPrecondition` and leaves the live
+        scope untouched, and an exit of a scope never entered does nothing.
         """
-        prior = self.tenant()
-        self.set_tenant(tenant_id)
-        try:
-            yield self
-        finally:
-            self.set_tenant(prior or "")
+        return _TenantScope(self, tenant_id)
 
     def tenant(self) -> Optional[str]:
         """The tenant currently bound to this connection, or ``None``.
@@ -1834,6 +1883,7 @@ class RemoteDatabase:
         warmup_fraction: Optional[float] = None,
         gradient_accumulation_steps: Optional[int] = None,
         triplet_margin: Optional[float] = None,
+        encoder: Optional[str] = None,
         target_modules: Optional[List[str]] = None,
         early_stopping_metric: Optional[str] = None,
         backbone_dtype: Optional[str] = None,
@@ -1891,6 +1941,7 @@ class RemoteDatabase:
             warmup_fraction=warmup_fraction,
             gradient_accumulation_steps=gradient_accumulation_steps,
             triplet_margin=triplet_margin,
+            encoder=encoder,
             target_modules=target_modules,
             early_stopping_metric=early_stopping_metric,
             backbone_dtype=backbone_dtype,
@@ -1951,6 +2002,7 @@ class RemoteDatabase:
         warmup_steps: Optional[int] = None,
         warmup_fraction: Optional[float] = None,
         gradient_accumulation_steps: Optional[int] = None,
+        encoder: Optional[str] = None,
         target_modules: Optional[List[str]] = None,
         backbone_dtype: Optional[str] = None,
         weight_decay: Optional[float] = None,
@@ -2017,6 +2069,7 @@ class RemoteDatabase:
             warmup_steps=warmup_steps,
             warmup_fraction=warmup_fraction,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            encoder=encoder,
             target_modules=target_modules,
             backbone_dtype=backbone_dtype,
             weight_decay=weight_decay,
@@ -2544,11 +2597,11 @@ class RemoteDatabase:
 
     # --- Evaluation verbs (EvalService) -------------------------------------------
     #
-    # The eval family measures model quality against golden data held in the
+    # The eval family measures model quality against ground-truth data held in the
     # engine, so the compute runs where the data is and only the typed report
     # crosses the wire. Each verb returns the same nested dict the embed
     # `Database` produces (the engine's serde report shape), so a caller reads
-    # the same keys on both transports. A `golden_source` is an unquoted
+    # the same keys on both transports. A `ground_truth` is an unquoted
     # relation reference — a bare name or the full catalog path
     # `<source>.public.<table>`.
 
@@ -2556,23 +2609,23 @@ class RemoteDatabase:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         embedding_table: Optional[str] = None,
         k: int = 10,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate embedding retrieval quality against a golden relevance set.
+        """Evaluate embedding retrieval quality against a relevance judgments.
 
         Returns the same nested dict the embed `Database` produces:
         ``eval_run_id``, ``aggregate`` (mean ``recall_at_k`` /
         ``precision_at_k`` / ``mrr`` / ``ndcg`` over all queries), and
-        ``per_query`` (one record per golden-set query). ``embedding_table``
+        ``per_query`` (one record per ground-truth query). ``embedding_table``
         names the result table to evaluate; ``None`` resolves the source's most
-        recent embedding table. ``golden_source`` addresses the golden set by
+        recent embedding table. ``ground_truth`` addresses the ground truth by
         its full catalog path (``<source>.public.<table>``) or bare name.
-        ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
+        ``cohorts`` optionally maps a ground truth ``query_id`` to an opaque
         ``{key: value}`` segment map, persisted with that query's per-query
         metrics (read back via :meth:`eval_per_query`). ``oversample`` / ``exact`` rank each query as they rank a :meth:`search`:
         ``exact=True`` scores every vector, so the report measures the embedding
@@ -2581,7 +2634,7 @@ class RemoteDatabase:
         """
         request = build_eval_embeddings_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             embedding_table=embedding_table,
             k=k,
             cohorts=cohorts,
@@ -2623,16 +2676,16 @@ class RemoteDatabase:
         source: str,
         columns: List[str],
         task: str,
-        golden_source: str,
+        ground_truth: str,
         label_column: str,
     ) -> Dict[str, Any]:
-        """Evaluate inference quality against golden labels.
+        """Evaluate inference quality against ground-truth labels.
 
         Returns the same nested dict the embed `Database` produces:
         ``aggregate`` (task-shaped, tagged by ``"task"``) and ``per_record``
         (one tagged record per predicted/gold pair). ``task`` is
-        ``"classification"`` or ``"ner"``; ``golden_source`` addresses the
-        golden labels by full catalog path (``<source>.public.<table>``) or
+        ``"classification"`` or ``"ner"``; ``ground_truth`` addresses the
+        ground-truth labels by full catalog path (``<source>.public.<table>``) or
         bare name, with ``label_column`` naming the gold-label column. Maps to
         `EvalService.EvalInference`.
         """
@@ -2641,7 +2694,7 @@ class RemoteDatabase:
             source=source,
             columns=columns,
             task=task,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             label_column=label_column,
         )
         resp = self._call(self._eval.EvalInference, request)
@@ -2652,26 +2705,26 @@ class RemoteDatabase:
         *,
         embedding_tables: List[str],
         source: str,
-        golden_source: str,
+        ground_truth: str,
         k: int = 10,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Compare multiple embedding tables side-by-side against one golden set.
+        """Compare multiple embedding tables side-by-side against one ground truth.
 
         Returns the same nested dict the embed `Database` produces: a
         ``per_table`` list whose first entry is the baseline (``delta: None``)
         and whose subsequent entries carry a ``delta`` against it (per-metric
         absolute/relative deltas plus paired ``significance``, ``None`` when
-        the runs share no query to pair on). ``golden_source`` addresses the
-        golden set by full catalog path (``<source>.public.<table>``) or bare
+        the runs share no query to pair on). ``ground_truth`` addresses the
+        ground truth by full catalog path (``<source>.public.<table>``) or bare
         name. ``oversample`` / ``exact`` rank every table's queries as
         :meth:`eval_embeddings` ranks them. Maps to `EvalService.EvalCompare`.
         """
         request = build_eval_compare_request(
             embedding_tables=embedding_tables,
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             k=k,
             oversample=oversample,
             exact=exact,
@@ -2683,12 +2736,12 @@ class RemoteDatabase:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         shape: str,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate whether a predictor's uncertainty is honest against a held-out
-        golden set pairing a predictive distribution with its realised outcome.
+        ground truth pairing a predictive distribution with its realised outcome.
 
         Returns the same nested dict the embed `Database` produces: ``aggregate``
         (``crps`` / ``nll`` / ``adaptive_ece`` / ``sharpness`` / ``coverage`` /
@@ -2697,7 +2750,7 @@ class RemoteDatabase:
         """
         request = build_eval_calibration_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             shape=shape,
             cohorts=cohorts,
         )
@@ -2887,20 +2940,13 @@ class RemoteDatabase:
         :class:`~jammi.errors.BackendError`, the same class the embedded arm
         raises for the same miss.
 
-        `output_model_id` reads the same on both arms at EVERY lifecycle state
-        — queued, running, completed, failed — not only once the job has
-        finished. It is the id the server resolved for this row
-        (`JobStatusResponse.output_model_id`): the stamped value once
-        the job completes, and before then the engine's own re-derivation from
-        the persisted spec, which is exactly what the embedded attach reports
-        because both call the SAME engine function. This client re-derives
-        nothing — the naming rule belongs to the engine, and a second
-        implementation here is the drift the conformance suite exists to catch.
-        Empty for a compute-kind job — no compute kind ever registers a model.
+        `output_model_id` reads the same on both arms at every lifecycle state:
+        the submit stamps it on the job's row, and both arms relay that column
+        (`JobStatusResponse.output_model_id` here). ``None`` for a compute
+        kind, which registers no model.
 
-        Note that `list_jobs()`'s `output_model_id` is the SAME field, relayed
-        verbatim by `JobSummary` too — stamped at submission, so the listing
-        and this handle agree at every lifecycle state.
+        A listing (`list_jobs()`) names only a model the job produced, so a
+        queued, running, failed or cancelled job lists none.
         """
         resp = self._call(
             self._job.JobStatus,
@@ -2910,19 +2956,18 @@ class RemoteDatabase:
             self._job,
             self._metadata,
             job_id=job_id,
-            kind=resp.kind,
-            output_model_id=resp.output_model_id,
+            kind=from_wire(JobKind, job_pb2.JobKind, resp.kind),
+            output_model_id=_present(resp, "output_model_id"),
         )
 
     def list_jobs(self) -> List[Dict[str, Any]]:
         """Jobs visible to the current tenant, most recent first.
 
         Maps to `JobService.ListJobs`; same dict shape per entry as
-        the embedded :meth:`jammi.EmbeddedBackend.list_jobs` — the
-        wire's `JobSummary` field set, with ``output_model_id`` stamped at
-        submission (always empty for a compute kind), ``error`` empty unless
-        it failed, and ``claimed_by`` / ``ranks`` saying where it ran. A listing of :meth:`job`
-        answers plus the submit-time identity; read
+        the embedded :meth:`jammi.EmbeddedBackend.list_jobs` (see
+        `_job_summary_to_dict`): ``output_model_id`` is the model the job
+        produced, present once it completed; ``error`` is present once it
+        failed; ``claimed_by`` / ``ranks`` say where it ran. Read
         :meth:`job(job_id).progress() <RemoteJob.progress>` for the mid-run
         progress surface.
         """
@@ -2948,12 +2993,12 @@ class RemoteDatabase:
         return [
             {
                 "instance_id": w.instance_id,
-                "label": w.label,
-                "host": w.host,
-                "kinds": w.kinds,
+                "label": _present(w, "label"),
+                "host": _present(w, "host"),
+                "kinds": [from_wire(JobKind, job_pb2.JobKind, k) for k in w.kinds],
                 "started_at": w.started_at,
                 "last_seen_at": w.last_seen_at,
-                "state": w.state,
+                "state": from_wire(WorkerState, job_pb2.WorkerState, w.state),
             }
             for w in resp.workers
         ]
@@ -2972,8 +3017,8 @@ class RemoteDatabase:
             self._job,
             self._metadata,
             job_id=resp.job_id,
-            kind=resp.kind,
-            output_model_id=resp.output_model_id,
+            kind=from_wire(JobKind, job_pb2.JobKind, resp.kind),
+            output_model_id=_present(resp, "output_model_id"),
         )
 
     # --- Stateless conformal / RRF numerics (computed client-side) ---------------
@@ -2993,6 +3038,10 @@ class RemoteDatabase:
         alpha: float,
         score: Optional[str] = None,
         raps_params: Optional[Tuple[float, int]] = None,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[List[int]]:
         """Conformalize a classification predictor into prediction sets.
 
@@ -3005,8 +3054,11 @@ class RemoteDatabase:
 
         ``score`` selects the nonconformity family — ``"lac"``, ``"aps"``
         (default), or ``"raps"``; for ``"raps"``, ``raps_params`` is the
-        ``(lambda, k_reg)`` pair (default ``(0.0, 1)``). Same algorithm and
-        output as the embedded engine's ``conformalize``.
+        ``(lambda, k_reg)`` pair (default ``(0.0, 1)``). ``groups`` with
+        ``test_groups`` calibrates one quantile per cohort (Mondrian);
+        ``weights`` with ``test_weights`` are likelihood ratios for a known
+        covariate shift (weighted conformal). Same algorithm and output as the
+        embedded engine's ``conformalize``.
         """
         return _conformal.conformalize(
             calibration,
@@ -3015,6 +3067,10 @@ class RemoteDatabase:
             alpha=alpha,
             score=score,
             raps_params=raps_params,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def conformalize_interval(
@@ -3024,6 +3080,10 @@ class RemoteDatabase:
         test_predictions: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize an absolute-residual regression predictor into intervals.
 
@@ -3031,11 +3091,18 @@ class RemoteDatabase:
         ``test_predictions`` are caller-supplied arrays not held by the engine,
         so no gRPC hop is made. The calibration nonconformity ``|y - ŷ|`` yields
         the finite-sample quantile ``q̂``, giving ``[ŷ - q̂, ŷ + q̂]`` per test
-        point. Same algorithm and output as the embedded engine's
-        ``conformalize_interval``.
+        point; the calibration schemes are ``conformalize``'s. Same algorithm and
+        output as the embedded engine's ``conformalize_interval``.
         """
         return _conformal.conformalize_interval(
-            predictions, observed, test_predictions, alpha=alpha
+            predictions,
+            observed,
+            test_predictions,
+            alpha=alpha,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def conformalize_cqr(
@@ -3047,6 +3114,10 @@ class RemoteDatabase:
         test_upper: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize a Conformalized Quantile Regression predictor into intervals.
 
@@ -3054,11 +3125,21 @@ class RemoteDatabase:
         targets, and test bands are caller-supplied arrays the engine never
         holds, so no wire hop is made. The calibration nonconformity
         ``max(q_lo - y, y - q_hi)`` yields the finite-sample quantile ``q̂``,
-        giving the adaptive-width ``[q_lo - q̂, q_hi + q̂]`` per test row. Same
-        algorithm and output as the embedded engine's ``conformalize_cqr``.
+        giving the adaptive-width ``[q_lo - q̂, q_hi + q̂]`` per test row; the
+        calibration schemes are ``conformalize``'s. Same algorithm and output as
+        the embedded engine's ``conformalize_cqr``.
         """
         return _conformal.conformalize_cqr(
-            lower, upper, observed, test_lower, test_upper, alpha=alpha
+            lower,
+            upper,
+            observed,
+            test_lower,
+            test_upper,
+            alpha=alpha,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def rrf_fuse(
@@ -3112,10 +3193,9 @@ class RemoteDatabase:
         client = self._flight_client()
         options = self._flight_options()
         # The Flight SQL lane is a separate transport whose faults surface as
-        # `pyarrow.flight.FlightError`, not `grpc.RpcError`; map them onto the
-        # taxonomy too so `sql()` — like every typed verb — raises only
-        # `JammiError`. A Flight fault is a transport/runtime failure of the
-        # compound-query lane, so it maps to `BackendError`.
+        # pyarrow's exceptions, not `grpc.RpcError`; `_flight_to_jammi` maps
+        # them onto the taxonomy so `sql()` — like every typed verb — raises
+        # only `JammiError`, of the class the embedded engine raises.
         try:
             info = client.get_flight_info(
                 pa.flight.FlightDescriptor.for_command(_command_statement_query(query)),
@@ -3123,8 +3203,8 @@ class RemoteDatabase:
             )
             reader = client.do_get(info.endpoints[0].ticket, options)
             return reader.read_all()
-        except pa.flight.FlightError as exc:
-            raise BackendError(str(exc)) from exc
+        except pa.ArrowException as exc:
+            raise _flight_to_jammi(exc) from exc
 
     def _flight_client(self):
         # The Flight SQL lane is a separate pyarrow.flight transport from the

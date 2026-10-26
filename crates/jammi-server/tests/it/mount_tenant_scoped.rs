@@ -2,12 +2,11 @@
 //! engine's single tenant-binding layer, wired beside the plain
 //! [`AssembledChain::mount`] (un-gated) counterpart.
 //!
-//! The stub `LifecycleService` from the composability-seam suite doubles again
-//! HERE as the "downstream mounts its own service" fixture, but with a
-//! different implementation: it echoes the `SessionTenant` extension it
-//! observed (or its absence) into `PlatformStatus.license_state` instead of
-//! metadata headers, so a call can distinguish "wrapped, `Tenant`",
-//! "wrapped, `Global`", and "not wrapped at all" (`mount`).
+//! `jammi_test_utils::echo`'s `EchoService` is the "downstream mounts its own
+//! service" fixture, implemented here to echo the `SessionTenant` extension it
+//! observed (or its absence) into `EchoReply.tenant`, so a call can
+//! distinguish "wrapped, `Tenant`", "wrapped, `Global`", and "not wrapped at
+//! all" (`mount`).
 //!
 //! A single generic resolver ([`ProbeResolver`]) drives all three outcomes off
 //! one metadata header, so one fixture proves: (i) `mount_tenant_scoped` binds
@@ -28,15 +27,10 @@ use jammi_server::grpc::session::{SessionStore, SessionTenant, TenantResolver, T
 use jammi_server::routes::health::MetricsRegistry;
 use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
 use jammi_server::tiers::TierSet;
+use jammi_test_utils::echo::echo_service_client::EchoServiceClient;
+use jammi_test_utils::echo::echo_service_server::{EchoService, EchoServiceServer};
+use jammi_test_utils::echo::{EchoReply, EchoRequest};
 use jammi_test_utils::test_config;
-use jammi_wire::proto::lifecycle::lifecycle_service_client::LifecycleServiceClient;
-use jammi_wire::proto::lifecycle::lifecycle_service_server::{
-    LifecycleService, LifecycleServiceServer,
-};
-use jammi_wire::proto::lifecycle::{
-    ApplyLicenseRequest, ApplyLicenseResponse, BootstrapRequest, BootstrapResponse, LoginRequest,
-    LoginResponse, PlatformStatus,
-};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
@@ -73,59 +67,28 @@ impl TenantResolver for ProbeResolver {
     }
 }
 
-/// A stub `LifecycleService` that echoes the `SessionTenant` extension it
-/// observed into `license_state`: absent (never bound — a plain [`mount`]) →
-/// `"unbound"`; bound `SessionTenant(None)` (resolver said `Global`) →
-/// `"global"`; bound `SessionTenant(Some(t))` → `"tenant:<t>"`. The other three
-/// verbs are unused by these tests and return trivial values.
+/// The downstream service: echoes the `SessionTenant` extension it observed
+/// into `tenant` — absent (never bound, a plain [`mount`]) → `"unbound"`;
+/// bound `SessionTenant(None)` (resolver said `Global`) → `"global"`; bound
+/// `SessionTenant(Some(t))` → `"tenant:<t>"`.
 ///
 /// [`mount`]: jammi_server::runtime::AssembledChain::mount
 #[derive(Clone, Default)]
-struct TenantEchoLifecycle;
+struct TenantEcho;
 
 #[tonic::async_trait]
-impl LifecycleService for TenantEchoLifecycle {
-    async fn apply_license(
-        &self,
-        _request: Request<ApplyLicenseRequest>,
-    ) -> Result<Response<ApplyLicenseResponse>, Status> {
-        Ok(Response::new(ApplyLicenseResponse {
-            accepted: true,
-            detail: String::new(),
-        }))
-    }
-
-    async fn bootstrap(
-        &self,
-        _request: Request<BootstrapRequest>,
-    ) -> Result<Response<BootstrapResponse>, Status> {
-        Ok(Response::new(BootstrapResponse {
-            dashboard_url: String::new(),
-            first_login_credential: String::new(),
-        }))
-    }
-
-    async fn status(&self, request: Request<()>) -> Result<Response<PlatformStatus>, Status> {
-        let observed = match request.extensions().get::<SessionTenant>() {
+impl EchoService for TenantEcho {
+    async fn echo(&self, request: Request<EchoRequest>) -> Result<Response<EchoReply>, Status> {
+        let tenant = match request.extensions().get::<SessionTenant>() {
             None => "unbound".to_string(),
             Some(SessionTenant(None)) => "global".to_string(),
             Some(SessionTenant(Some(t))) => format!("tenant:{t}"),
         };
-        Ok(Response::new(PlatformStatus {
-            bootstrapped: true,
-            licensed: true,
-            license_state: observed,
-            platform_version: String::new(),
-        }))
-    }
-
-    async fn login(
-        &self,
-        _request: Request<LoginRequest>,
-    ) -> Result<Response<LoginResponse>, Status> {
-        Ok(Response::new(LoginResponse {
-            bearer: String::new(),
-            expires_at_micros: 0,
+        Ok(Response::new(EchoReply {
+            payload: request.into_inner().payload,
+            authorization: String::new(),
+            session_id: String::new(),
+            tenant,
         }))
     }
 }
@@ -159,12 +122,9 @@ async fn probe_chain(addr: SocketAddr, resolver: Arc<dyn TenantResolver>) -> (Gr
     (chain, dir)
 }
 
-/// Call `LifecycleService.Status` against `addr`, attaching [`PROBE_HEADER`]
-/// when `cred` is `Some`.
-async fn probe_status(
-    addr: SocketAddr,
-    cred: Option<&'static str>,
-) -> Result<PlatformStatus, Status> {
+/// Call `EchoService.Echo` against `addr`, attaching [`PROBE_HEADER`] when
+/// `cred` is `Some`.
+async fn probe_echo(addr: SocketAddr, cred: Option<&'static str>) -> Result<EchoReply, Status> {
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
         .expect("uri")
         .connect()
@@ -178,8 +138,13 @@ async fn probe_status(
         }
         Ok(req)
     };
-    let mut client = LifecycleServiceClient::with_interceptor(channel, attach);
-    Ok(client.status(()).await?.into_inner())
+    let mut client = EchoServiceClient::with_interceptor(channel, attach);
+    Ok(client
+        .echo(EchoRequest {
+            payload: "probe".into(),
+        })
+        .await?
+        .into_inner())
 }
 
 /// `mount_tenant_scoped` binds `SessionTenant` from the resolver exactly like
@@ -196,13 +161,13 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
 
     let assembled = assemble_grpc_chain(chain)
         .expect("assemble")
-        .mount_tenant_scoped(LifecycleServiceServer::new(TenantEchoLifecycle));
+        .mount_tenant_scoped(EchoServiceServer::new(TenantEcho));
 
     assert!(
         assembled
             .mounted()
             .iter()
-            .any(|m| m == "jammi.v1.lifecycle.LifecycleService"),
+            .any(|m| m == "jammi.test.echo.EchoService"),
         "mount_tenant_scoped must record the wrapped service under its NAME: {:?}",
         assembled.mounted()
     );
@@ -221,18 +186,18 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
 
     // No credential: the resolver's EXPLICIT Global scope — the wrapper still
     // binds `SessionTenant(None)`, distinct from never having bound at all.
-    let global = probe_status(addr, None).await.expect("global status");
+    let global = probe_echo(addr, None).await.expect("global echo");
     assert_eq!(
-        global.license_state, "global",
+        global.tenant, "global",
         "a resolved Global scope must bind SessionTenant(None), not leave it unbound"
     );
 
     // A known credential: `SessionTenant(Some(tenant))`.
-    let tenant = probe_status(addr, Some(PROBE_CRED_TENANT))
+    let tenant = probe_echo(addr, Some(PROBE_CRED_TENANT))
         .await
-        .expect("tenant status");
+        .expect("tenant echo");
     assert_eq!(
-        tenant.license_state,
+        tenant.tenant,
         format!("tenant:{}", probe_tenant()),
         "a resolved Tenant scope must bind SessionTenant(Some(tenant))"
     );
@@ -258,7 +223,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
     .await;
     let scoped = assemble_grpc_chain(chain_scoped)
         .expect("assemble")
-        .mount_tenant_scoped(LifecycleServiceServer::new(TenantEchoLifecycle));
+        .mount_tenant_scoped(EchoServiceServer::new(TenantEcho));
     let bound_scoped = scoped.bind().await.expect("bind");
     let addr_scoped = bound_scoped.addr();
     let (tx_scoped, rx_scoped) = oneshot::channel::<()>();
@@ -271,7 +236,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
             .expect("serve");
     });
 
-    let err = probe_status(addr_scoped, Some("bogus-credential"))
+    let err = probe_echo(addr_scoped, Some("bogus-credential"))
         .await
         .expect_err("a resolver-rejected credential must reject before the handler runs");
     assert_eq!(
@@ -292,7 +257,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
     .await;
     let plain = assemble_grpc_chain(chain_plain)
         .expect("assemble")
-        .mount(LifecycleServiceServer::new(TenantEchoLifecycle));
+        .mount(EchoServiceServer::new(TenantEcho));
     let bound_plain = plain.bind().await.expect("bind");
     let addr_plain = bound_plain.addr();
     let (tx_plain, rx_plain) = oneshot::channel::<()>();
@@ -305,11 +270,11 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
             .expect("serve");
     });
 
-    let ok = probe_status(addr_plain, Some("bogus-credential"))
+    let ok = probe_echo(addr_plain, Some("bogus-credential"))
         .await
         .expect("a plain-mounted service must still run on a resolver-rejecting credential");
     assert_eq!(
-        ok.license_state, "unbound",
+        ok.tenant, "unbound",
         "a plain-mounted service must never observe a SessionTenant extension"
     );
 

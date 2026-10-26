@@ -228,6 +228,75 @@ def test_cqr_rejects_mismatched_lengths():
         )
 
 
+# --- calibration schemes: Mondrian and weighted ----------------------------
+
+
+def _softmax(logits):
+    peak = max(logits)
+    mass = [math.exp(v - peak) for v in logits]
+    total = sum(mass)
+    return [m / total for m in mass]
+
+
+def test_mondrian_holds_each_cohort_to_its_own_quantile():
+    # Residuals |y - 0|: cohort "a" scores [1, 2, 3, 4], cohort "b" [10, 20, 30,
+    # 40]. n = 4 per cohort, alpha = 0.25: rank = ceil(5 * 0.75) = 4, so "a"'s
+    # quantile is 4 and "b"'s 40. A cohort unseen at calibration ("c") is held to
+    # the pooled quantile over all eight: rank = ceil(9 * 0.75) = 7, i.e. 30.
+    observed = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+    groups = ["a"] * 4 + ["b"] * 4
+    intervals = conformal.conformalize_interval(
+        [0.0] * 8, observed, [0.0, 0.0, 0.0], alpha=0.25,
+        groups=groups, test_groups=["a", "b", "c"],
+    )
+    assert intervals == [(-4.0, 4.0), (-40.0, 40.0), (-30.0, 30.0)]
+
+
+def test_weighted_threshold_follows_each_test_rows_ratio():
+    # Twenty unit-weight scores 1..20 at alpha = 0.2. A unit test weight puts the
+    # target at 0.8 * 21 = 16.8 (the 17th score); weight 5 at 0.8 * 25 = 20 (the
+    # 20th); weight 6 at 20.8, beyond the calibration mass, so +inf.
+    observed = [float(i) for i in range(1, 21)]
+    intervals = conformal.conformalize_interval(
+        [0.0] * 20, observed, [0.0, 0.0, 0.0], alpha=0.2,
+        weights=[1.0] * 20, test_weights=[1.0, 5.0, 6.0],
+    )
+    assert intervals[:2] == [(-17.0, 17.0), (-20.0, 20.0)]
+    assert intervals[2] == (-math.inf, math.inf)
+
+
+def test_unit_weights_reproduce_the_marginal_sets():
+    rng = random.Random(31)
+    calibration = [_softmax([rng.uniform(-2, 2) for _ in range(4)]) for _ in range(40)]
+    labels = [rng.randrange(4) for _ in range(40)]
+    test = [_softmax([rng.uniform(-2, 2) for _ in range(4)]) for _ in range(25)]
+    marginal = conformal.conformalize(calibration, labels, test, alpha=0.1)
+    weighted = conformal.conformalize(
+        calibration, labels, test, alpha=0.1,
+        weights=[1.0] * 40, test_weights=[1.0] * 25,
+    )
+    assert weighted == marginal
+
+
+def test_a_scheme_needs_both_halves_and_only_one_kind():
+    args = ([0.0, 0.0], [1.0, 2.0], [0.0])
+    with pytest.raises(ValueError):
+        conformal.conformalize_interval(*args, alpha=0.5, groups=["a", "b"])
+    with pytest.raises(ValueError):
+        conformal.conformalize_interval(
+            *args, alpha=0.5, groups=["a", "b"], test_groups=["a"],
+            weights=[1.0, 1.0], test_weights=[1.0],
+        )
+    with pytest.raises(ValueError):
+        conformal.conformalize_interval(
+            *args, alpha=0.5, weights=[1.0], test_weights=[1.0]
+        )
+    with pytest.raises(ValueError):
+        conformal.conformalize_interval(
+            *args, alpha=0.5, weights=[1.0, -1.0], test_weights=[1.0]
+        )
+
+
 # --- reciprocal-rank fusion --------------------------------------------------
 
 

@@ -96,7 +96,7 @@ def test_job_attaches_on_a_connection_that_never_submitted_it(
     submitted = _submit(submitter)
     job_id = submitted.job_id
     submitted_output_model_id = submitted.output_model_id
-    assert submitted.status() == "queued"
+    assert submitted.status() == jammi.JobStatus.QUEUED
     submitter.close()
     del submitted, submitter
 
@@ -109,18 +109,18 @@ def test_job_attaches_on_a_connection_that_never_submitted_it(
         # output model id the submit call handed back — re-derived from the
         # catalog row, never invented here.
         assert attached.job_id == job_id
-        assert attached.kind == "fine_tune"
+        assert attached.kind == jammi.JobKind.FINE_TUNE
         assert attached.output_model_id == submitted_output_model_id
 
         # Every read verb works on a job this connection did not submit.
-        assert attached.status() in {"queued", "running", "completed"}
+        assert attached.status() in {jammi.JobStatus.QUEUED, jammi.JobStatus.RUNNING, jammi.JobStatus.COMPLETED}
         assert attached.acceleration_report()["state"] in {"pending", "determined"}
         assert isinstance(attached.metrics(), dict)
         progress = attached.progress()
-        assert set(progress) == {"rows_done", "rows_total", "phase"}
+        assert progress is None or isinstance(progress, jammi.JobProgress)
 
         result = attached.wait()
-        assert attached.status() == "completed"
+        assert attached.status() == jammi.JobStatus.COMPLETED
         assert attached.acceleration_report()["state"] == "determined"
         assert attached.metrics()["total_steps"] > 0
         # `wait()`'s terminal result is the tagged model payload.
@@ -131,15 +131,15 @@ def test_job_attaches_on_a_connection_that_never_submitted_it(
 
 
 def test_job_not_found_raises_the_typed_error(tmp_path: Path) -> None:
-    """An id with no matching row raises the typed `BackendError` — the SAME
+    """An id with no matching row raises the typed `NotFound` — the SAME
     class the remote arm raises for the same miss (the live parity module pins
     the two against each other), never `None` and never a handle that fails
     later on its first read."""
-    from jammi.errors import BackendError
+    from jammi.errors import NotFound
 
     db = jammi.connect(f"file://{tmp_path}")
     try:
-        with pytest.raises(BackendError):
+        with pytest.raises(NotFound):
             db.job("no-such-job-id")
     finally:
         db.close()
@@ -171,17 +171,16 @@ def test_list_jobs_carries_the_wire_field_set(
         assert {j["job_id"] for j in jobs} == {first, second}
         for entry in jobs:
             assert set(entry.keys()) == _SUMMARY_KEYS, entry
-            assert entry["kind"] == "fine_tune"
-            assert entry["status"] == "queued"
+            assert entry["kind"] == jammi.JobKind.FINE_TUNE
+            assert entry["status"] == jammi.JobStatus.QUEUED
             assert entry["base_model_id"]
             assert entry["created_at"]
-            # The deterministic output id is stamped at submit time (it
-            # depends only on job_id) — never the empty string for this kind,
-            # queued or not; `error` is empty unless the job failed.
-            assert entry["output_model_id"] == f"jammi:fine-tuned:{entry['job_id']}"
-            assert entry["error"] == ""
+            # A listing names only a model a job produced: a queued job has
+            # none yet, and no failure to report.
+            assert entry["output_model_id"] is None
+            assert entry["error"] is None
             # Queued and unclaimed: no claimant, no ranks yet.
-            assert entry["claimed_by"] == ""
+            assert entry["claimed_by"] is None
             assert entry["ranks"] == []
     finally:
         db.close()
@@ -208,9 +207,9 @@ def test_list_jobs_is_tenant_scoped(
         assert db.list_jobs() == []
         # And B cannot attach to it by id either — the same predicate, on the
         # same row, through the other verb.
-        from jammi.errors import BackendError
+        from jammi.errors import NotFound
 
-        with pytest.raises(BackendError):
+        with pytest.raises(NotFound):
             db.job(job_id)
 
         db.set_tenant(tenant_a)
@@ -227,7 +226,7 @@ def test_cancel_job_returns_false_once_terminal(tmp_path: Path) -> None:
     try:
         job = _submit(db)
         job.wait()
-        assert job.status() == "completed"
+        assert job.status() == jammi.JobStatus.COMPLETED
         assert db.cancel_job(job.job_id) is False
         assert isinstance(db.list_workers(), list)
         assert isinstance(db.prune_jobs(), int)

@@ -82,8 +82,7 @@ export interface JammiClient {
   readonly eval: Client<typeof EvalService>;
   readonly pipeline: Client<typeof PipelineService>;
   /** Durable jobs — `SubmitJob`/`JobStatus`/`WaitJob`/`ListJobs`/`CancelJob`/
-   *  `ListWorkers`/`PruneJobs` (`JobService`; replaces the old
-   *  `TrainingService`). */
+   *  `ListWorkers`/`PruneJobs` (`JobService`). */
   readonly job: Client<typeof JobService>;
   readonly trigger: Client<typeof TriggerService>;
   readonly audit: Client<typeof AuditService>;

@@ -116,7 +116,7 @@ async fn start_gpu_engine_server() -> GpuEngineServer {
     cfg.gpu.require_gpu = true;
 
     // `open` (not `new`) registers the compound-query SQL functions on the
-    // session context — matching the production `OssServer` shape and what
+    // session context — matching the production `Server` shape and what
     // the Flight SQL read-back below needs available.
     let session = InferenceSession::open(cfg)
         .await

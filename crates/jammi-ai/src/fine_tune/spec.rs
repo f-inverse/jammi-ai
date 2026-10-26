@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::status::JobKind;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::CachePolicy;
 
@@ -237,8 +238,10 @@ impl RankAdmission {
         self.serveable_world
     }
 
-    /// Admit `spec`, or refuse with a typed [`JammiError::Config`] naming the
-    /// bound it crosses.
+    /// Admit `spec`, or refuse naming the bound it crosses: a rank count the
+    /// request cannot ask for is [`JammiError::InvalidArgument`] on
+    /// `world_size`, a collective this build cannot reach is
+    /// [`JammiError::Config`].
     ///
     /// The refusals, each of which would otherwise become a job that fails
     /// on a worker rather than at the caller:
@@ -278,19 +281,24 @@ impl RankAdmission {
         let world_size = common.world_size;
 
         if world_size == 0 {
-            return Err(JammiError::Config(
-                "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)"
-                    .into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason:
+                    "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)"
+                        .into(),
+            });
         }
         if world_size > self.serveable_world {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} exceeds the serveable world of {} (the wider of \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} exceeds the serveable world of {} (the wider of \
                  [worker] local_ranks and [distributed] max_world_size): raise local_ranks for a \
                  gang on this host's devices, max_world_size on every coordinator for a gang \
                  across the fleet, or submit a smaller rank count",
-                self.serveable_world
-            )));
+                    self.serveable_world
+                ),
+            });
         }
         if self.collective.requires_cuda() && !self.cuda_build {
             return Err(JammiError::Config(format!(
@@ -300,18 +308,24 @@ impl RankAdmission {
             )));
         }
         if world_size > 1 && common.config.cached {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with GradCache (`cached`): the \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} cannot be combined with GradCache (`cached`): the \
                  cached objective's second pass is over the WHOLE batch on one rank, so a \
                  gang would not compute the objective this config asks for"
-            )));
+                ),
+            });
         }
         if world_size > 1 && common.config.hard_negatives.mine {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with hard-negative mining \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} cannot be combined with hard-negative mining \
                  (`hard_negatives.mine`): the miner retrieves from this process's own index, \
                  so each rank would mine a different negative pool"
-            )));
+                ),
+            });
         }
         Ok(())
     }
@@ -340,8 +354,8 @@ impl RankAdmission {
 /// workspace that builds a
 /// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind, so
 /// a hand-rolled bypass has to duplicate this function's body verbatim
-/// rather than merely skip a witness read -- `
-/// every_durable_training_submit_edge_calls_the_one_admission_function`'s
+/// rather than merely skip a witness read --
+/// `every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`'s
 /// source-level oracle is still what catches that duplication (Rust's
 /// privacy model cannot forbid a caller from writing the same match/insert
 /// logic again under a different name), stated as the ORACLE being the
@@ -393,8 +407,9 @@ pub fn admit_training_spec(
     spec: TrainingSpec,
 ) -> Result<AdmittedTrainingSpec> {
     match &spec {
-        TrainingSpec::FineTune { common, .. } => {
+        TrainingSpec::FineTune { common, task, .. } => {
             common.config.validate()?;
+            ensure_fine_tunable(*task)?;
         }
         TrainingSpec::GraphFineTune {
             common,
@@ -412,13 +427,40 @@ pub fn admit_training_spec(
     Ok(AdmittedTrainingSpec(spec))
 }
 
+/// The tasks a fine-tune trains: an encoder's embedding of text, images or
+/// audio, or a classification or regression head over its pooled output. A
+/// token-level task is served from a checkpoint that ships its own token
+/// classifier, and is refused here before any row is written.
+fn ensure_fine_tunable(task: ModelTask) -> Result<()> {
+    match task {
+        ModelTask::TextEmbedding
+        | ModelTask::ImageEmbedding
+        | ModelTask::AudioEmbedding
+        | ModelTask::Classification
+        | ModelTask::Regression => Ok(()),
+        ModelTask::Ner => Err(JammiError::InvalidArgument {
+            argument: "task".into(),
+            reason: "ner is served from a token-classification checkpoint, not fine-tuned; a \
+                     fine-tune trains text, image or audio embeddings, classification or \
+                     regression"
+                .into(),
+        }),
+    }
+}
+
+/// The deterministic output model id the two LoRA fine-tune kinds
+/// (`fine_tune`, `graph_fine_tune`) register their trained artifact under.
+///
+/// The naming rule, in one place: the submit stamps it on the job's row and
+/// the worker registers the trained model under it, both through this
+/// function, so no surface can mint a different id for the same job.
+pub fn fine_tuned_model_id(job_id: &str) -> String {
+    format!("jammi:fine-tuned:{job_id}")
+}
+
 /// The catalog's durable record of a [`submit_admitted_training`] call --
-/// the caller reads [`Self::recorded_job_id`] to build whatever handle its
-/// own crate returns ([`crate::fine_tune::training_job::TrainingJob`] for
-/// the two `_deduped` edges, [`crate::jobs::JobHandle`] for `enqueue`, a
-/// bench tier's own claim-by-id call for `jammi-bench`), since those handle
-/// types differ by caller and this function stays training-shape-agnostic
-/// about what the caller does with the id.
+/// the job id of record, which the session turns into a
+/// [`crate::jobs::JobHandle`] and a bench tier claims by id.
 #[derive(Debug, Clone)]
 pub struct SubmittedJob {
     /// The job id OF RECORD: `job_id` (this call's own argument) on a fresh
@@ -433,21 +475,19 @@ pub struct SubmittedJob {
 
 /// The ONE function in the workspace that builds a
 /// [`jammi_db::catalog::jobs_repo::SubmitJobParams`] for a training kind and
-/// submits it -- every durable training submit edge calls this rather than
-/// constructing `SubmitJobParams` itself:
-/// `crate::session::InferenceSession::submit_fine_tune_spec_deduped`,
-/// [`crate::session::InferenceSession::enqueue`]'s training arm,
-/// [`crate::pipeline::context_predictor`]'s `train_context_predictor_deduped`,
-/// and (across the
-/// crate boundary) `jammi-bench`'s finetune-run tier. `jammi_db::Catalog::
+/// submits it -- every durable training submit edge reaches it rather than
+/// constructing `SubmitJobParams` itself: the session's shared submit tail
+/// (`crate::session::InferenceSession::submit_training`, behind
+/// `submit_fine_tune_spec_deduped`, [`crate::session::InferenceSession::enqueue`]'s
+/// training arm and `train_context_predictor_deduped`) and, across the crate
+/// boundary, `jammi-bench`'s finetune-run tier. `jammi_db::Catalog::
 /// submit_job`/`submit_job_deduped` themselves stay generic, kind-agnostic
 /// APIs -- `jammi-db` never depends on `jammi-ai` and so cannot know this
 /// crate's `TrainingSpec` shape at all -- this function is `jammi-ai`'s own
 /// only caller of them for a training kind (pinned by
-/// `every_durable_training_submit_edge_calls_the_one_admission_function`'s
-/// enumerating source oracle, which now also asserts this function itself
-/// is the only training-kind `SubmitJobParams` construction site in
-/// `crates/jammi-ai/src`).
+/// `every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`,
+/// the enumerating source oracle, and
+/// `every_training_submit_edge_admits_then_calls_the_one_submit_tail`).
 ///
 /// `admitted` is taken by reference so the caller keeps its own handle for
 /// whatever else it needs the admitted spec for (`training_job_links`, in
@@ -495,11 +535,11 @@ impl TrainingSpec {
     /// The catalog `kind` tag for this spec — the same discriminator the tagged
     /// JSON carries, mirrored into the `training_jobs.kind` column so a query can
     /// filter by verb without parsing the spec blob.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> JobKind {
         match self {
-            TrainingSpec::FineTune { .. } => "fine_tune",
-            TrainingSpec::GraphFineTune { .. } => "graph_fine_tune",
-            TrainingSpec::ContextPredictor { .. } => "context_predictor",
+            TrainingSpec::FineTune { .. } => JobKind::FineTune,
+            TrainingSpec::GraphFineTune { .. } => JobKind::GraphFineTune,
+            TrainingSpec::ContextPredictor { .. } => JobKind::ContextPredictor,
         }
     }
 

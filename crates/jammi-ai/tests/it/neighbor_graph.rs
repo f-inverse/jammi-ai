@@ -620,8 +620,8 @@ async fn neighbor_graph_rejects_zero_k() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("k >= 1"),
-        "k = 0 is a typed error, got: {err}"
+        matches!(&err, jammi_db::error::JammiError::InvalidArgument { argument, .. } if argument == "k"),
+        "k = 0 is a typed refusal of k, got: {err}"
     );
 }
 

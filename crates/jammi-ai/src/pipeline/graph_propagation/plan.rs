@@ -140,12 +140,7 @@ const DST: &str = "_dst";
 const RAW_WEIGHT: &str = "_weight";
 
 fn plan_error(step: &'static str) -> impl Fn(datafusion::error::DataFusionError) -> JammiError {
-    move |e| match JammiError::from(e) {
-        JammiError::DataFusion(inner) => {
-            JammiError::Other(format!("graph propagation: {step}: {inner}"))
-        }
-        typed => typed,
-    }
+    move |e| JammiError::from(e.context(format!("graph propagation: {step}")))
 }
 
 /// The order an adjacency's rows are committed in, `(n, g)` ascending: the
@@ -462,7 +457,7 @@ fn ascending(schema: &SchemaRef, columns: &[&str]) -> Result<LexOrdering> {
         .collect::<datafusion::error::Result<Vec<_>>>()
         .map_err(plan_error("sort key"))?;
     LexOrdering::new(exprs)
-        .ok_or_else(|| JammiError::Other("graph propagation: an empty sort key".into()))
+        .ok_or_else(|| JammiError::Internal("graph propagation: an empty sort key".into()))
 }
 
 /// `plan` sorted by `columns` within each of its partitions.

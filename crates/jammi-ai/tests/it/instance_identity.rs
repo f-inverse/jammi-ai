@@ -8,16 +8,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_ai::fine_tune::worker::{EmbeddedWorker, COMPILED_KINDS};
+use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::instance::{GangListing, InstanceRegistration, MemberRoot};
-use jammi_db::catalog::jobs_repo::WorkerRecord;
+use jammi_db::catalog::jobs_repo::{WorkerRecord, WorkerState};
 use jammi_db::catalog::lease::{instance_liveness_margin, instance_prune_window};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 
 use crate::common;
+use jammi_db::catalog::status::JobKind;
 
 const LABEL: &str = "shared-label-7";
 
@@ -289,7 +290,7 @@ fn fast_peer_config(dir: &std::path::Path, port: u16) -> jammi_db::config::Jammi
 async fn wait_until_gang_member(
     catalog: &Catalog,
     instance_id: &str,
-    kind: &str,
+    kind: JobKind,
     lease: Duration,
     root: &MemberRoot,
 ) {
@@ -508,7 +509,7 @@ async fn a_failed_first_upsert_worker_leaves_the_cell_none_so_the_keeper_writes_
         tokio::time::sleep(Duration::from_millis(100)).await;
         let rows = session.catalog().list_workers().await.unwrap();
         if let Some(w) = rows.into_iter().find(|w| w.instance_id == instance_id) {
-            if w.state == "claiming" {
+            if w.state == WorkerState::Claiming {
                 claiming_row = Some(w);
                 break;
             }
@@ -550,7 +551,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
     let mut config = fast_peer_config(dir.path(), 19105);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let kind = COMPILED_KINDS[0];
+    let kind = JobKind::ALL[0];
 
     let me = root_of(&config);
     let session = InferenceSession::open(config).await.unwrap();
@@ -565,7 +566,7 @@ async fn a_gang_member_survives_a_forced_instance_delete_after_one_keeper_pass()
         .into_iter()
         .find(|w| w.instance_id == session.instance_id())
         .expect("this process's own workers row");
-    assert_eq!(before.state, "claiming");
+    assert_eq!(before.state, WorkerState::Claiming);
 
     force_delete_instance(session.catalog(), session.instance_id()).await;
     // Wait comfortably past one heartbeat tick (1s) for the session's own
@@ -598,7 +599,7 @@ async fn a_drained_worker_is_not_resurrected_as_a_member_after_a_forced_delete()
     let mut config = fast_peer_config(dir.path(), 19106);
     config.worker.enabled = true;
     let lease = config.lease.intervals().unwrap().lease();
-    let kind = COMPILED_KINDS[0];
+    let kind = JobKind::ALL[0];
 
     let me = root_of(&config);
     let session = InferenceSession::open(config).await.unwrap();

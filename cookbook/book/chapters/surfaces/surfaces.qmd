@@ -20,8 +20,8 @@ the program, and the in-process engine and the server agree.
 
 ## The program and the server
 
-The corpus is the twenty-row `tiny_corpus` and the encoder the tiny BERT checkpoint the
-book ships, so every surface finishes in seconds once built. The query is by example:
+The corpus is the twenty-row `tiny_corpus` and the encoder `all-MiniLM-L6-v2`, so every
+surface finishes in seconds once built. The query is by example:
 the rows nearest the vector stored for row `1`. Every surface can ask it without a text
 encoder of its own.
 

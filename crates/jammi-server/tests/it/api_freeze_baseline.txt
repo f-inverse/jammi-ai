@@ -14,9 +14,9 @@
 # ignored. Order does not matter (the test compares as sets); kept sorted for a
 # readable diff.
 
-# --- the thirteen jammi.v1.* wire packages (the wire contract): ten served on
+# --- the twelve jammi.v1.* wire packages (the wire contract): ten served on
 # --- the public listener, two served only on `peer_bind`
-# --- (`jammi.v1.peer`, `jammi.v1.gang`), `jammi.v1.lifecycle` contract-only ---
+# --- (`jammi.v1.peer`, `jammi.v1.gang`) ---
 PACKAGE jammi.v1.audit
 PACKAGE jammi.v1.catalog
 PACKAGE jammi.v1.embedding
@@ -36,7 +36,6 @@ PACKAGE jammi.v1.inference
 # vocabulary (FineTuneSpec/GraphFineTuneSpec/ContextPredictorSpec/
 # FineTuneConfig) rather than duplicating it.
 PACKAGE jammi.v1.job
-PACKAGE jammi.v1.lifecycle
 # ADDED (additive, minor-compatible): the engine-internal segment-search
 # seam between replicas. Served ONLY on the separate `[server] peer_bind`
 # listener — the public listener answers UNIMPLEMENTED for its rpcs — and
@@ -117,10 +116,6 @@ RPC JobService/ListWorkers
 RPC JobService/PruneJobs
 RPC JobService/SubmitJob
 RPC JobService/WaitJob
-RPC LifecycleService/ApplyLicense
-RPC LifecycleService/Bootstrap
-RPC LifecycleService/Login
-RPC LifecycleService/Status
 # ADDED (additive, minor-compatible): `PeerService` — served only on
 # `peer_bind`, never on the public listener.
 RPC PeerService/ExactRescore

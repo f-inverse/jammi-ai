@@ -118,6 +118,10 @@ impl TokenizerWrapper {
                 .map(|e| e.get_attention_mask().to_vec())
                 .collect(),
             offsets: encodings.iter().map(|e| e.get_offsets().to_vec()).collect(),
+            word_ids: encodings
+                .iter()
+                .map(|e| e.get_word_ids().to_vec())
+                .collect(),
             seq_len: encodings.first().map_or(0, |e| e.len()),
         })
     }
@@ -132,6 +136,9 @@ pub struct BatchEncoding {
     pub attention_masks: Vec<Vec<u32>>,
     /// Character byte offsets per token: `(start, end)`. Special tokens have `(0, 0)`.
     pub offsets: Vec<Vec<(usize, usize)>>,
+    /// The word each token belongs to, as the pre-tokenizer split the text;
+    /// `None` for a special token or padding. A word's subtokens share one id.
+    pub word_ids: Vec<Vec<Option<u32>>>,
     /// Padded sequence length (columns in the batch).
     pub seq_len: usize,
 }
@@ -163,6 +170,9 @@ impl BatchEncoding {
         for row in &mut self.offsets {
             row.resize(width, (0, 0));
         }
+        for row in &mut self.word_ids {
+            row.resize(width, None);
+        }
         self.seq_len = width;
     }
 }
@@ -176,6 +186,10 @@ mod tests {
             input_ids: vec![vec![7, 8, 0], vec![4, 5, 6]],
             attention_masks: vec![vec![1, 1, 0], vec![1, 1, 1]],
             offsets: vec![vec![(0, 1), (2, 3), (0, 0)], vec![(0, 1), (2, 3), (4, 5)]],
+            word_ids: vec![
+                vec![Some(0), Some(1), None],
+                vec![Some(0), Some(0), Some(1)],
+            ],
             seq_len: 3,
         }
     }
@@ -195,6 +209,7 @@ mod tests {
         assert_eq!(encoding.input_ids[0], vec![7, 8, 0, 0, 0, 0, 0, 0]);
         assert_eq!(encoding.attention_masks[1], vec![1, 1, 1, 0, 0, 0, 0, 0]);
         assert_eq!(encoding.offsets[1].len(), 8);
+        assert_eq!(encoding.word_ids[1][3..], [None; 5]);
         assert_eq!(encoding.row_lengths(), vec![2, 3]);
         encoding.pad_to(4);
         assert_eq!(encoding.seq_len, 8);

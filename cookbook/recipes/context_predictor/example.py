@@ -106,35 +106,43 @@ job = db.train_context_predictor(
 )
 job.wait()
 model_id = job.output_model_id
-print(f"trained {model_id}; final loss {job.metrics()['final_loss']:.3f}")
+metrics = job.metrics()
+held_out = metrics["held_out_tasks"]
+print(f"trained {model_id}; final loss {metrics['final_loss']:.3f}")
+print(f"held out from training: {sorted(held_out)}")
 
 # %% [markdown]
 # ## Predict a task it never saw
 #
 # `predict_with_context_predictor` returns a mean and a spread for one row,
-# with the context rows that informed it. The rows come from the last task,
-# held out from training, and the errors are compared with the best
-# context-free guess, the overall mean.
+# with the context rows that informed it. Every row of every task the job held
+# out is predicted — the predictor never trained on them — and the errors are
+# compared with the best context-free guess, the overall mean. One task alone
+# says little: a task whose level sits near the overall mean is one the mean
+# already guesses well.
 
 # %%
-truth = {r["_row_id"]: r["y"] for r in source.to_pylist()}
+rows = source.to_pylist()
+truth = {r["_row_id"]: r["y"] for r in rows}
 overall = float(np.mean(list(truth.values())))
 errors, baseline = [], []
-for r in range(6):
-    key = f"t{TASKS - 1:02d}_r{r:02d}"
-    prediction = db.predict_with_context_predictor(model_id, source="rows", target_key=key)
-    mean, std = prediction["mean"], prediction["std"]
-    print(
-        f"{key}: y={truth[key]:+.2f}  predicted {mean:+.2f} ± {std:.2f}  "
-        f"(context: {len(prediction['context_ref'])} rows, via {prediction['source']})"
-    )
-    errors.append(abs(mean - truth[key]))
-    baseline.append(abs(overall - truth[key]))
+for task in sorted(held_out):
+    task_errors, task_baseline = [], []
+    for key in [r["_row_id"] for r in rows if r["task"] == task]:
+        prediction = db.predict_with_context_predictor(model_id, source="rows", target_key=key)
+        task_errors.append(abs(prediction["mean"] - truth[key]))
+        task_baseline.append(abs(overall - truth[key]))
+    print(f"{task}: mean absolute error {np.mean(task_errors):.3f} "
+          f"(overall mean as the guess: {np.mean(task_baseline):.3f})")
+    errors += task_errors
+    baseline += task_baseline
 
-print(
-    f"mean absolute error on the held-out task: {np.mean(errors):.3f} "
-    f"(overall mean as the guess: {np.mean(baseline):.3f})"
-)
+key = f"{sorted(held_out)[0].replace('task_', 't')}_r00"
+prediction = db.predict_with_context_predictor(model_id, source="rows", target_key=key)
+print(f"{key}: y={truth[key]:+.2f}  predicted {prediction['mean']:+.2f} ± {prediction['std']:.2f}  "
+      f"(context: {len(prediction['context_ref'])} rows, via {prediction['source']})")
+print(f"every held-out row: mean absolute error {np.mean(errors):.3f} "
+      f"(overall mean as the guess: {np.mean(baseline):.3f})")
 assert np.mean(errors) < np.mean(baseline), "the context beats no context"
 
 # %%

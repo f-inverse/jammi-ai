@@ -128,7 +128,7 @@ pub(crate) fn register_read_view(
         return Ok(());
     }
     let parsed = ::url::Url::parse(url.as_str())
-        .map_err(|e| JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}")))?;
+        .map_err(|e| JammiError::Internal(format!("Storage URL '{url}' did not re-parse: {e}")))?;
     runtime.register_object_store(&parsed, ReadView::of(driver));
     Ok(())
 }
@@ -137,7 +137,7 @@ pub(crate) fn register_read_view(
 /// `LocalFileSystem` rooted at `/` — with a read-only view of the same.
 pub(crate) fn register_local_read_view(runtime: &RuntimeEnv) -> Result<()> {
     let root = ::url::Url::parse("file://")
-        .map_err(|e| JammiError::Config(format!("the file:// root did not parse: {e}")))?;
+        .map_err(|e| JammiError::Internal(format!("the file:// root did not parse: {e}")))?;
     runtime.register_object_store(
         &root,
         ReadView::of(Arc::new(object_store::local::LocalFileSystem::new())),

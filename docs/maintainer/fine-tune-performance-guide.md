@@ -307,12 +307,12 @@ report as provenance (`kernels_disabled_expected`), distinct from the process-OB
 `media_front_end_wall_s` on every media leg, read from
 the run's own metrics (`TrainingResult::media_front_end_wall`, carried as
 `media_front_end_wall_s`), wherever the run happened. Its boundary is DECLARED, not implied, and it has exactly ONE such boundary: on an
-`EncoderAdapters` target, the wall around the decode + preprocess call — including the
+`AdaptedEncoder` target, the wall around the decode + preprocess call — including the
 device tensor build those preprocess functions perform internally, which cannot be
 separated without splitting them — with the tower forward EXCLUDED, accumulated only while
 the loop is in training mode (held-out eval passes are excluded, so the number is a strict
 subset of the training wall), and `null` rather than `0.0` on a text leg because
-tokenization is not a media front end and stays in the residual. On a `ProjectionHead`
+tokenization is not a media front end and stays in the residual. On a `FrozenEncoder`
 target, of any modality, the field never accumulates at all — the frozen base's decode,
 preprocess and forward are one inseparable call there with no seam to time in isolation, so
 charging that combined call to a field documented as front-end-only would give it a second,

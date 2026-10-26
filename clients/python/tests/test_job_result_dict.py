@@ -33,8 +33,8 @@ def _computed() -> inference_pb2.CacheOutcome:
 
 def test_model_arm_carries_cache_outcome_computed() -> None:
     resp = job_pb2.JobStatusResponse(
-        status="completed",
-        kind="fine_tune",
+        status=job_pb2.JOB_STATUS_COMPLETED,
+        kind=job_pb2.JOB_KIND_FINE_TUNE,
         model=job_pb2.ModelResult(
             model_id="jammi:fine-tuned:abc",
             artifact_path="file:///artifacts/abc",
@@ -55,8 +55,8 @@ def test_model_arm_carries_the_reused_model_artifact() -> None:
     """A model-level reuse names the artifact the job's row shares — the
     same one `artifact_path` names."""
     resp = job_pb2.JobStatusResponse(
-        status="completed",
-        kind="fine_tune",
+        status=job_pb2.JOB_STATUS_COMPLETED,
+        kind=job_pb2.JOB_KIND_FINE_TUNE,
         model=job_pb2.ModelResult(
             model_id="jammi:fine-tuned:second",
             artifact_path="file:///artifacts/first",
@@ -74,8 +74,8 @@ def test_model_arm_carries_the_reused_model_artifact() -> None:
 
 def test_table_arm_carries_the_reused_table() -> None:
     computed = job_pb2.JobStatusResponse(
-        status="completed",
-        kind="embedding",
+        status=job_pb2.JOB_STATUS_COMPLETED,
+        kind=job_pb2.JOB_KIND_EMBEDDING,
         table=job_pb2.TableResult(table="jammi.embeddings_1", cache_outcome=_computed()),
     )
     assert _job_result_to_dict(computed) == {
@@ -84,8 +84,8 @@ def test_table_arm_carries_the_reused_table() -> None:
         "cache_outcome": {"outcome": "computed"},
     }
     reused = job_pb2.JobStatusResponse(
-        status="completed",
-        kind="embedding",
+        status=job_pb2.JOB_STATUS_COMPLETED,
+        kind=job_pb2.JOB_KIND_EMBEDDING,
         table=job_pb2.TableResult(
             table="jammi.embeddings_1",
             cache_outcome=inference_pb2.CacheOutcome(reused_table="jammi.embeddings_1"),

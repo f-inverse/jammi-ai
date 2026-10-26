@@ -109,9 +109,9 @@ def _wait_running(job, timeout_secs: float = 120.0) -> None:
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
         status = job.status()
-        if status == "running":
+        if status is jammi.JobStatus.RUNNING:
             return
-        assert status == "queued", f"the long job must not be terminal yet: {status}"
+        assert status is jammi.JobStatus.QUEUED, f"the long job must not be terminal yet: {status}"
         time.sleep(0.1)
     raise AssertionError("the job was never claimed")
 

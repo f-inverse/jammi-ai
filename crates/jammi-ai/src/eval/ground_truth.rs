@@ -1,11 +1,11 @@
-//! Golden dataset loading and schema validation.
+//! Ground-truth dataset loading and schema validation.
 
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use jammi_db::error::{JammiError, Result};
-use jammi_numerics::ner::Entity;
+use jammi_numerics::ner::Span;
 pub use jammi_numerics::retrieval::RelevanceJudgment;
 
 /// The input for a retrieval query — text, image bytes, or audio bytes.
@@ -18,8 +18,8 @@ pub enum QueryInput {
     Audio(Vec<u8>),
 }
 
-/// Which encode path a retrieval golden set drives, selected by the query
-/// column present in the golden schema (`query_text` / `query_image` /
+/// Which encode path a retrieval ground truth drives, selected by the query
+/// column present in the truth schema (`query_text` / `query_image` /
 /// `query_audio`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryModality {
@@ -38,28 +38,26 @@ pub struct RetrievalQuery {
     pub judgments: Vec<RelevanceJudgment>,
 }
 
-/// A loaded retrieval golden dataset, grouped by query.
-pub struct RetrievalGolden {
+/// A loaded retrieval ground-truth dataset, grouped by query.
+pub struct RetrievalTruth {
     pub queries: Vec<RetrievalQuery>,
 }
 
-/// A loaded classification golden dataset: id → label.
-pub struct ClassificationGolden {
+/// A loaded classification ground-truth dataset: id → label.
+pub struct ClassificationTruth {
     pub labels: HashMap<String, String>,
 }
 
-/// A loaded NER golden dataset: row `id` → gold entity-span set.
+/// A loaded NER ground-truth dataset: row `id` → gold entity-span set.
 ///
 /// One CSV/parquet row per entity span — multiple spans on the same `id`
-/// are grouped into the same `Vec<Entity>` by [`load_ner_golden_from_batches`].
-/// `text` is empty and `confidence` is `0.0` for gold rows; the metric's
-/// strict equality on `(label, start, end)` ignores both fields.
+/// are grouped into the same `Vec<Span>` by [`load_ner_truth_from_batches`].
 #[derive(Debug)]
-pub struct NerGolden {
-    pub entities: HashMap<String, Vec<Entity>>,
+pub struct NerTruth {
+    pub entities: HashMap<String, Vec<Span>>,
 }
 
-/// Returns true if `actual` is compatible with `expected` for golden schema validation.
+/// Returns true if `actual` is compatible with `expected` for truth schema validation.
 ///
 /// When Utf8 is expected, we accept any string-like type (Utf8View, LargeUtf8) and
 /// any numeric type (Int32, Int64, Float64) because ID columns are commonly integers
@@ -101,30 +99,30 @@ pub fn ensure_column(schema: &Schema, name: &str, expected: DataType) -> Result<
                 Ok(())
             } else {
                 Err(JammiError::Eval(format!(
-                    "Golden dataset column '{name}' has type {:?}, expected {:?}",
+                    "Ground-truth dataset column '{name}' has type {:?}, expected {:?}",
                     field.data_type(),
                     expected
                 )))
             }
         }
         Err(_) => Err(JammiError::Eval(format!(
-            "Golden dataset missing required column '{name}'"
+            "Ground-truth dataset missing required column '{name}'"
         ))),
     }
 }
 
-/// Load a retrieval golden dataset from DataFusion query results.
+/// Load a retrieval ground-truth dataset from DataFusion query results.
 ///
 /// The `modality` selects which query column the loader reads and which
 /// [`QueryInput`] variant it produces:
 /// - [`QueryModality::Text`]: `query_text` (Utf8) column.
 /// - [`QueryModality::Image`]: `query_image` (Binary) column.
 /// - [`QueryModality::Audio`]: `query_audio` (Binary) column.
-pub fn load_retrieval_golden_from_batches(
+pub fn load_retrieval_truth_from_batches(
     batches: &[arrow::array::RecordBatch],
     has_grades: bool,
     modality: QueryModality,
-) -> Result<RetrievalGolden> {
+) -> Result<RetrievalTruth> {
     // Ordered by `query_id`: the queries are evaluated, and their metrics
     // averaged, in this order, so a report is the same bits on every run.
     let mut query_map: BTreeMap<String, (QueryInput, Vec<RelevanceJudgment>)> = BTreeMap::new();
@@ -190,7 +188,7 @@ pub fn load_retrieval_golden_from_batches(
         })
         .collect();
 
-    Ok(RetrievalGolden { queries })
+    Ok(RetrievalTruth { queries })
 }
 
 /// Clone a [`QueryInput`] for the first-row-wins insertion into the query map
@@ -223,10 +221,10 @@ fn extract_binary_column(col: &dyn Array) -> Result<Vec<Vec<u8>>> {
     )))
 }
 
-/// Load a classification golden dataset from DataFusion query results.
-pub fn load_classification_golden_from_batches(
+/// Load a classification ground-truth dataset from DataFusion query results.
+pub fn load_classification_truth_from_batches(
     batches: &[arrow::array::RecordBatch],
-) -> Result<ClassificationGolden> {
+) -> Result<ClassificationTruth> {
     let mut labels = HashMap::new();
 
     for batch in batches {
@@ -238,7 +236,7 @@ pub fn load_classification_golden_from_batches(
         }
     }
 
-    Ok(ClassificationGolden { labels })
+    Ok(ClassificationTruth { labels })
 }
 
 /// Validate that a schema contains an integer-typed column.
@@ -264,27 +262,26 @@ pub fn ensure_column_int64(schema: &Schema, name: &str) -> Result<()> {
                 Ok(())
             } else {
                 Err(JammiError::Eval(format!(
-                    "Golden dataset column '{name}' has type {:?}, expected an integer type",
+                    "Ground-truth dataset column '{name}' has type {:?}, expected an integer type",
                     field.data_type()
                 )))
             }
         }
         Err(_) => Err(JammiError::Eval(format!(
-            "Golden dataset missing required column '{name}'"
+            "Ground-truth dataset missing required column '{name}'"
         ))),
     }
 }
 
-/// Load an NER golden dataset from DataFusion query results.
+/// Load an NER ground-truth dataset from DataFusion query results.
 ///
 /// Input batches must carry four columns: `id` (Utf8 or numeric, coerced
 /// to a string id internally), `label` (Utf8), `start` (any integer
 /// width), and `end` (any integer width). Each row contributes one entity
 /// span to `entities[id]`; multiple rows sharing an `id` accumulate into
-/// the same span vector. `text` is left empty and `confidence` is `0.0`,
-/// which the metric ignores via [`Entity`]'s custom equality.
-pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Result<NerGolden> {
-    let mut entities: HashMap<String, Vec<Entity>> = HashMap::new();
+/// the same span vector.
+pub fn load_ner_truth_from_batches(batches: &[arrow::array::RecordBatch]) -> Result<NerTruth> {
+    let mut entities: HashMap<String, Vec<Span>> = HashMap::new();
 
     for batch in batches {
         let ids = extract_string_column(batch, "id")?;
@@ -293,22 +290,19 @@ pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Re
         let ends = extract_usize_column(batch, "end")?;
 
         for (((id, label), start), end) in ids.into_iter().zip(labels).zip(starts).zip(ends) {
-            entities.entry(id).or_default().push(Entity {
-                label,
-                start,
-                end,
-                text: String::new(),
-                confidence: 0.0,
-            });
+            entities
+                .entry(id)
+                .or_default()
+                .push(Span { label, start, end });
         }
     }
 
-    Ok(NerGolden { entities })
+    Ok(NerTruth { entities })
 }
 
 /// Extract an integer column as `usize`, rejecting negative values with a
-/// schema-named error. NER spans index byte offsets (`Entity::start`,
-/// `Entity::end`), which the metric kernel models as `usize`.
+/// schema-named error. NER spans index byte offsets (`Span::start`,
+/// `Span::end`), which the metric kernel models as `usize`.
 fn extract_usize_column(batch: &arrow::array::RecordBatch, column: &str) -> Result<Vec<usize>> {
     use arrow::array::{
         Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -327,7 +321,7 @@ fn extract_usize_column(batch: &arrow::array::RecordBatch, column: &str) -> Resu
                     let v = arr.value(i);
                     if v < 0 {
                         Err(JammiError::Eval(format!(
-                            "Golden dataset column '{column}' has negative value {v} at row {i}; \
+                            "Ground-truth dataset column '{column}' has negative value {v} at row {i}; \
                              span offsets must be non-negative"
                         )))
                     } else {
@@ -413,7 +407,7 @@ pub(crate) fn extract_string_column(
 }
 
 /// Extract a real-valued column as `Vec<f64>`, widening the common numeric
-/// Arrow types (Float64/Float32, Int64/Int32) so a golden source may store an
+/// Arrow types (Float64/Float32, Int64/Int32) so a ground-truth source may store an
 /// outcome or distribution parameter as either an integer or a float.
 ///
 /// Returns `Eval` when the column is missing or not a numeric type.
@@ -453,7 +447,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn load_ner_golden_round_trips_three_row_fixture() {
+    fn load_ner_truth_round_trips_three_row_fixture() {
         // Mirrors `cookbook/fixtures/tiny_ner_gold.csv` shape — one row per
         // entity span, multiple rows per id permitted.
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -473,29 +467,25 @@ mod tests {
         )
         .expect("valid batch");
 
-        let golden = load_ner_golden_from_batches(&[batch]).expect("loader succeeds");
+        let truth = load_ner_truth_from_batches(&[batch]).expect("loader succeeds");
 
-        assert_eq!(golden.entities.len(), 2);
+        assert_eq!(truth.entities.len(), 2);
 
-        let row_one = golden.entities.get("1").expect("row 1 present");
+        let row_one = truth.entities.get("1").expect("row 1 present");
         assert_eq!(row_one.len(), 2);
         let labels: Vec<&str> = row_one.iter().map(|e| e.label.as_str()).collect();
         assert!(labels.contains(&"PER"));
         assert!(labels.contains(&"ORG"));
 
-        let row_two = golden.entities.get("2").expect("row 2 present");
+        let row_two = truth.entities.get("2").expect("row 2 present");
         assert_eq!(row_two.len(), 1);
         assert_eq!(row_two[0].label, "PER");
         assert_eq!(row_two[0].start, 4);
         assert_eq!(row_two[0].end, 11);
-        // Gold rows leave `text` empty and `confidence` zero — the metric
-        // ignores both fields via the `Entity` custom equality.
-        assert!(row_two[0].text.is_empty());
-        assert_eq!(row_two[0].confidence, 0.0);
     }
 
     #[test]
-    fn load_ner_golden_rejects_negative_span_offsets() {
+    fn load_ner_truth_rejects_negative_span_offsets() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("label", DataType::Utf8, false),
@@ -514,7 +504,7 @@ mod tests {
         .expect("valid batch");
 
         let err =
-            load_ner_golden_from_batches(&[batch]).expect_err("negative offset must be rejected");
+            load_ner_truth_from_batches(&[batch]).expect_err("negative offset must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("negative"), "error message: {msg}");
         assert!(msg.contains("start"), "error message: {msg}");

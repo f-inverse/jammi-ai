@@ -44,7 +44,7 @@ use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
@@ -64,11 +64,9 @@ use tempfile::{tempdir, TempDir};
 // ---------------------------------------------------------------------------
 
 /// Prefix of every package in the compiled `jammi.v1` wire surface — the frozen
-/// contract, which may exceed what a given build mounts (a contract-only
-/// service like `jammi.v1.lifecycle` is in the descriptor yet served by no OSS
-/// handler; it is accounted for on the control-plane allowlist). The descriptor
-/// also carries `google.*` / `arrow.*` imports; only `jammi.v1.*` services
-/// define the engine's own rpc surface, so the bind scopes to them.
+/// contract. The descriptor also carries `google.*` / `arrow.*` imports; only
+/// `jammi.v1.*` services define the engine's own rpc surface, so the bind
+/// scopes to them.
 const WIRE_PACKAGE_PREFIX: &str = "jammi.v1";
 
 /// Decode [`FILE_DESCRIPTOR_SET`] into the set of `Service/Method` paths every
@@ -126,20 +124,6 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // only the one-shot construction-time pass, which is not an RPC.
     // `PruneJobs` is tenant-scoped exactly like every other job RPC and is
     // covered by a case below, not allowlisted.
-    // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
-    // descriptor so the candle-free `jammi-admin` / CLI client can call a
-    // PLATFORM server that implements them, but NOT served by the OSS engine:
-    // `assemble_grpc_chain` mounts no `LifecycleService`, so an OSS server
-    // answers UNIMPLEMENTED. They touch no tenant-scoped row here because there
-    // is no handler here at all — the platform implementation owns their auth +
-    // governance semantics (and their own isolation proof), off in the platform
-    // repo. They appear in the descriptor (which is the frozen contract, not the
-    // per-build mount set), so they must be accounted for; being defined-but-
-    // unmounted is exactly why they are allowlisted rather than cased.
-    ("LifecycleService", "ApplyLicense"),
-    ("LifecycleService", "Bootstrap"),
-    ("LifecycleService", "Login"),
-    ("LifecycleService", "Status"),
 ];
 
 /// Rpcs served ONLY on the internal `[server] peer_bind` listener — the first
@@ -1511,7 +1495,7 @@ async fn assert_eval_run_isolated() {
         eval_type: "embedding".into(),
         model_id: Some(pk),
         source_id: "src_a".into(),
-        golden_source: "golden".into(),
+        ground_truth: "truth".into(),
         k: Some(10),
         metrics_json: "{}".into(),
         status: "completed".into(),
@@ -2770,7 +2754,7 @@ async fn assert_embedding_with_own_model_isolated() {
                 )
                 .await?;
             job.wait().await?;
-            Ok::<_, JammiError>(job.model_id().to_string())
+            Ok::<_, JammiError>(job.output_model_id().unwrap().to_string())
         })
         .await
         .expect("tenant A trains its own model");
@@ -2827,7 +2811,7 @@ async fn assert_training_create_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -2859,7 +2843,7 @@ async fn assert_training_list_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -2890,7 +2874,7 @@ async fn assert_cancel_job_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_cancel_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,
@@ -2929,7 +2913,7 @@ async fn assert_prune_jobs_isolated() {
     cat_a
         .submit_job(SubmitJobParams {
             job_id: "job_prune_a",
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: None,
@@ -3569,7 +3553,7 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
 
 /// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`:
 /// `GangServiceServer` is mounted only on the internal `peer_bind` `Routes`
-/// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the
+/// (`Server::bind`), beside `PeerServiceServer`, and is never added to the
 /// public `Routes`. This is the invariant that makes
 /// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
 /// the gang admission handler through the public tenant layer, and on the

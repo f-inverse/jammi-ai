@@ -10,6 +10,7 @@ import tempfile
 import pyarrow as pa
 
 import jammi
+from jammi.errors import NotFound
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
@@ -50,14 +51,15 @@ print(bodies)
 # %% [markdown]
 # ## Drop it
 #
-# After `drop_mutable_table`, SQL no longer resolves the name. With
+# After `drop_mutable_table`, SQL no longer resolves the name: a query that
+# names it raises `NotFound`, the class every missing thing raises. With
 # `if_exists=True`, dropping a table that is already gone does not raise.
 
 # %%
 db.drop_mutable_table("notes")
 try:
     db.sql("SELECT COUNT(*) FROM mutable.public.notes")
-except RuntimeError as dropped:
+except NotFound as dropped:
     print(f"after the drop: {dropped}")
 else:
     raise AssertionError("post-drop SELECT must raise")

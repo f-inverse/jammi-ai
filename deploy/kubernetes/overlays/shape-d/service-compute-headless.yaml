@@ -6,7 +6,7 @@
 #
 # `publishNotReadyAddresses: true`: the peer/gang listener is bound and
 # already serving `PeerService`/`GangService` connections as soon as
-# `OssServer::bind` returns (`crates/jammi-server/src/runtime.rs`), which
+# `Server::bind` returns (`crates/jammi-server/src/runtime.rs`), which
 # happens BEFORE the process's own `/readyz` reports ready --
 # `/readyz` gates the catalog ping and, when `[server] preload_models` is
 # set, model preload (`docs/guide/src/deploy-server.md`'s "Preloading

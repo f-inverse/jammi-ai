@@ -93,7 +93,7 @@ bound tenant. Each dict carries `{model_id, backend, task, status}`.
 
 ## Mutable companion tables
 
-- `db.create_mutable_table(name, *, schema, primary_key, indexes=None, order_column=None, chunk_size=None) -> str` — provision a mutable companion table alongside the append-only result tables; `schema` is the column definition, `primary_key` the upsert key. `indexes` declares secondary lookups, `order_column` the sort key, `chunk_size` the row-group size.
+- `db.create_mutable_table(name, *, schema, primary_key, indexes=None, order_column=None) -> str` — provision a mutable companion table alongside the append-only result tables; `schema` is the column definition, `primary_key` the upsert key. `indexes` declares secondary lookups, `order_column` the sort key.
 - `db.drop_mutable_table(name, *, if_exists=False) -> None` — drop a mutable table; `if_exists=True` makes a missing table a no-op.
 - `db.list_mutable_tables() -> list[dict]` — control-plane catalog read of the registered mutable tables.
 

@@ -1131,8 +1131,8 @@ impl PyDatabase {
     /// binding. Registry introspection, not a SQL query. Each entry is a dict
     /// mirroring the table's `MutableTableDefinition`: `id` (str), `schema`
     /// (`pyarrow.Schema`), `primary_key` (list of str), `indexes` (list of
-    /// `{"name", "columns", "unique"}` dicts), `order_column` (str — empty when
-    /// the table declares none), and `chunk_size` (int).
+    /// `{"name", "columns", "unique"}` dicts) and `order_column` (str — empty
+    /// when the table declares none).
     fn list_mutable_tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let defs =
@@ -1156,7 +1156,6 @@ impl PyDatabase {
             }
             entry.set_item("indexes", indexes)?;
             entry.set_item("order_column", def.order_column.clone().unwrap_or_default())?;
-            entry.set_item("chunk_size", def.chunk_size)?;
             out.append(entry)?;
         }
         Ok(out.into_any().unbind())

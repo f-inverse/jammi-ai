@@ -652,8 +652,8 @@ message MutableTableDefinition {
   // Optional monotonic ordering column for streaming reads (`scan_after`).
   // Empty == none.
   string order_column = 5;
-  // Chunk size for streaming reads. 0 == the engine default (8192).
-  uint64 chunk_size = 6;
+  reserved 6;
+  reserved "chunk_size";
   // Free-form tenant-owned metadata as a JSON object string; "{}" when none.
   // The engine stores it verbatim and never parses it.
   string user_metadata = 7;

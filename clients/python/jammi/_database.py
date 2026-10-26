@@ -424,9 +424,9 @@ def _mutable_table_definition_to_dict(
 
     Mirrors the embedded `Database.list_mutable_tables` entry — `id`, `schema`
     (a `pyarrow.Schema` decoded from the IPC framing), `primary_key`, `indexes`
-    (each a `{"name", "columns", "unique"}` dict), `order_column` (empty string
-    when the table declares none, matching the embedded `unwrap_or_default`), and
-    `chunk_size` — so a caller reads the same keys regardless of transport.
+    (each a `{"name", "columns", "unique"}` dict) and `order_column` (empty string
+    when the table declares none, matching the embedded `unwrap_or_default`) — so
+    a caller reads the same keys regardless of transport.
     """
     schema = pa.ipc.open_stream(d.schema).schema
     return {
@@ -438,7 +438,6 @@ def _mutable_table_definition_to_dict(
             for idx in d.indexes
         ],
         "order_column": d.order_column,
-        "chunk_size": d.chunk_size,
     }
 
 
@@ -1451,7 +1450,6 @@ class RemoteDatabase:
         primary_key: List[str],
         indexes: Optional[List[Dict[str, Any]]] = None,
         order_column: Optional[str] = None,
-        chunk_size: Optional[int] = None,
     ) -> str:
         """Register a mutable companion table on the remote engine and return its
         catalog id.
@@ -1460,8 +1458,7 @@ class RemoteDatabase:
         list of column names drawn from it. `indexes` is an optional list of dicts
         of shape ``{"name": str, "columns": [str, ...], "unique": bool=False}`` —
         one secondary index per entry. `order_column` is an optional monotonic
-        column enabling streaming `scan_after` reads; `chunk_size` overrides the
-        engine's default scan chunk size. Tenant scope is the session's bound
+        column enabling streaming `scan_after` reads. Tenant scope is the session's bound
         tenant (the wire body is tenant-free). Maps to
         `CatalogService.CreateMutableTable`.
         """
@@ -1471,7 +1468,6 @@ class RemoteDatabase:
             primary_key=primary_key,
             indexes=indexes,
             order_column=order_column,
-            chunk_size=chunk_size,
         )
         resp = self._call(self._catalog.CreateMutableTable, request)
         return resp.mutable_table_id
@@ -1495,8 +1491,7 @@ class RemoteDatabase:
         """A descriptor for every mutable companion table registered to the current
         tenant. Each entry is the same dict shape as the embed
         `Database.list_mutable_tables`: ``id``, ``schema`` (a `pyarrow.Schema`),
-        ``primary_key``, ``indexes``, ``order_column`` (empty when none), and
-        ``chunk_size``. Maps to `CatalogService.ListMutableTables`.
+        ``primary_key``, ``indexes`` and ``order_column`` (empty when none). Maps to `CatalogService.ListMutableTables`.
         """
         resp = self._call(
             self._catalog.ListMutableTables, catalog_pb2.ListMutableTablesRequest()

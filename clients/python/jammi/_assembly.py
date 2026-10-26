@@ -1654,7 +1654,6 @@ def build_create_mutable_table_request(
     primary_key: List[str],
     indexes: Optional[List[Dict[str, Any]]] = None,
     order_column: Optional[str] = None,
-    chunk_size: Optional[int] = None,
 ) -> catalog_pb2.CreateMutableTableRequest:
     """Assemble the `CreateMutableTableRequest` for a mutable companion table from
     the binding's flat kwargs.
@@ -1663,8 +1662,7 @@ def build_create_mutable_table_request(
     stream); `primary_key` is a non-empty subset of its columns. `indexes` is an
     optional list of ``{"name", "columns", "unique"}`` dicts — one secondary
     index per entry. `order_column` is an optional monotonic column enabling
-    streaming `scan_after` reads; `chunk_size` overrides the engine's default scan
-    chunk size. The wire body is tenant-free — the server stamps the session
+    streaming `scan_after` reads. The wire body is tenant-free — the server stamps the session
     tenant onto the catalog row. The same request the embed binding submits
     in-process.
     """
@@ -1684,8 +1682,6 @@ def build_create_mutable_table_request(
     )
     if order_column is not None:
         definition.order_column = order_column
-    if chunk_size is not None:
-        definition.chunk_size = chunk_size
     return catalog_pb2.CreateMutableTableRequest(definition=definition)
 
 

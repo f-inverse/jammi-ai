@@ -150,7 +150,6 @@ async fn create_then_read_then_drop_mutable_table() {
                 primary_key: vec!["sku".into()],
                 indexes: vec![],
                 order_column: "seq".into(),
-                chunk_size: 0,
                 user_metadata: String::new(),
             }),
         })
@@ -203,7 +202,6 @@ async fn create_mutable_table_rejects_primary_key_not_in_schema() {
                 primary_key: vec!["does_not_exist".into()],
                 indexes: vec![],
                 order_column: String::new(),
-                chunk_size: 0,
                 user_metadata: String::new(),
             }),
         })

@@ -1558,7 +1558,6 @@ class EmbeddedBackend:
         primary_key: List[str],
         indexes: Optional[List[Dict[str, Any]]] = None,
         order_column: Optional[str] = None,
-        chunk_size: Optional[int] = None,
     ) -> str:
         """Register a mutable companion table and return its catalog id.
 
@@ -1566,8 +1565,7 @@ class EmbeddedBackend:
         list of column names drawn from it. `indexes` is an optional list of
         ``{"name", "columns", "unique"}`` dicts — one secondary index per entry.
         `order_column` is an optional monotonic column enabling streaming
-        `scan_after` reads; `chunk_size` overrides the engine's default scan chunk
-        size. Tenant scope is the session's bound tenant. Same handle shape and
+        `scan_after` reads. Tenant scope is the session's bound tenant. Same handle shape and
         verb signature as the remote `RemoteDatabase.create_mutable_table`; the
         request is assembled with the shared `CreateMutableTableRequest` builder
         and submitted through the engine's wire seam.
@@ -1578,7 +1576,6 @@ class EmbeddedBackend:
             primary_key=primary_key,
             indexes=indexes,
             order_column=order_column,
-            chunk_size=chunk_size,
         )
         return self._native._create_mutable_table_proto(request.SerializeToString())
 

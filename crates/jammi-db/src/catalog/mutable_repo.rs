@@ -487,7 +487,6 @@ fn materialize(
         indexes,
         user_metadata,
         order_column,
-        chunk_size: 8192,
     })
 }
 

@@ -95,8 +95,6 @@ pub struct MutableTableDefinition {
     /// Must exist in `schema` and be `Int64` or `UInt64`. Required for backing
     /// a Phase-4 trigger-stream topic; optional otherwise.
     pub order_column: Option<String>,
-    /// Chunk size for streaming reads. Default 8192.
-    pub chunk_size: usize,
 }
 
 /// Builder with build-time validation.
@@ -109,7 +107,6 @@ pub struct MutableTableDefinitionBuilder {
     indexes: Vec<MutableIndexDef>,
     user_metadata: serde_json::Value,
     order_column: Option<String>,
-    chunk_size: usize,
     allow_internal_columns: bool,
 }
 
@@ -123,7 +120,6 @@ impl MutableTableDefinitionBuilder {
             indexes: vec![],
             user_metadata: serde_json::Value::Object(serde_json::Map::new()),
             order_column: None,
-            chunk_size: 8192,
             allow_internal_columns: false,
         }
     }
@@ -160,11 +156,6 @@ impl MutableTableDefinitionBuilder {
 
     pub fn order_column(mut self, column: impl Into<String>) -> Self {
         self.order_column = Some(column.into());
-        self
-    }
-
-    pub fn chunk_size(mut self, size: usize) -> Self {
-        self.chunk_size = size;
         self
     }
 
@@ -232,7 +223,6 @@ impl MutableTableDefinitionBuilder {
             indexes: self.indexes,
             user_metadata: self.user_metadata,
             order_column: self.order_column,
-            chunk_size: self.chunk_size,
         })
     }
 }

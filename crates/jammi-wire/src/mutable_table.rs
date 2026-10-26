@@ -42,9 +42,6 @@ pub fn definition_from_proto(
     if !def.order_column.is_empty() {
         builder = builder.order_column(def.order_column);
     }
-    if def.chunk_size != 0 {
-        builder = builder.chunk_size(def.chunk_size as usize);
-    }
     if !def.user_metadata.is_empty() {
         let value: serde_json::Value = serde_json::from_str(&def.user_metadata)
             .map_err(|e| Status::invalid_argument(format!("user_metadata is not JSON: {e}")))?;
@@ -82,7 +79,6 @@ pub fn definition_to_proto(
             })
             .collect(),
         order_column: def.order_column.clone().unwrap_or_default(),
-        chunk_size: def.chunk_size as u64,
         user_metadata: def.user_metadata.to_string(),
     })
 }

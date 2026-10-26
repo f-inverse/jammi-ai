@@ -952,7 +952,9 @@ impl<B> PermitBody<B> {
 fn synthesized_trailers(code: Code, message: String) -> HeaderMap {
     let status = limits_status(code, message);
     let mut headers = HeaderMap::new();
-    let _ = status.add_header(&mut headers);
+    if let Err(e) = status.add_header(&mut headers) {
+        tracing::warn!("the synthesized trailer's limits detail did not encode: {e}");
+    }
     headers
 }
 
@@ -1182,7 +1184,11 @@ mod tests {
             self.entered.fetch_add(1, Ordering::SeqCst);
             let gate = Arc::clone(&self.gate);
             Box::pin(async move {
-                let _ = gate.acquire().await;
+                drop(
+                    gate.acquire()
+                        .await
+                        .expect("the test never closes its gate"),
+                );
                 Ok(Response::new(TestBody::default()))
             })
         }
@@ -1671,7 +1677,7 @@ mod tests {
             }
         }
         let mut svc = RefusalStatusLayer::new(Arc::clone(&metrics)).layer(AlwaysRefuses);
-        let _ = svc.call(mk_req("/x/Y")).await.unwrap();
+        svc.call(mk_req("/x/Y")).await.unwrap();
         assert_eq!(
             metrics
                 .grpc_refused
@@ -1710,7 +1716,7 @@ mod tests {
             }
         }
         let mut svc = RefusalStatusLayer::new(Arc::clone(&metrics)).layer(RawCodecRefusal);
-        let _ = svc.call(mk_req("/x/Y")).await.unwrap();
+        svc.call(mk_req("/x/Y")).await.unwrap();
         assert_eq!(
             metrics
                 .grpc_refused
@@ -1724,7 +1730,7 @@ mod tests {
     async fn refusal_status_layer_does_not_count_a_normal_success_response() {
         let metrics = Arc::new(MetricsRegistry::new().unwrap());
         let mut svc = RefusalStatusLayer::new(Arc::clone(&metrics)).layer(Immediate);
-        let _ = svc.call(mk_req("/x/Y")).await.unwrap();
+        svc.call(mk_req("/x/Y")).await.unwrap();
         assert_eq!(
             metrics.grpc_refused.with_label_values(&["in_flight"]).get(),
             0

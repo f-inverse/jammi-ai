@@ -157,14 +157,9 @@ impl DerivedTable {
     /// `statement` with every reference to the table replaced by the derived
     /// table that reads its `money` columns as `numeric`.
     fn rewrite(&self, mut statement: Statement) -> DataFusionResult<Statement> {
-        let mut visitor = ReplaceTable {
-            derived: self,
-            error: None,
-        };
-        let _ = statement.visit(&mut visitor);
-        match visitor.error {
-            Some(error) => Err(error),
-            None => Ok(statement),
+        match statement.visit(&mut ReplaceTable { derived: self }) {
+            ControlFlow::Continue(()) => Ok(statement),
+            ControlFlow::Break(error) => Err(error),
         }
     }
 
@@ -210,18 +205,21 @@ impl DerivedTable {
     }
 }
 
-/// Replaces each reference to one table with its [`DerivedTable`]. It runs
-/// after a factor's children are visited, so the derived table — which
-/// names the table again — is never itself revisited.
+/// Replaces each reference to one table with its [`DerivedTable`], breaking
+/// with the error when one cannot be built. It runs after a factor's
+/// children are visited, so the derived table — which names the table
+/// again — is never itself revisited.
 struct ReplaceTable<'a> {
     derived: &'a DerivedTable,
-    error: Option<DataFusionError>,
 }
 
 impl VisitorMut for ReplaceTable<'_> {
-    type Break = ();
+    type Break = DataFusionError;
 
-    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+    fn post_visit_table_factor(
+        &mut self,
+        factor: &mut TableFactor,
+    ) -> ControlFlow<DataFusionError> {
         let TableFactor::Table {
             name,
             alias,
@@ -239,10 +237,7 @@ impl VisitorMut for ReplaceTable<'_> {
                 *factor = derived;
                 ControlFlow::Continue(())
             }
-            Err(error) => {
-                self.error = Some(error);
-                ControlFlow::Break(())
-            }
+            Err(error) => ControlFlow::Break(error),
         }
     }
 }

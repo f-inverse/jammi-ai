@@ -286,7 +286,7 @@ fn distilbert_lora_bias_site_dispatches_the_fused_lora_linear_site_whatever_the_
     for training in [false, true, false] {
         encoder.set_training(training);
         let before = lora_linear_fused_dispatch_snapshot();
-        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        encoder.forward_hidden(&input_ids, &mask).expect("forward");
         let after = lora_linear_fused_dispatch_snapshot();
         assert!(
             after.fused > before.fused && after.eager == before.eager,
@@ -614,7 +614,7 @@ fn distilbert_biased_layer_norm_dispatches_the_fused_kernel_whatever_the_mode() 
     for training in [false, true, false] {
         encoder.set_training(training);
         let before = jammi_encoders::ln_dispatch_snapshot();
-        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        encoder.forward_hidden(&input_ids, &mask).expect("forward");
         let after = jammi_encoders::ln_dispatch_snapshot();
         assert!(
             after.fused > before.fused && after.eager == before.eager,
@@ -658,7 +658,7 @@ fn distilbert_head64_training_attention_block_and_softmax_two_sided_counters() {
     let block_before = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
     let flash_before = jammi_encoders::attention_block_flash_dispatch_snapshot();
-    let _ = encoder
+    encoder
         .forward_hidden(&input_ids, &mask)
         .expect("training forward at head64");
     let block_after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -698,7 +698,7 @@ fn distilbert_head64_training_gelu_two_sided_counters() {
 
     let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
     let before = gelu_counters.snapshot();
-    let _ = encoder
+    encoder
         .forward_hidden(&input_ids, &mask)
         .expect("training forward at head64");
     let after = gelu_counters.snapshot();
@@ -733,7 +733,7 @@ fn distilbert_head16_training_attention_block_counted_eager() {
     let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
 
     let before = jammi_encoders::attention_block_dispatch_snapshot();
-    let _ = encoder
+    encoder
         .forward_hidden(&input_ids, &mask)
         .expect("training forward at head16");
     let after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -776,7 +776,7 @@ fn distilbert_head64_output_is_bit_identical_regardless_of_training_history() {
 
     let mut encoder_toggled = build();
     encoder_toggled.set_training(true);
-    let _ = encoder_toggled
+    encoder_toggled
         .forward_hidden(&input_ids, &mask)
         .expect("training forward (to touch the fused arm)");
     encoder_toggled.set_training(false);
@@ -820,7 +820,7 @@ fn distilbert_head64_disabled_attention_block_and_softmax_child_process_body() {
 
     let block_before = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
-    let _ = encoder
+    encoder
         .forward_hidden(&input_ids, &mask)
         .expect("disabled attention_block_fused/softmax must fall back to eager, not error");
     let block_after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -860,7 +860,7 @@ fn distilbert_head64_disabled_gelu_erf_fused_child_process_body() {
 
     let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
     let before = gelu_counters.snapshot();
-    let _ = encoder
+    encoder
         .forward_hidden(&input_ids, &mask)
         .expect("disabled gelu_erf_fused must fall back to eager, not error");
     let after = gelu_counters.snapshot();

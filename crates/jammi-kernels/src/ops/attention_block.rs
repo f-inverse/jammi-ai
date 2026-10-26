@@ -1373,7 +1373,7 @@ mod tests {
                  materialized contiguous copy (OP_N) — bwd would then issue a DIFFERENT GEMM \
                  shape than fwd's own QKᵀ"
             );
-            let _ = lhs.matmul(&rhs).unwrap();
+            lhs.matmul(&rhs).unwrap();
 
             // dv = p.transpose(-1,-2) (VIEW, no `.contiguous()`) @ dctx —
             // see the module doc's "GEMM operand form is a determinism
@@ -1396,7 +1396,7 @@ mod tests {
                  own generic `Op::Matmul` backward issues for the eager composition's equivalent \
                  gradient (backprop.rs: `rhs_grad = lhs.t().matmul(&grad)`, always a view)"
             );
-            let _ = lhs.matmul(&dctx).unwrap();
+            lhs.matmul(&dctx).unwrap();
 
             // dp = dctx @ v.transpose(-1,-2) (VIEW, no `.contiguous()`)
             let rhs = v.transpose(D::Minus1, D::Minus2).unwrap();
@@ -1413,7 +1413,7 @@ mod tests {
                 "dp rhs @ ({b},{s},{h},{d}) must be a transpose VIEW of `v`, not a materialized \
                  copy — same determinism concern as `dv`'s `lhs` above"
             );
-            let _ = dctx.matmul(&rhs).unwrap();
+            dctx.matmul(&rhs).unwrap();
 
             // dqs = ds @ k — both operands ALREADY contiguous (`ds` a
             // fresh `CustomOp2` output, `k` this fixture's own contiguous
@@ -1426,7 +1426,7 @@ mod tests {
                 is_gemm_operand_admissible(k.layout()),
                 "dqs rhs @ ({b},{s},{h},{d})"
             );
-            let _ = ds.matmul(&k).unwrap();
+            ds.matmul(&k).unwrap();
 
             // dkr = ds.transpose(-1,-2) (VIEW, no `.contiguous()`) @ q
             let lhs = ds.transpose(D::Minus1, D::Minus2).unwrap();
@@ -1443,7 +1443,7 @@ mod tests {
                 "dkr lhs @ ({b},{s},{h},{d}) must be a transpose VIEW of `ds`, not a materialized \
                  copy — same determinism concern as `dv`'s `lhs` above"
             );
-            let _ = lhs.matmul(&q).unwrap();
+            lhs.matmul(&q).unwrap();
         }
     }
 
@@ -2277,10 +2277,9 @@ mod tests {
         let scale = 1.0 / (d as f32).sqrt();
         let op = AttentionBlockFused::new(scale, FullyMaskedPolicy::Propagate, true).unwrap();
         let out = fused(qkv.as_tensor(), rope_pack.as_tensor(), &mask, op).unwrap();
-        let err = out.sum_all().unwrap().backward().expect_err(
+        out.sum_all().unwrap().backward().expect_err(
             "a tracked rope_pack must make backward fail loudly, not silently drop its gradient",
         );
-        let _ = err;
     }
 
     /// `bwd` runs DETACHED (module doc's "`bwd` runs DETACHED" section):

@@ -454,7 +454,7 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_file(&weights_path);
+        std::fs::remove_file(&weights_path).expect("remove the test's weights");
     }
 
     /// NEGATIVE CONTROL (family F: non-vacuous): loading a DIFFERENT LoRA
@@ -537,7 +537,7 @@ mod tests {
              doc)"
         );
 
-        let _ = std::fs::remove_file(&weights_path);
+        std::fs::remove_file(&weights_path).expect("remove the test's weights");
     }
 
     /// The three groups of a batch are `synthetic_ids(.., seed + i, ..)`
@@ -655,7 +655,7 @@ mod tests {
             }
         }
 
-        let _ = std::fs::remove_file(&weights_path);
+        std::fs::remove_file(&weights_path).expect("remove the test's weights");
     }
 
     /// A process-unique temp directory (never `/tmp` directly, and never

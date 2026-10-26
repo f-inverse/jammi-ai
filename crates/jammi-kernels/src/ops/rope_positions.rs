@@ -721,7 +721,7 @@ impl CustomOp3 for RopePositionsFused {
     /// for the live probe.
     fn bwd(
         &self,
-        arg1: &Tensor,
+        _arg1: &Tensor,
         arg2: &Tensor,
         arg3: &Tensor,
         _res: &Tensor,
@@ -743,7 +743,6 @@ impl CustomOp3 for RopePositionsFused {
                  error replaces"
             )));
         }
-        let _ = arg1; // domain-only; `dx` above is the whole gradient wrt qkv.
         Ok((Some(dx), None, None))
     }
 }

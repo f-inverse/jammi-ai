@@ -107,19 +107,19 @@ mod length_and_domain_tests {
     #[test]
     #[should_panic(expected = "cosine_distance: length mismatch")]
     fn cosine_distance_refuses_a_longer_b() {
-        let _ = cosine_distance(&vq(&[1.0, 0.0]), &[1.0, 0.0, 0.0]);
+        cosine_distance(&vq(&[1.0, 0.0]), &[1.0, 0.0, 0.0]);
     }
 
     #[test]
     #[should_panic(expected = "cosine_distance: length mismatch")]
     fn cosine_distance_refuses_a_shorter_b() {
-        let _ = cosine_distance(&vq(&[1.0, 0.0, 0.0]), &[1.0, 0.0]);
+        cosine_distance(&vq(&[1.0, 0.0, 0.0]), &[1.0, 0.0]);
     }
 
     #[test]
     #[should_panic(expected = "cosine_similarity: length mismatch")]
     fn cosine_similarity_refuses_a_length_mismatch() {
-        let _ = cosine_similarity(&vq(&[1.0, 0.0]), &[1.0, 0.0, 0.0]);
+        cosine_similarity(&vq(&[1.0, 0.0]), &[1.0, 0.0, 0.0]);
     }
 
     /// The measured self-hit: `cosine_distance(v, v)` on an ordinary

@@ -1005,6 +1005,27 @@ fn completeness(
     }
 }
 
+/// SIGKILL `child` by pid: the deliberate "crash a process" action. A child
+/// already killed makes it a no-op (ESRCH).
+pub fn sigkill(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: `pid` is a child this process spawned; SIGKILL is unconditional
+    // and synchronous, touching no allocator or thread state.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// Kill `child` and reap it: what a fixture's `Drop` does with a process it
+/// spawned. A destructor cannot fail its test (a panic while unwinding aborts
+/// the process), so a reap that fails says so on stderr.
+pub fn reap_on_drop(child: &mut Child) {
+    sigkill(child);
+    if let Err(e) = child.wait() {
+        eprintln!("could not reap child process {}: {e}", child.id());
+    }
+}
+
 /// Kill `child` and reap it by polling `try_wait` for up to `ceiling`.
 /// Returns the reaped status (`None` if it never reaped within the bound — a
 /// documented caveat: a `SIGKILL`ed process in uninterruptible sleep can
@@ -1482,7 +1503,7 @@ mod tests {
     /// give `snapshot()`/`try_wait()` something to observe mid-run.
     fn printsleep_child() -> ! {
         eprintln!("hello-mid-run");
-        let _ = io::stderr().flush();
+        io::stderr().flush().expect("flush stderr");
         thread::sleep(Duration::from_secs(2));
         std::process::exit(0);
     }

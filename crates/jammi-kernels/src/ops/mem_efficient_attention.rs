@@ -2518,18 +2518,17 @@ mod tests {
         let mut mask = vec![0f32; s];
         mask[s - 1] = -10_000.0;
 
-        let (m_ok, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
-        let (m_bad, l_bad, w_bad) = running_softmax_row(&scores, &mask, chunk, false, 0, None);
+        let (_, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
+        let (_, l_bad, w_bad) = running_softmax_row(&scores, &mask, chunk, false, 0, None);
 
-        let weighted_index = |m: f32, l: f32, w: &[f32]| -> f32 {
-            let _ = (m, l);
+        let weighted_index = |l: f32, w: &[f32]| -> f32 {
             w.iter()
                 .enumerate()
                 .map(|(k, e)| (e / l) * (k as f32))
                 .sum::<f32>()
         };
-        let idx_ok = weighted_index(m_ok, l_ok, &w_ok);
-        let idx_bad = weighted_index(m_bad, l_bad, &w_bad);
+        let idx_ok = weighted_index(l_ok, &w_ok);
+        let idx_bad = weighted_index(l_bad, &w_bad);
         assert!(
             (idx_ok - idx_bad).abs() > 1e-2,
             "post-exp mutant must diverge from the correct pre-exp chunked recurrence: \
@@ -2591,13 +2590,13 @@ mod tests {
         let scores: Vec<f32> = (0..s).map(|i| ((i as f32) * 0.17).cos()).collect();
         let mask = vec![0f32; s];
 
-        let (m_ok, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
+        let (_, l_ok, w_ok) = running_softmax_row(&scores, &mask, chunk, true, 0, None);
         // Skip bug: a boundary key vanishes from every chunk after the
         // first (`+1` advance).
-        let (m_skip, l_skip, w_skip) = running_softmax_row(&scores, &mask, chunk, true, 1, None);
+        let (_, l_skip, w_skip) = running_softmax_row(&scores, &mask, chunk, true, 1, None);
         // Reprocess bug: a boundary key is double-counted across adjacent
         // chunks (`-1` advance).
-        let (m_dup, l_dup, w_dup) = running_softmax_row(&scores, &mask, chunk, true, -1, None);
+        let (_, l_dup, w_dup) = running_softmax_row(&scores, &mask, chunk, true, -1, None);
 
         let weighted_index = |l: f32, w: &[f32]| -> f32 {
             w.iter()
@@ -2608,7 +2607,6 @@ mod tests {
         let idx_ok = weighted_index(l_ok, &w_ok);
         let idx_skip = weighted_index(l_skip, &w_skip);
         let idx_dup = weighted_index(l_dup, &w_dup);
-        let _ = (m_ok, m_skip, m_dup);
 
         assert!(
             (idx_ok - idx_skip).abs() > 1e-2,

@@ -133,7 +133,7 @@ fn forward_dispatches_the_fused_rope_kernel_whatever_the_mode() {
     for training in [false, true, false] {
         model.set_training(training);
         let before = jammi_encoders::rope_dispatch_snapshot();
-        let _ = model.forward_hidden(&input_ids, &mask).expect("forward");
+        model.forward_hidden(&input_ids, &mask).expect("forward");
         let after = jammi_encoders::rope_dispatch_snapshot();
         assert!(
             after.fused > before.fused,
@@ -171,7 +171,7 @@ fn forward_dispatches_the_fused_softmax_kernel_whatever_the_mode() {
     for training in [false, true, false] {
         model.set_training(training);
         let before = jammi_encoders::softmax_dispatch_snapshot();
-        let _ = model.forward_hidden(&input_ids, &mask).expect("forward");
+        model.forward_hidden(&input_ids, &mask).expect("forward");
         let after = jammi_encoders::softmax_dispatch_snapshot();
         assert!(
             after.fused > before.fused,
@@ -208,7 +208,7 @@ fn forward_dispatches_the_fused_geglu_kernel_whatever_the_mode() {
     for training in [false, true, false] {
         model.set_training(training);
         let before = jammi_encoders::geglu_dispatch_snapshot();
-        let _ = model.forward_hidden(&input_ids, &mask).expect("forward");
+        model.forward_hidden(&input_ids, &mask).expect("forward");
         let after = jammi_encoders::geglu_dispatch_snapshot();
         assert!(
             after.fused > before.fused,

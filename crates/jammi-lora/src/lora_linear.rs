@@ -1510,7 +1510,7 @@ mod quantized_base_forward_tests {
         let x = Tensor::from_vec(x_v, (rows, in_f), &device).unwrap();
 
         let before = lora_linear_fused_counters().snapshot();
-        let _ = lora.forward(&x).unwrap();
+        lora.forward(&x).unwrap();
         let after = lora_linear_fused_counters().snapshot();
         assert_eq!(
             (before.fused, before.eager),

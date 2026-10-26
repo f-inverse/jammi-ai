@@ -1887,7 +1887,7 @@ mod tests {
         // genuinely frozen `w` — the self-contradiction check only
         // refuses `!dweight_needed && w.track_op()`, never a true frozen
         // leaf.
-        let _ = out_false.sum_all().unwrap().backward().unwrap();
+        out_false.sum_all().unwrap().backward().unwrap();
     }
 
     /// `bwd`'s self-contradiction domain check (an op

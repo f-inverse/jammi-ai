@@ -241,7 +241,7 @@ fn bert_lora_bias_site_dispatches_the_fused_lora_linear_site_whatever_the_mode()
     for training in [false, true, false] {
         encoder.set_training(training);
         let before = lora_linear_fused_dispatch_snapshot();
-        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        encoder.forward_hidden(&input_ids, &mask).expect("forward");
         let after = lora_linear_fused_dispatch_snapshot();
         assert!(
             after.fused > before.fused && after.eager == before.eager,
@@ -965,7 +965,7 @@ fn bert_biased_layer_norm_dispatches_the_fused_kernel_whatever_the_mode() {
     for training in [false, true, false] {
         encoder.set_training(training);
         let before = jammi_encoders::ln_dispatch_snapshot();
-        let _ = encoder.forward_hidden(&input_ids, &mask).expect("forward");
+        encoder.forward_hidden(&input_ids, &mask).expect("forward");
         let after = jammi_encoders::ln_dispatch_snapshot();
         assert!(
             after.fused > before.fused && after.eager == before.eager,
@@ -1003,8 +1003,7 @@ fn bert_head64_training_attention_block_and_softmax_two_sided_counters() {
     let block_before = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
     let flash_before = jammi_encoders::attention_block_flash_dispatch_snapshot();
-    let _ = bert
-        .forward_hidden(&input_ids, &mask)
+    bert.forward_hidden(&input_ids, &mask)
         .expect("training forward at head64");
     let block_after = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
@@ -1045,8 +1044,7 @@ fn bert_head64_training_gelu_two_sided_counters() {
 
     let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
     let before = gelu_counters.snapshot();
-    let _ = bert
-        .forward_hidden(&input_ids, &mask)
+    bert.forward_hidden(&input_ids, &mask)
         .expect("training forward at head64");
     let after = gelu_counters.snapshot();
     assert!(
@@ -1080,8 +1078,7 @@ fn bert_head16_training_attention_block_counted_eager() {
     let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
 
     let before = jammi_encoders::attention_block_dispatch_snapshot();
-    let _ = bert
-        .forward_hidden(&input_ids, &mask)
+    bert.forward_hidden(&input_ids, &mask)
         .expect("training forward at head16");
     let after = jammi_encoders::attention_block_dispatch_snapshot();
     assert!(
@@ -1110,7 +1107,7 @@ fn bert_head64_output_is_bit_identical_regardless_of_training_history() {
     // Leg B: a model toggled into training mode and back to eval.
     let mut bert_toggled = build_frozen_bert_head64(&device);
     bert_toggled.set_training(true);
-    let _ = bert_toggled
+    bert_toggled
         .forward_hidden(&input_ids, &mask)
         .expect("training forward (to touch the fused arm)");
     bert_toggled.set_training(false);
@@ -1156,8 +1153,7 @@ fn bert_head64_disabled_attention_block_and_softmax_child_process_body() {
 
     let block_before = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
-    let _ = bert
-        .forward_hidden(&input_ids, &mask)
+    bert.forward_hidden(&input_ids, &mask)
         .expect("disabled attention_block_fused/softmax must fall back to eager, not error");
     let block_after = jammi_encoders::attention_block_dispatch_snapshot();
     let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
@@ -1197,8 +1193,7 @@ fn bert_head64_disabled_gelu_erf_fused_child_process_body() {
 
     let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
     let before = gelu_counters.snapshot();
-    let _ = bert
-        .forward_hidden(&input_ids, &mask)
+    bert.forward_hidden(&input_ids, &mask)
         .expect("disabled gelu_erf_fused must fall back to eager, not error");
     let after = gelu_counters.snapshot();
     assert!(

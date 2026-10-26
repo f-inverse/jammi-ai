@@ -1139,7 +1139,10 @@ mod grpc_timeout_header_tests {
         let (addr, wait_job_header, _subscribe_header) = start_capturing_server().await;
         let client = connect(addr).await;
 
-        let _ = client.wait_job("does-not-matter").await;
+        // Only the request's header is under test, not the reply.
+        match client.wait_job("does-not-matter").await {
+            Ok(_) | Err(_) => {}
+        }
         assert_eq!(
             wait_job_header.lock().unwrap().take(),
             Some(None),
@@ -1147,9 +1150,12 @@ mod grpc_timeout_header_tests {
              stream, never a client-declared deadline"
         );
 
-        let _ = client
+        match client
             .wait_job_with_timeout("does-not-matter", Duration::from_secs(5))
-            .await;
+            .await
+        {
+            Ok(_) | Err(_) => {}
+        }
         let captured = wait_job_header.lock().unwrap().take();
         assert!(
             matches!(captured, Some(Some(_))),
@@ -1171,9 +1177,13 @@ mod grpc_timeout_header_tests {
             tenant: None,
         };
 
-        let _ = client
+        // Only the request's header is under test, not the reply.
+        match client
             .subscribe(&topic, Predicate::match_all(), None, false)
-            .await;
+            .await
+        {
+            Ok(_) | Err(_) => {}
+        }
         assert_eq!(
             subscribe_header.lock().unwrap().take(),
             Some(None),
@@ -1181,7 +1191,7 @@ mod grpc_timeout_header_tests {
              stream, never a client-declared deadline"
         );
 
-        let _ = client
+        match client
             .subscribe_with_timeout(
                 &topic,
                 Predicate::match_all(),
@@ -1189,7 +1199,10 @@ mod grpc_timeout_header_tests {
                 false,
                 Duration::from_secs(5),
             )
-            .await;
+            .await
+        {
+            Ok(_) | Err(_) => {}
+        }
         let captured = subscribe_header.lock().unwrap().take();
         assert!(
             matches!(captured, Some(Some(_))),

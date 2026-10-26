@@ -426,23 +426,19 @@ fn canary_max_abs_diff(device: &Device) -> candle_core::Result<f32> {
 /// propagates completely unchanged: it is not this guard's own refusal at
 /// all, so it is never re-wrapped.
 pub fn ensure_quantized_cuda_admitted(device: &Device) -> candle_core::Result<()> {
-    #[cfg(feature = "cuda")]
-    {
-        if !matches!(device, Device::Cuda(_)) {
-            return Ok(());
-        }
-        let verdict = canary_verdict(device)?;
-        decide(verdict).map_err(candle_core::Error::from)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => decide(canary_verdict(device)?).map_err(candle_core::Error::from),
         // No quantized-CUDA capability exists to gate at all without this
         // crate's own `cuda` feature compiled in (module doc) -- routed
         // through the SAME decision core as the real check (rather than a
         // bare `Ok(())`) so `decide`/`CanaryVerdict` stay live code in
         // EVERY feature configuration, not merely under `cuda` + `test`.
-        let _ = device;
-        decide(CanaryVerdict::FastKernelsTrusted).map_err(candle_core::Error::from)
+        #[cfg(not(feature = "cuda"))]
+        Device::Cuda(_) => {
+            decide(CanaryVerdict::FastKernelsTrusted).map_err(candle_core::Error::from)
+        }
+        Device::Cpu | Device::Metal(_) => Ok(()),
     }
 }
 

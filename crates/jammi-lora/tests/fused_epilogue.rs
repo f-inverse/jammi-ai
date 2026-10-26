@@ -305,7 +305,7 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
     // `jammi_lora::lora_epilogue_counters`'s doc). A fused-dispatch
     // forward must NOT move `lora_epilogue`'s snapshot at all.
     let epilogue_before = lora_epilogue_dispatch_snapshot();
-    let _ = lora.forward(&x).unwrap();
+    lora.forward(&x).unwrap();
     let after = lora_linear_fused_dispatch_snapshot();
     let epilogue_after = lora_epilogue_dispatch_snapshot();
     assert!(
@@ -352,7 +352,7 @@ fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
     .unwrap();
 
     let before = lora_linear_fused_dispatch_snapshot();
-    let _ = lora.forward(&x).unwrap();
+    lora.forward(&x).unwrap();
     let after = lora_linear_fused_dispatch_snapshot();
     assert!(
         after.eager > before.eager,
@@ -394,7 +394,7 @@ fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
 
     let before = lora_linear_fused_dispatch_snapshot();
     let epilogue_before = lora_epilogue_dispatch_snapshot();
-    let _ = lora.forward(&x).unwrap();
+    lora.forward(&x).unwrap();
     let after = lora_linear_fused_dispatch_snapshot();
     let epilogue_after = lora_epilogue_dispatch_snapshot();
     assert!(
@@ -1261,7 +1261,7 @@ fn trainable_var_bias_is_a_counted_eager_refusal() {
     .unwrap();
     let x_leaf = rand_input(&device);
     let before_leaf = lora_linear_fused_dispatch_snapshot();
-    let _ = lora_leaf.forward(&x_leaf).unwrap();
+    lora_leaf.forward(&x_leaf).unwrap();
     let after_leaf = lora_linear_fused_dispatch_snapshot();
     assert!(
         after_leaf.fused > before_leaf.fused && after_leaf.eager == before_leaf.eager,
@@ -1295,7 +1295,7 @@ fn trainable_var_bias_is_a_counted_eager_refusal() {
     .unwrap();
     let x_var = rand_input(&device);
     let before_var = lora_linear_fused_dispatch_snapshot();
-    let _ = lora_var.forward(&x_var).unwrap();
+    lora_var.forward(&x_var).unwrap();
     let after_var = lora_linear_fused_dispatch_snapshot();
     assert!(
         after_var.eager > before_var.eager && after_var.fused == before_var.fused,

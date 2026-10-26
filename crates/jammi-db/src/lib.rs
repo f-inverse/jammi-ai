@@ -16,6 +16,7 @@ pub mod evidence_channel;
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 mod federation;
 pub mod index;
+mod lateral_unnest;
 pub mod memory_pool;
 mod pg_uri;
 pub mod server_info;

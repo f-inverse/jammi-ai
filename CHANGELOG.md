@@ -203,6 +203,12 @@ The dependency audit is green again on the live advisory database, and database 
   reaches into, so a filter or sort above them stays above them (#739). A live test runs every
   admitted and refused construct over Postgres, over MySQL, and over the same rows in a file;
   the MySQL one runs in a new `Test (MySQL)` lane against MySQL 8.4 (`ci/dev.sh --with mysql`).
+- **A list column breaks down by item in every form.** `FROM t CROSS JOIN unnest(f(t.c)) AS
+  u(x)` failed to plan on every source: DataFusion plans a lateral `unnest` as a correlated
+  subquery over one empty row, which its decorrelation does not reach (#748). An optimizer rule,
+  `lateral_unnest`, plans the subquery's projections and unnests over the join's left side, its
+  outer references read as that side's columns, so the lateral and select-list forms answer alike
+  over a file, Postgres and MySQL.
 - **Every Postgres column reads as the value it holds, and none fails its source.** The
   driver named a column's type from its type name and failed the whole source's registration
   on one it did not know — a domain, `jsonb`, `citext`, `timetz` (#740) — failed every query

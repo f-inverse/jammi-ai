@@ -231,7 +231,7 @@ impl JammiSession {
         let base_ctx = SessionContext::new_with_config(session_config);
         let base_state = base_ctx.state();
 
-        let rules = federating(base_state.optimizer().rules.clone());
+        let rules = optimizer_rules(base_state.optimizer().rules.clone());
 
         // The tenant-scope analyzer rule, applied before federation,
         // projection pruning and the rest. It reads each query's scope from
@@ -1342,27 +1342,25 @@ fn extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     planners
 }
 
-/// The session's optimizer rules: DataFusion's, and, in a build that
+/// The session's optimizer rules: DataFusion's, with, right after
+/// `scalar_subquery_to_join`, the lateral `unnest`'s decorrelation
+/// ([`crate::lateral_unnest::LateralUnnest`]) and then, in a build that
 /// carries a database source, federation
-/// ([`crate::federation::RemoteFederation`]) right after
-/// `scalar_subquery_to_join`, so the sub-plans it hands a remote are
-/// decorrelated.
-fn federating(
-    rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
+/// ([`crate::federation::RemoteFederation`]) — so the sub-plans federation
+/// hands a remote are decorrelated.
+fn optimizer_rules(
+    mut rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
 ) -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
-    #[cfg(any(feature = "postgres", feature = "mysql"))]
-    let rules = {
-        let mut rules = rules;
-        let after = rules
-            .iter()
-            .position(|r| r.name() == "scalar_subquery_to_join")
-            .map_or(rules.len(), |pos| pos + 1);
-        rules.insert(
-            after,
-            Arc::new(crate::federation::RemoteFederation::default()),
-        );
-        rules
-    };
+    let after = rules
+        .iter()
+        .position(|r| r.name() == "scalar_subquery_to_join")
+        .map_or(rules.len(), |pos| pos + 1);
+    let ours: [Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>; _] = [
+        Arc::new(crate::lateral_unnest::LateralUnnest),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Arc::new(crate::federation::RemoteFederation::default()),
+    ];
+    rules.splice(after..after, ours);
     rules
 }
 

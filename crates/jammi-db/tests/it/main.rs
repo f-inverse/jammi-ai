@@ -86,3 +86,4 @@ mod trigger;
 mod trigger_multi_replica_offsets;
 mod trigger_replay_column_types;
 mod trigger_replay_row_order;
+mod unnest_forms;

@@ -15,6 +15,9 @@ workspace ships every publishable crate at the same
   ^0.13 and call only the unaffected bulk and read paths), and unsafe-libyaml (a substrait build
   dependency, linked into no binary). The two pyo3 exceptions name their real gate, arrow 59,
   in place of a release freeze.
+- **`ci/dev.sh` starts every container for `JAMMI_CI_PLATFORM`.** Its free-space probe ran
+  the image for the host's platform, so a CUDA-image run on an arm64 host failed before it
+  began.
 
 ## [0.55.0] - 2026-10-10
 

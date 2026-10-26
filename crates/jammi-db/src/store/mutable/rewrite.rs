@@ -36,6 +36,7 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::provider::{count_batch, MutableTableProvider};
+use crate::tenant_scope::TenantConfig;
 
 /// What a rewrite does to the rows it selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
@@ -295,6 +296,7 @@ impl RowRewriteExec {
         context: Arc<TaskContext>,
     ) -> DfResult<RecordBatch> {
         let schema = input.schema();
+        let tenant = TenantConfig::of(context.session_config().options())?.tenant();
         let selected = concat_batches(&schema, &collect(input, context).await?)?;
         let width = target.def.schema.fields().len();
         let rows = |from: usize| {
@@ -309,7 +311,7 @@ impl RowRewriteExec {
             Rewrite::Update => Some(rows(width)?),
         };
         let rewritten = target
-            .rewrite_rows(old, new)
+            .rewrite_rows(tenant, old, new)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         count_batch(rewritten)

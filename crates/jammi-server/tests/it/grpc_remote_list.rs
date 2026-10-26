@@ -17,6 +17,7 @@
 //! (the analyzer scopes on the schema's own `tenant_id` column, so no
 //! out-of-band tenant-column declaration is needed); no live network.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -106,6 +107,67 @@ async fn count_via_remote(server: &EngineServer, tenant: &str) -> i64 {
         }
     }
     total
+}
+
+/// The source ids `client`'s session lists.
+async fn source_ids(client: &DataClient) -> BTreeSet<String> {
+    client
+        .catalog()
+        .list_sources()
+        .await
+        .expect("list_sources")
+        .into_iter()
+        .map(|source| source.source_id)
+        .collect()
+}
+
+/// A session that names no tenant is global on every verb, whatever tenant
+/// another session's query just ran under: it never lists that tenant's
+/// private source, and a source it registers belongs to no tenant, so every
+/// tenant sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbound_session_never_inherits_another_sessions_tenant() {
+    let server = start_engine_server().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_tenant_parquet(&dir);
+    let connection = || SourceConnection {
+        url: Some(format!("file://{}", path.display())),
+        format: Some(FileFormat::Parquet),
+        ..Default::default()
+    };
+    let a = remote(&server).await;
+    a.bind_tenant(tenant_a()).await.expect("bind A");
+    let b = remote(&server).await;
+    b.bind_tenant(tenant_b()).await.expect("bind B");
+    let unbound = remote(&server).await;
+
+    b.catalog()
+        .add_source("b_private", SourceType::File, connection())
+        .await
+        .expect("B registers its private source");
+    assert!(!source_ids(&unbound).await.contains("b_private"));
+
+    b.sql("SELECT COUNT(*) AS n FROM b_private.public.notes")
+        .await
+        .expect("B queries its source over Flight SQL");
+    assert!(
+        !source_ids(&unbound).await.contains("b_private"),
+        "after B's query the unbound session must still not list B's private source"
+    );
+
+    unbound
+        .catalog()
+        .add_source("unbound_global", SourceType::File, connection())
+        .await
+        .expect("the unbound session registers a source");
+    assert!(
+        source_ids(&a).await.contains("unbound_global"),
+        "a source an unbound session registers is global: tenant A sees it"
+    );
+    assert!(
+        source_ids(&b).await.contains("unbound_global"),
+        "a source an unbound session registers is global: tenant B sees it"
+    );
 }
 
 /// The mandatory tenant-scope proof: a `--tenant A` query over a `DataClient`

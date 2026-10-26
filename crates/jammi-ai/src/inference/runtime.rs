@@ -30,18 +30,15 @@ use crate::model::{ModelGuard, PreparedInput};
 /// models, whichever task the load runs on.
 pub struct TenantScopedModels {
     cache: Arc<ModelCache>,
-    binding: TenantBinding,
     tenant: TenantContext,
 }
 
 impl TenantScopedModels {
     /// The cache, bound under `binding`'s tenant as it is effective now.
-    pub fn capture(cache: Arc<ModelCache>, binding: TenantBinding) -> Self {
-        let tenant = binding.current();
+    pub fn capture(cache: Arc<ModelCache>, binding: &TenantBinding) -> Self {
         Self {
             cache,
-            binding,
-            tenant,
+            tenant: binding.current(),
         }
     }
 }
@@ -53,9 +50,7 @@ impl ModelRuntime for TenantScopedModels {
         source: &ModelSource,
         task: ModelTask,
     ) -> jammi_datafusion::Result<Arc<dyn BoundModel>> {
-        let guard = self
-            .binding
-            .scope(self.tenant, self.cache.get_or_load(source, task))
+        let guard = TenantBinding::within(self.tenant, self.cache.get_or_load(source, task))
             .await
             .map_err(jammi_datafusion::Error::runtime)?;
         Ok(Arc::new(guard))

@@ -426,7 +426,6 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
     let chain = GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(Arc::clone(&session)),

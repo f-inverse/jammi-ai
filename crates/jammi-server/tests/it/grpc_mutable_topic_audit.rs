@@ -91,7 +91,6 @@ async fn start_fixture() -> Fixture {
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: Some(trigger),
         engine: Some(session),

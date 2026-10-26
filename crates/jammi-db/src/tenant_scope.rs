@@ -10,14 +10,23 @@
 //! pins this — *"to modify the semantics of a LogicalPlan, one should
 //! implement an AnalyzerRule instead"*. Tenant scope changes *which rows the
 //! query returns*; that's semantics, not optimization.
+//!
+//! A query's scope is read once, where the query enters the engine, and
+//! travels in its session configuration as a [`TenantConfig`]: the analyzer
+//! reads it from the configuration it is handed, a scan from the state that
+//! plans it, a sink from the task context that runs it. Nothing a query
+//! does after it entered reads an ambient value, so a query never sees two
+//! tenants, whichever task each part of it runs on.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::config::ConfigOptions;
-use datafusion::error::Result as DfResult;
+use datafusion::config::{ConfigEntry, ConfigExtension, ConfigOptions, ExtensionOptions};
+use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{BinaryExpr, Expr, Filter, LogicalPlan, Operator, TableScan};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::scalar::ScalarValue;
@@ -80,42 +89,44 @@ impl SourceTenantColumns {
     }
 }
 
-/// Per-session tenant state consulted by the analyzer rule, the catalog,
-/// and the mutable-table read/write paths.
+/// The tenant a call into the engine runs under, where the call enters it.
 ///
 /// The binding overlays two values:
 ///
 /// 1. A **task-local override** (`CURRENT_TENANT_OVERRIDE`) installed for
 ///    the duration of one [`crate::session::JammiSession::with_tenant_scoped`]
-///    closure. Concurrent tasks each carry their own override — reads see
-///    the override of the task that initiated them, with no shared-state
-///    write involved.
-/// 2. A **shared default** (`Arc<RwLock<TenantContext>>`) mutated by the
-///    sticky session-level binding APIs ([`crate::session::JammiSession::bind_tenant`],
-///    [`crate::session::JammiSession::with_tenant`], the Flight SQL
-///    [`SessionStateProvider`] in `jammi-server`). Sticky-binding callers
-///    that hold the session behind `Arc` and serialise their requests still
-///    work unchanged.
+///    or [`crate::session::JammiSession::with_request_scope`] closure: how a
+///    server binds each request. Concurrent tasks each carry their own
+///    override, with no shared-state write involved.
+/// 2. The **session's bound tenant**, set by
+///    [`crate::session::JammiSession::bind_tenant`]: one embedded
+///    connection's tenant, the value every call it makes enters with. A
+///    session shared between requests never binds one; each request scopes
+///    itself instead.
 ///
-/// [`Self::current`] returns the override when present, the shared value
-/// otherwise. Every reader on the engine side consults [`Self::current`];
-/// no reader peeks at the inner `RwLock` directly.
+/// [`Self::current`] returns the override when present, the bound tenant
+/// otherwise. It is read where a call enters the engine: a catalog verb on
+/// its own task, and a query once, when it is planned, into the
+/// [`TenantConfig`] its execution reads.
 ///
 /// `Clone` is cheap (an `Arc` clone); the binding is shared between the
-/// session, the [`TenantScopeAnalyzerRule`], the [`crate::catalog::Catalog`],
-/// and the mutable-table provider/sink.
-///
-/// [`SessionStateProvider`]: https://docs.rs/datafusion-flight-sql-server/latest/datafusion_flight_sql_server/session/trait.SessionStateProvider.html
+/// session, its [`crate::catalog::Catalog`], and its query context.
 #[derive(Debug, Clone)]
 pub struct TenantBinding {
     shared: Arc<RwLock<TenantContext>>,
 }
 
 impl TenantBinding {
-    /// Construct a fresh binding whose shared default is [`TenantContext::Unscoped`].
+    /// A fresh binding whose bound tenant is [`TenantContext::Unscoped`].
     pub fn unscoped() -> Self {
+        Self::bound_to(TenantContext::Unscoped)
+    }
+
+    /// A fresh binding whose bound tenant is `ctx`: a handle pinned to one
+    /// tenant, sharing nothing with any other binding.
+    pub fn bound_to(ctx: TenantContext) -> Self {
         Self {
-            shared: Arc::new(RwLock::new(TenantContext::Unscoped)),
+            shared: Arc::new(RwLock::new(ctx)),
         }
     }
 
@@ -128,7 +139,7 @@ impl TenantBinding {
     pub fn current(&self) -> TenantContext {
         CURRENT_TENANT_OVERRIDE
             .try_with(|c| *c)
-            .unwrap_or_else(|_| self.read_shared())
+            .unwrap_or_else(|_| *self.shared.read().expect("tenant binding lock poisoned"))
     }
 
     /// Convenience: the [`TenantId`] of [`Self::current`], if any.
@@ -136,37 +147,33 @@ impl TenantBinding {
         self.current().tenant()
     }
 
-    /// Snapshot the sticky shared value, ignoring any task-local override.
-    /// Used by the constructor helpers in tests and by the Flight SQL
-    /// `SessionStateProvider` which mutates the shared value directly.
-    pub fn read_shared(&self) -> TenantContext {
-        *self.shared.read().expect("tenant binding lock poisoned")
-    }
-
-    /// Replace the sticky shared value. Has no effect on tasks executing
-    /// inside a [`crate::session::JammiSession::with_tenant_scoped`] closure
-    /// — those reads continue to observe the task-local override.
-    pub fn set_shared(&self, ctx: TenantContext) {
+    /// Bind `ctx` as the session's tenant: what a call enters with when no
+    /// task-local override is installed. Has no effect on a call already
+    /// inside a scope, nor on a query already planned.
+    pub(crate) fn bind(&self, ctx: TenantContext) {
         *self.shared.write().expect("tenant binding lock poisoned") = ctx;
     }
 
-    /// Shared handle to the inner `Arc<RwLock<TenantContext>>`. Used by the
-    /// server-side Flight SQL provider in `jammi-server`, which mutates the
-    /// shared value from a request interceptor that does not (yet) thread
-    /// the binding through a `with_tenant_scoped` closure.
-    pub fn shared_arc(&self) -> Arc<RwLock<TenantContext>> {
-        Arc::clone(&self.shared)
-    }
-
     /// Run `f` with `ctx` installed as the task-local override for the
-    /// duration of the returned future. Concurrent calls on different tasks
-    /// each see their own `ctx` — no shared state is mutated, so there is no
-    /// race window between binding and read.
-    pub async fn scope<F, T>(&self, ctx: TenantContext, f: F) -> T
+    /// duration of the returned future: every binding's [`Self::current`]
+    /// reads it on this task. Concurrent calls on different tasks each see
+    /// their own `ctx` — no shared state is mutated, so there is no race
+    /// window between binding and read.
+    pub async fn within<F, T>(ctx: TenantContext, f: F) -> T
     where
         F: Future<Output = T>,
     {
         CURRENT_TENANT_OVERRIDE.scope(ctx, f).await
+    }
+
+    /// Run the synchronous `f` under `ctx`: one poll of a response stream a
+    /// transport hands back after its handler returned, so the stream reads
+    /// the scope its request entered under.
+    pub fn within_sync<F, T>(ctx: TenantContext, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        CURRENT_TENANT_OVERRIDE.sync_scope(ctx, f)
     }
 
     /// Returns `true` when the current task is executing inside a
@@ -203,24 +210,116 @@ impl Default for TenantBinding {
     }
 }
 
+/// The tenant scope a query was planned under, carried in its session
+/// configuration from analysis to execution.
+///
+/// Set where the query enters the engine — a session's query context from
+/// its [`TenantBinding`] as the call enters, a Flight SQL request's state
+/// from the scope its resolver read — and read by everything the query does
+/// after: the [`TenantScopeAnalyzerRule`] from the configuration it is
+/// handed, a mutable table's scan from the state that plans it, its sink
+/// from the task context that runs it. The scope belongs to the request,
+/// so SQL cannot set it (`SET` refuses its keys) and lists none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantConfig {
+    context: TenantContext,
+    every_tenant: bool,
+}
+
+impl TenantConfig {
+    /// A query's scope under `context`: the tenant's rows and the global
+    /// ones, or only the global ones when unscoped.
+    pub fn new(context: TenantContext) -> Self {
+        Self {
+            context,
+            every_tenant: false,
+        }
+    }
+
+    /// The scope a call entering under `binding` plans with now: its
+    /// current tenant, and every tenant's rows inside
+    /// [`crate::session::JammiSession::with_admin_scope`].
+    pub fn current(binding: &TenantBinding) -> Self {
+        Self {
+            context: binding.current(),
+            every_tenant: TenantBinding::is_admin_scope(),
+        }
+    }
+
+    /// The scope a query was planned under, from its configuration. A plan
+    /// whose session carries none was planned outside the engine's query
+    /// context; it is refused rather than read as any tenant.
+    pub fn of(options: &ConfigOptions) -> DfResult<Self> {
+        options.extensions.get::<Self>().copied().ok_or_else(|| {
+            DataFusionError::Internal(
+                "a plan reached tenant scoping with no tenant scope in its session \
+                 configuration: it was planned outside the engine's query context"
+                    .into(),
+            )
+        })
+    }
+
+    /// `state`, planning under this scope.
+    pub fn scoping(self, mut state: SessionState) -> SessionState {
+        state.config_mut().options_mut().extensions.insert(self);
+        state
+    }
+
+    /// The tenant context rows are read and written under.
+    pub fn context(&self) -> TenantContext {
+        self.context
+    }
+
+    /// The bound tenant, if any.
+    pub fn tenant(&self) -> Option<TenantId> {
+        self.context.tenant()
+    }
+
+    /// Whether reads see every tenant's rows (an admin scope).
+    pub fn every_tenant(&self) -> bool {
+        self.every_tenant
+    }
+}
+
+impl ExtensionOptions for TenantConfig {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(*self)
+    }
+
+    fn set(&mut self, key: &str, _value: &str) -> DfResult<()> {
+        Err(DataFusionError::Configuration(format!(
+            "`{}.{key}` is the request's tenant scope, which SQL cannot set",
+            Self::PREFIX
+        )))
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        Vec::new()
+    }
+}
+
+impl ConfigExtension for TenantConfig {
+    const PREFIX: &'static str = "jammi_tenant";
+}
+
 /// `AnalyzerRule` that wraps every tenant-aware `TableScan` in a `Filter`
 /// emitting the session's tenant predicate.
 #[derive(Debug)]
 pub struct TenantScopeAnalyzerRule {
-    binding: TenantBinding,
     source_columns: Arc<SourceTenantColumns>,
 }
 
 impl TenantScopeAnalyzerRule {
-    pub fn new(binding: TenantBinding, source_columns: Arc<SourceTenantColumns>) -> Self {
-        Self {
-            binding,
-            source_columns,
-        }
-    }
-
-    fn current_context(&self) -> TenantContext {
-        self.binding.current()
+    pub fn new(source_columns: Arc<SourceTenantColumns>) -> Self {
+        Self { source_columns }
     }
 
     /// Find the tenant-discriminator column for a `TableScan`. Schema column
@@ -296,17 +395,16 @@ impl AnalyzerRule for TenantScopeAnalyzerRule {
         "tenant_scope_predicate_injection"
     }
 
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DfResult<LogicalPlan> {
-        // Admin scope bypasses tenant-predicate injection entirely so that
-        // server-side administrative scans (e.g. recovery enumerating
-        // work-in-progress rows across tenants) can observe every row. The
-        // caller of `JammiSession::with_admin_scope` is responsible for the
-        // boundary; this rule trusts the task-local marker installed there.
-        if TenantBinding::is_admin_scope() {
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> DfResult<LogicalPlan> {
+        let scope = TenantConfig::of(config)?;
+        // An admin scope reads every tenant's rows: server-side
+        // administrative scans (recovery enumerating work-in-progress rows
+        // across tenants). The caller of `JammiSession::with_admin_scope` is
+        // responsible for the boundary.
+        if scope.every_tenant() {
             return Ok(plan);
         }
-        let ctx = self.current_context();
-        plan.transform_up(|node| self.rewrite_node(node, ctx))
+        plan.transform_up(|node| self.rewrite_node(node, scope.context()))
             .map(|t| t.data)
     }
 }
@@ -348,18 +446,23 @@ mod tests {
         Arc::new(LogicalTableSource::new(tenanted_schema()))
     }
 
-    fn scoped_binding(t: TenantId) -> TenantBinding {
-        let b = TenantBinding::unscoped();
-        b.set_shared(TenantContext::Scoped(t));
-        b
+    /// A query configuration planning under `config`.
+    fn planned_under(config: TenantConfig) -> ConfigOptions {
+        let mut options = ConfigOptions::default();
+        options.extensions.insert(config);
+        options
     }
 
-    fn unscoped_binding() -> TenantBinding {
-        TenantBinding::unscoped()
+    fn scoped(t: TenantId) -> ConfigOptions {
+        planned_under(TenantConfig::new(TenantContext::Scoped(t)))
     }
 
-    fn rule_with(binding: TenantBinding) -> TenantScopeAnalyzerRule {
-        TenantScopeAnalyzerRule::new(binding, Arc::new(SourceTenantColumns::new()))
+    fn unscoped() -> ConfigOptions {
+        planned_under(TenantConfig::new(TenantContext::Unscoped))
+    }
+
+    fn rule() -> TenantScopeAnalyzerRule {
+        TenantScopeAnalyzerRule::new(Arc::new(SourceTenantColumns::new()))
     }
 
     /// Walk `plan` top-down and count `Filter` nodes whose direct child is a
@@ -501,8 +604,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule_with(scoped_binding(tenant_a()))
-            .analyze(plan, &ConfigOptions::default())
+        let out = rule()
+            .analyze(plan, &scoped(tenant_a()))
             .unwrap();
 
         let predicate = first_predicate_above_scan(&out);
@@ -528,8 +631,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule_with(scoped_binding(tenant_a()))
-            .analyze(plan, &ConfigOptions::default())
+        let out = rule()
+            .analyze(plan, &scoped(tenant_a()))
             .unwrap();
 
         assert_eq!(
@@ -566,8 +669,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule_with(scoped_binding(tenant_a()))
-            .analyze(outer, &ConfigOptions::default())
+        let out = rule()
+            .analyze(outer, &scoped(tenant_a()))
             .unwrap();
 
         // Both `sources` (inside the subquery alias) and `models` (outer scan)
@@ -587,8 +690,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule_with(scoped_binding(tenant_a()))
-            .analyze(plan, &ConfigOptions::default())
+        let out = rule()
+            .analyze(plan, &scoped(tenant_a()))
             .unwrap();
 
         // Top-level node is still an Aggregate.
@@ -619,11 +722,57 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule_with(unscoped_binding())
-            .analyze(plan, &ConfigOptions::default())
+        let out = rule()
+            .analyze(plan, &unscoped())
             .unwrap();
 
         let predicate = first_predicate_above_scan(&out);
         assert_isnull_only(&predicate, "tenant_id");
+    }
+
+    /// A plan whose session carries no scope was planned outside the engine's
+    /// query context; the rule refuses it rather than read it as any tenant.
+    #[test]
+    fn a_plan_without_a_tenant_scope_is_refused() {
+        let plan = LogicalPlanBuilder::scan("t", tenanted_source(), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let err = rule().analyze(plan, &ConfigOptions::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("no tenant scope"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An admin scope reads every tenant's rows: no predicate is injected.
+    #[test]
+    fn an_admin_scope_injects_no_predicate() {
+        let plan = LogicalPlanBuilder::scan("t", tenanted_source(), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let admin = TenantConfig {
+            context: TenantContext::Scoped(tenant_a()),
+            every_tenant: true,
+        };
+        let out = rule().analyze(plan.clone(), &planned_under(admin)).unwrap();
+        assert_eq!(out, plan);
+    }
+
+    /// The scope is the request's: SQL `SET` on any of its keys is refused,
+    /// so a client cannot rebind its own query to another tenant.
+    #[test]
+    fn sql_cannot_set_the_tenant_scope() {
+        let mut options = scoped(tenant_a());
+        let err = options
+            .set("jammi_tenant.context", "Unscoped")
+            .unwrap_err();
+        assert!(err.to_string().contains("SQL cannot set"), "{err}");
+        assert_eq!(
+            TenantConfig::of(&options).unwrap(),
+            TenantConfig::new(TenantContext::Scoped(tenant_a()))
+        );
+        assert!(options.entries().iter().all(|e| !e.key.starts_with("jammi_tenant")));
     }
 }

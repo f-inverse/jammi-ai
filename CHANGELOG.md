@@ -179,6 +179,17 @@ The dependency audit is green again on the live advisory database, and database 
   `Decimal128(19, s)` that Postgres filters and aggregates, `s` being the database's money scale.
   Tables without one are read as before.
 
+- **Every request runs under its own tenant.** Flight SQL bound each query's tenant by
+  overwriting one process-wide binding, so two tenants querying at once each read the other's
+  rows about half the time, and a connection that bound no tenant inherited whichever tenant had
+  queried last, for its reads and for the sources it registered. A request now resolves its
+  tenant once, where it enters, and runs under it alone: its handler, every poll of its response
+  stream, and its query's own session configuration (`TenantConfig`), which the analyzer, the
+  mutable-table scan and sink, and the work DataFusion runs on other tasks read. A request that
+  names no tenant runs global on every verb. SQL cannot set a query's scope, and a plan planned
+  without one is refused. `TenantBoundProvider` is `ResolvedFlightScope`, a `FlightScope`, and
+  `GrpcChain` has no `flight_binding`.
+
 - **A filter on a database column holds when the query also joins a file.** The engine ran such a
   filter above the federated scan, and physical filter pushdown handed it to that scan, which took
   it and then neither sent it to the database nor applied it: a `WHERE` on a Postgres column of a

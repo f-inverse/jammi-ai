@@ -71,19 +71,18 @@ impl From<TenantId> for String {
     }
 }
 
-/// Session-scoped tenant binding propagated through DataFusion's
-/// `SessionConfig` extension store.
+/// The tenant a call runs under.
 ///
-/// Read by [`crate::tenant_scope::TenantScopeAnalyzerRule`] during plan
-/// analysis to inject `tenant_id = $current OR tenant_id IS NULL` predicates
-/// on every scanned table whose schema declares the column; read by
-/// `crate::catalog::backend::Transaction::set_tenant` to bind a tenant for
-/// the duration of one transaction (used by the mutable-table sink to enforce
-/// the write-side guard).
+/// A query carries it in its session configuration
+/// ([`crate::tenant_scope::TenantConfig`]), where the
+/// [`crate::tenant_scope::TenantScopeAnalyzerRule`] reads it to inject
+/// `tenant_id = $current OR tenant_id IS NULL` on every scanned table whose
+/// schema declares the column, and a mutable table's sink reads it to bind
+/// one transaction's tenant
+/// (`crate::catalog::backend::Transaction::set_tenant`, the write-side guard).
 ///
 /// `Scoped(t)` filters to tenant `t` and also surfaces engine-default rows
-/// (`tenant_id IS NULL`). `Unscoped` shows only `tenant_id IS NULL` rows —
-/// the no-op identity on a pre-Phase-3 population.
+/// (`tenant_id IS NULL`). `Unscoped` shows only `tenant_id IS NULL` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TenantContext {
     /// No tenant binding; reads see only globally-scoped rows.

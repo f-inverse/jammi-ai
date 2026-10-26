@@ -55,14 +55,11 @@ pub fn session_tenant_traced<T>(request: &Request<T>) -> Option<TenantId> {
 
 /// Run a session call under the request's tenant scope.
 ///
-/// A bound tenant installs the engine's task-local tenant override for the
-/// duration of the call via `with_tenant_scoped` — the concurrency-safe form
-/// the gRPC handlers must use, since they share one `Arc<InferenceSession>`
-/// and the sticky `bind_tenant` would race across concurrent requests. The
-/// `TenantScope` handle the closure receives is the marker that the scope is
-/// active on this task; `f` calls the verb on the [`jammi_ai::Session`]
-/// (which delegates to the same engine) and observes the same task-local. An
-/// unscoped session runs the call directly.
+/// Every request enters a scope of its own — its tenant's, or global when
+/// it named none — since the handlers share one `Arc<InferenceSession>`:
+/// a call never reads a tenant another request left behind. `f` calls the
+/// verb on the [`jammi_ai::Session`] (which delegates to the same engine)
+/// and runs inside the scope.
 ///
 /// Generic over the call's error type: most verbs return [`JammiError`], but the
 /// trigger and audit verbs return their own error enums (`TriggerError`,
@@ -78,10 +75,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    match tenant {
-        Some(t) => session.with_tenant_scoped(t, |_scope| f()).await,
-        None => f().await,
-    }
+    session.with_request_scope(tenant, f).await
 }
 
 /// Reject a missing required string field with `invalid_argument`.

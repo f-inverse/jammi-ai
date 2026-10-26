@@ -84,7 +84,6 @@ async fn start_gpu_embedding_server() -> (
     let chain = jammi_server::runtime::GrpcChain {
         addr: crate::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: Some(session),

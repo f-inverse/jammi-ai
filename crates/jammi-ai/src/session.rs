@@ -873,24 +873,29 @@ impl InferenceSession {
         )
     }
 
-    /// Run `f` with `tenant` bound for the duration of the closure's future.
+    /// Run `f` with `tenant` bound for the duration of the closure's future:
+    /// how a session shared between requests scopes each one. Concurrent
+    /// invocations from different tasks each see their own `tenant`.
     ///
-    /// The binding is installed as a Tokio task-local that shadows the
-    /// session's sticky shared binding for the executing task only.
-    /// Concurrent invocations from different tasks each see their own
-    /// `tenant`; no race exists on the shared
-    /// `Arc<RwLock<TenantContext>>` because no shared write happens in the
-    /// scoped path.
-    ///
-    /// Delegates to [`jammi_db::session::JammiSession::with_tenant_scoped`];
-    /// see that method for the design rationale (Option β: task-local
-    /// override rather than per-call session rebuild).
+    /// Delegates to [`jammi_db::session::JammiSession::with_tenant_scoped`].
     pub async fn with_tenant_scoped<'a, F, Fut, T>(&'a self, tenant: jammi_db::TenantId, f: F) -> T
     where
         F: FnOnce(jammi_db::TenantScope<'a>) -> Fut,
         Fut: std::future::Future<Output = T> + 'a,
     {
         self.inner.with_tenant_scoped(tenant, f).await
+    }
+
+    /// Run `f` under one request's scope: `tenant`'s, or global when the
+    /// request names none, whatever tenant the session is bound to.
+    ///
+    /// Delegates to [`jammi_db::session::JammiSession::with_request_scope`].
+    pub async fn with_request_scope<F, Fut, T>(&self, tenant: Option<jammi_db::TenantId>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.inner.with_request_scope(tenant, f).await
     }
 
     /// Run `f` inside the bound tenant's scope when one is bound, so every
@@ -942,7 +947,7 @@ impl InferenceSession {
         InferenceRuntime {
             model: Arc::new(crate::inference::runtime::TenantScopedModels::capture(
                 Arc::clone(&self.model_cache),
-                self.tenant_binding_arc(),
+                &self.inner.tenant_binding_arc(),
             )),
             observer: self.observer.clone(),
         }
@@ -992,13 +997,6 @@ impl InferenceSession {
     /// Access the engine configuration.
     pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
-    }
-
-    /// Shared handle to the engine's tenant binding. The server's
-    /// Flight SQL `TenantBoundProvider` updates this for the duration of
-    /// each query so the analyzer rule scopes rows to the bound tenant.
-    pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {
-        self.inner.tenant_binding_arc()
     }
 
     /// Access the ANN cache.

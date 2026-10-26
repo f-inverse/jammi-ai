@@ -147,10 +147,7 @@ impl Catalog {
     /// and write on the returned handle is scoped to it, sharing the original
     /// catalog's backend (`Arc`) so it sees the same database.
     pub fn pinned_to_tenant(&self, tenant: Option<TenantId>) -> Self {
-        let binding = TenantBinding::unscoped();
-        if let Some(t) = tenant {
-            binding.set_shared(crate::tenant::TenantContext::Scoped(t));
-        }
+        let binding = TenantBinding::bound_to(crate::tenant::TenantContext::from_option(tenant));
         Self {
             backend: Arc::clone(&self.backend),
             tenant: Some(binding),

@@ -96,7 +96,6 @@ impl MutableTableRegistry {
         Ok(Arc::new(MutableTableProvider::new(
             def,
             Arc::clone(&self.backend),
-            self.tenant.clone(),
         )))
     }
 
@@ -162,7 +161,6 @@ impl MutableTableRegistry {
         Arc::new(MutableTableProvider::new(
             Arc::new(def),
             Arc::clone(&self.backend),
-            self.tenant.clone(),
         ))
     }
 

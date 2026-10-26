@@ -45,7 +45,6 @@ async fn start_session_only_server() -> (
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store_for_server.clone(),
         trigger: None,
         engine: None,

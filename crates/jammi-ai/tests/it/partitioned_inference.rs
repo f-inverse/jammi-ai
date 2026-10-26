@@ -941,7 +941,7 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
         let runtime = InferenceRuntime {
             model: Arc::new(jammi_ai::inference::runtime::TenantScopedModels::capture(
                 Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
-                jammi_db::tenant_scope::TenantBinding::unscoped(),
+                &jammi_db::tenant_scope::TenantBinding::unscoped(),
             )),
             observer: None,
         };

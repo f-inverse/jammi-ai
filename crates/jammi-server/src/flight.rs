@@ -19,14 +19,23 @@
 //!   [`crate::grpc::session::SessionStore`]. Clients call
 //!   `CatalogService.SetTenant` to bind their tenant; subsequent Flight SQL
 //!   queries on the same `jammi-session-id` header run scoped to that tenant
-//!   via the [`TenantBoundProvider`]. This Flight-only path mounts no engine,
+//!   through [`ResolvedFlightScope`]. This Flight-only path mounts no engine,
 //!   so only the engine-free control verbs (the tenant trio + `GetServerInfo`)
 //!   answer here; the engine-backed catalog verbs are reached on the full gRPC
 //!   chain instead.
+//!
+//! Every request that reaches the engine enters its own scope
+//! ([`FlightScope`]) before it plans: its handler runs inside it, and so does
+//! every poll of the stream it answers with. A query planned there carries
+//! the scope in its state ([`jammi_db::tenant_scope::TenantConfig`]) for the
+//! work DataFusion runs on other tasks. Requests share nothing that holds a
+//! tenant, so concurrent requests of different tenants never see each
+//! other's.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -38,7 +47,6 @@ use arrow_flight::{
 };
 use async_trait::async_trait;
 use datafusion::execution::context::SessionState;
-use datafusion::prelude::SessionContext;
 use datafusion_flight_sql_server::service::FlightSqlService;
 use datafusion_flight_sql_server::session::SessionStateProvider;
 use datafusion_flight_sql_server::state::CommandTicket;
@@ -49,6 +57,7 @@ use jammi_db::store::statement::StatementClass;
 use jammi_db::tenant::TenantContext;
 use jammi_db::tenant_scope::TenantBinding;
 use prost::Message;
+use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tower::Layer;
@@ -74,7 +83,7 @@ pub async fn serve_flight(
     ctx: &QueryContext,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = JammiFlightService::new(Arc::new(StaticState(ctx.state())));
+    let service = JammiFlightService::new(Arc::new(SessionScope(ctx.clone())));
     tracing::info!("Flight SQL server listening on {addr}");
     Server::builder()
         .add_service(FlightServiceServer::new(service))
@@ -83,20 +92,37 @@ pub async fn serve_flight(
     Ok(())
 }
 
-/// One state for every request: the single-tenant shape's provider.
-struct StaticState(SessionState);
+/// How a Flight request is scoped: the tenant its metadata names, and the
+/// query context it plans through.
+#[async_trait]
+pub trait FlightScope: Send + Sync {
+    /// The query context every request plans through.
+    fn context(&self) -> &QueryContext;
+
+    /// The scope `metadata` names — `None` for the session's own — or the
+    /// status that refuses the request before it plans.
+    async fn resolve(&self, metadata: &MetadataMap) -> Result<Option<TenantContext>, Status>;
+}
+
+/// The single-tenant shape: every request runs under the session's own
+/// scope.
+struct SessionScope(QueryContext);
 
 #[async_trait]
-impl SessionStateProvider for StaticState {
-    async fn new_context(&self, _request: &Request<()>) -> Result<SessionState, Status> {
-        Ok(self.0.clone())
+impl FlightScope for SessionScope {
+    fn context(&self) -> &QueryContext {
+        &self.0
+    }
+
+    async fn resolve(&self, _metadata: &MetadataMap) -> Result<Option<TenantContext>, Status> {
+        Ok(None)
     }
 }
 
 /// Start Flight SQL + `CatalogService` on one Tonic server, sharing a single
 /// [`SessionStore`]. Both surfaces bind tenants through the engine-default
 /// [`SessionIdTenantResolver`]: the Flight SQL service via its
-/// [`TenantBoundProvider`], the `CatalogService` via the async
+/// [`ResolvedFlightScope`], the `CatalogService` via the async
 /// [`TenantResolverLayer`] — the same single-binder mechanism the full gRPC
 /// chain uses.
 ///
@@ -108,17 +134,12 @@ impl SessionStateProvider for StaticState {
 /// chain instead of this function.
 pub async fn serve_flight_with_catalog_service(
     base_ctx: &QueryContext,
-    base_tenant_binding: TenantBinding,
     addr: SocketAddr,
     store: SessionStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resolver = SessionIdTenantResolver::arc(store.clone());
-    let provider = TenantBoundProvider::new(
-        base_ctx.state(),
-        base_tenant_binding.clone(),
-        Arc::clone(&resolver),
-    );
-    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(provider)));
+    let scope = ResolvedFlightScope::new(base_ctx.clone(), Arc::clone(&resolver));
+    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(scope)));
 
     // This Flight-SQL-only path mounts just Flight + CatalogService — the core
     // handshake surface, no optional tiers, no engine — so it advertises core
@@ -145,95 +166,123 @@ pub async fn serve_flight_with_catalog_service(
     Ok(())
 }
 
-/// `SessionStateProvider` that mutates the engine's shared `TenantBinding`
-/// based on the scope the one [`TenantResolver`] resolves from each query's
-/// metadata — the SAME resolver the gRPC plane binds through (the engine default
-/// reads `jammi-session-id` → `SessionStore`; a downstream's authenticating
-/// resolver reads its own credential). The mutation is process-global because
-/// the binding is shared; concurrent Flight SQL requests on different tenants
-/// serialise on the write lock.
-///
-/// **Concurrency caveat:** if a deployment serves more than one tenant
-/// concurrently through Flight SQL (rather than gRPC + per-statement
-/// session bindings), the race window between binding mutation and SQL
-/// execution can return rows under a stale binding, because the binding
-/// lives on the shared session. The gRPC `CatalogService` surface
-/// is the supported multi-tenant path. Downstream gRPC consumers that own
-/// their own request handlers avoid the race by routing each request through
-/// [`jammi_db::session::JammiSession::with_tenant_scoped`], which
-/// installs the tenant as a Tokio task-local for the duration of the
-/// closure.
-pub struct TenantBoundProvider {
-    base_state: SessionState,
-    binding: TenantBinding,
-    /// The one tenant-binding resolver — the SAME resolver the gRPC plane binds
-    /// through, threaded down to the Flight SQL `db.sql` lane.
-    /// It resolves each query's scope and binds it, so Flight and gRPC can never
-    /// disagree about who a request is; an authenticating resolver's rejection
-    /// fails the query before any binding, closing the cross-transport bypass.
+/// The multi-tenant shape's [`FlightScope`]: each request runs under the
+/// scope the one [`TenantResolver`] reads from its metadata — the SAME
+/// resolver the gRPC plane binds through (the engine default reads
+/// `jammi-session-id` → `SessionStore`; a downstream's authenticating
+/// resolver reads its own credential), so Flight and gRPC can never disagree
+/// about who a request is. An authenticating resolver's rejection fails the
+/// request before it plans, closing the cross-transport bypass.
+pub struct ResolvedFlightScope {
+    ctx: QueryContext,
     resolver: Arc<dyn TenantResolver>,
 }
 
-impl TenantBoundProvider {
-    pub fn new(
-        base_state: SessionState,
-        binding: TenantBinding,
-        resolver: Arc<dyn TenantResolver>,
-    ) -> Self {
-        Self {
-            base_state,
-            binding,
-            resolver,
-        }
+impl ResolvedFlightScope {
+    pub fn new(ctx: QueryContext, resolver: Arc<dyn TenantResolver>) -> Self {
+        Self { ctx, resolver }
     }
 }
 
 #[async_trait]
-impl SessionStateProvider for TenantBoundProvider {
-    async fn new_context(&self, request: &Request<()>) -> Result<SessionState, Status> {
-        // Resolve the query's scope through the one resolver and bind it — or
-        // reject (an authenticating resolver's `Err` fails the query here, so the
-        // `db.sql` lane never runs unscoped on a missing/invalid credential). An
-        // explicit `Global` scope binds the unscoped context.
-        let ctx = match self.resolver.resolve(request.metadata()).await? {
+impl FlightScope for ResolvedFlightScope {
+    fn context(&self) -> &QueryContext {
+        &self.ctx
+    }
+
+    async fn resolve(&self, metadata: &MetadataMap) -> Result<Option<TenantContext>, Status> {
+        Ok(Some(match self.resolver.resolve(metadata).await? {
             TenantScope::Tenant(t) => TenantContext::Scoped(t),
             TenantScope::Global => TenantContext::Unscoped,
-        };
-        self.binding.set_shared(ctx);
-
-        Ok(self.base_state.clone())
+        }))
     }
 }
 
 /// The Flight service the engine mounts: the inner `FlightSqlService` with
-/// its statement-ticket arm taken over (module doc). One provider serves
-/// both — the inner's own requests and the taken-over arm resolve a
-/// request's state, and its tenant, through the same object.
+/// its statement-ticket arm taken over (module doc). Every request that
+/// reaches the engine enters the scope its [`FlightScope`] resolves, and the
+/// inner service's state is the one planning under it.
 pub struct JammiFlightService {
     inner: FlightSqlService,
-    provider: Arc<dyn SessionStateProvider>,
+    scope: Arc<dyn FlightScope>,
 }
 
-/// The one provider, shared with the inner service (which owns its copy
-/// boxed).
-struct SharedProvider(Arc<dyn SessionStateProvider>);
+/// The inner service's provider: the request's state, planning under the
+/// scope the request entered (installed by [`JammiFlightService`] around the
+/// call that asks for it).
+struct EnteredScope(Arc<dyn FlightScope>);
 
 #[async_trait]
-impl SessionStateProvider for SharedProvider {
-    async fn new_context(&self, request: &Request<()>) -> Result<SessionState, Status> {
-        self.0.new_context(request).await
+impl SessionStateProvider for EnteredScope {
+    async fn new_context(&self, _request: &Request<()>) -> Result<SessionState, Status> {
+        Ok(self.0.context().state())
+    }
+}
+
+/// A response stream polled under the scope its request entered: tonic
+/// polls it after the handler returned, off the handler's scope.
+struct Entered<S> {
+    scope: Option<TenantContext>,
+    stream: S,
+}
+
+impl<S: Stream + Unpin> Stream for Entered<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        let this = &mut *self;
+        let stream = Pin::new(&mut this.stream);
+        match this.scope {
+            Some(ctx) => TenantBinding::within_sync(ctx, || stream.poll_next(cx)),
+            None => stream.poll_next(cx),
+        }
     }
 }
 
 impl JammiFlightService {
-    /// Mount the inner service over `provider`, taking the statement arm.
-    pub fn new(provider: Arc<dyn SessionStateProvider>) -> Self {
+    /// Mount the inner service over `scope`, taking the statement arm.
+    pub fn new(scope: Arc<dyn FlightScope>) -> Self {
         Self {
-            inner: FlightSqlService::new_with_provider(Box::new(SharedProvider(Arc::clone(
-                &provider,
-            )))),
-            provider,
+            inner: FlightSqlService::new_with_provider(Box::new(EnteredScope(Arc::clone(&scope)))),
+            scope,
         }
+    }
+
+    /// Run `call` under `scope`, the session's own when `None`.
+    async fn entered<T>(
+        scope: Option<TenantContext>,
+        call: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        match scope {
+            Some(ctx) => TenantBinding::within(ctx, call).await,
+            None => call.await,
+        }
+    }
+
+    /// Run `call` and every poll of the stream it answers with under the
+    /// scope `metadata` names.
+    async fn entered_stream<S, T>(
+        &self,
+        metadata: &MetadataMap,
+        call: impl std::future::Future<Output = Result<Response<S>, Status>>,
+    ) -> Result<Response<BoxedStream<T>>, Status>
+    where
+        S: Stream<Item = Result<T, Status>> + Send + Unpin + 'static,
+        T: 'static,
+    {
+        let scope = self.scope.resolve(metadata).await?;
+        let response = Self::entered(scope, call).await?;
+        Ok(response.map(|stream| Box::pin(Entered { scope, stream }) as BoxedStream<T>))
+    }
+
+    /// Run the unary `call` under the scope `metadata` names.
+    async fn entered_unary<T>(
+        &self,
+        metadata: &MetadataMap,
+        call: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        let scope = self.scope.resolve(metadata).await?;
+        Self::entered(scope, call).await
     }
 
     /// The statement a ticket carries, when it is a statement ticket (the
@@ -265,11 +314,8 @@ impl JammiFlightService {
     /// at the first call with the status the engine's own classification gives
     /// it — a missing relation is `NOT_FOUND` here exactly as it is in process —
     /// rather than with the inner service's planner's untyped failure.
-    async fn plan_statement<T>(&self, request: &Request<T>, query: &str) -> Result<(), Status> {
-        let inspect =
-            Request::from_parts(request.metadata().clone(), request.extensions().clone(), ());
-        let state = self.provider.new_context(&inspect).await?;
-        StatementClass::plan(&state, query)
+    async fn plan_statement(&self, query: &str) -> Result<(), Status> {
+        StatementClass::plan(&self.scope.context().state(), query)
             .await
             .map(|_| ())
             .map_err(engine_status)
@@ -279,16 +325,13 @@ impl JammiFlightService {
     /// own state and encode its rows under the plan's schema — the schema
     /// the inner service advertised for it (`get_flight_info` derives the
     /// same one from the same logical plan).
-    async fn do_get_statement(
-        &self,
-        request: &Request<Ticket>,
-        query: &str,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let inspect =
-            Request::from_parts(request.metadata().clone(), request.extensions().clone(), ());
-        let state = self.provider.new_context(&inspect).await?;
-        let ctx = QueryContext::from(SessionContext::new_with_state(state));
-        let frame = ctx.sql(query).await.map_err(engine_status)?;
+    async fn do_get_statement(&self, query: &str) -> Result<Response<BoxedStream<FlightData>>, Status> {
+        let frame = self
+            .scope
+            .context()
+            .sql(query)
+            .await
+            .map_err(engine_status)?;
         let schema = Arc::new(frame.schema().as_arrow().clone());
         let stream = frame.execute_stream().await.map_err(engine_status)?;
         let flight = FlightDataEncoderBuilder::new()
@@ -347,14 +390,18 @@ fn arrow_status_code(class: ErrorClass) -> u16 {
 
 type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+/// The handshake and the listing calls reach no engine state and run as they
+/// arrive: a deployment's handshake is where its credential is presented, so
+/// it is never refused for the credential it carries. Every other call
+/// enters its request's scope.
 #[async_trait]
 impl FlightService for JammiFlightService {
     type HandshakeStream = <FlightSqlService as FlightService>::HandshakeStream;
     type ListFlightsStream = <FlightSqlService as FlightService>::ListFlightsStream;
     type DoGetStream = BoxedStream<FlightData>;
-    type DoPutStream = <FlightSqlService as FlightService>::DoPutStream;
-    type DoExchangeStream = <FlightSqlService as FlightService>::DoExchangeStream;
-    type DoActionStream = <FlightSqlService as FlightService>::DoActionStream;
+    type DoPutStream = BoxedStream<arrow_flight::PutResult>;
+    type DoExchangeStream = BoxedStream<FlightData>;
+    type DoActionStream = BoxedStream<arrow_flight::Result>;
     type ListActionsStream = <FlightSqlService as FlightService>::ListActionsStream;
 
     async fn handshake(
@@ -375,33 +422,46 @@ impl FlightService for JammiFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        if let Some(query) = Self::descriptor_statement(request.get_ref()) {
-            self.plan_statement(&request, &query).await?;
-        }
-        self.inner.get_flight_info(request).await
+        let metadata = request.metadata().clone();
+        let statement = Self::descriptor_statement(request.get_ref());
+        self.entered_unary(&metadata, async {
+            if let Some(query) = statement {
+                self.plan_statement(&query).await?;
+            }
+            self.inner.get_flight_info(request).await
+        })
+        .await
     }
 
     async fn poll_flight_info(
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        self.inner.poll_flight_info(request).await
+        let metadata = request.metadata().clone();
+        self.entered_unary(&metadata, self.inner.poll_flight_info(request))
+            .await
     }
 
     async fn get_schema(
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        self.inner.get_schema(request).await
+        let metadata = request.metadata().clone();
+        self.entered_unary(&metadata, self.inner.get_schema(request))
+            .await
     }
 
     async fn do_get(
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let metadata = request.metadata().clone();
         match Self::statement_query(request.get_ref()) {
-            Some(query) => self.do_get_statement(&request, &query).await,
-            None => self.inner.do_get(request).await,
+            Some(query) => {
+                self.entered_stream(&metadata, self.do_get_statement(&query))
+                    .await
+            }
+            None => self.entered_stream(&metadata, self.inner.do_get(request)).await,
         }
     }
 
@@ -409,21 +469,27 @@ impl FlightService for JammiFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        self.inner.do_put(request).await
+        let metadata = request.metadata().clone();
+        self.entered_stream(&metadata, self.inner.do_put(request))
+            .await
     }
 
     async fn do_exchange(
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        self.inner.do_exchange(request).await
+        let metadata = request.metadata().clone();
+        self.entered_stream(&metadata, self.inner.do_exchange(request))
+            .await
     }
 
     async fn do_action(
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        self.inner.do_action(request).await
+        let metadata = request.metadata().clone();
+        self.entered_stream(&metadata, self.inner.do_action(request))
+            .await
     }
 
     async fn list_actions(

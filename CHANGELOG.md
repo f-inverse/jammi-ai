@@ -24,6 +24,13 @@ workspace ships every publishable crate at the same
   `Decimal128(19, s)` that Postgres filters and aggregates, `s` being the database's money scale.
   Tables without one are read as before.
 
+- **A filter on a database column holds when the query also joins a file.** The engine ran such a
+  filter above the federated scan, and physical filter pushdown handed it to that scan, which took
+  it and then neither sent it to the database nor applied it: a `WHERE` on a Postgres column of a
+  Postgres × Parquet join returned the rows it should have removed. Every federated sub-plan is now
+  planned behind a `FederatedScanExec` that takes no filter from above, so the filter stays in the
+  engine's `FilterExec`.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

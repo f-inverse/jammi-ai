@@ -390,6 +390,7 @@ The engine's dependency tree is gated in CI by `cargo deny` against the RustSec
 advisory database, plus a license allowlist and the source/ban guards that
 formalize the engine's one-way dependency direction (no crate from outside crates.io
 in the engine's dependency closure). The advisory lane runs the live RustSec
-DB on every PR; a documented exception in `deny.toml` records any advisory the
-release knowingly carries, with a written rationale, rather than destabilizing
-the freeze with a risky bump. The config is `deny.toml` at the repo root.
+DB on every PR. An advisory is fixed by moving the dependency to the fixed
+version. `deny.toml` excepts one only when no release of the crate that pulls it
+in accepts that version, and each exception states why the engine does not reach
+the affected code and what clears it. The config is `deny.toml` at the repo root.

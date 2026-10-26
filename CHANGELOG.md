@@ -6,6 +6,18 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **Every advisory a reachable release fixes is fixed.** rustls 0.23.46, rustls-webpki 0.103.16,
+  webpki-roots 1.0.11, tokio 1.54.1, ctutils 0.4.6 and zstd-sys 2.1.2, and DataFusion's file
+  compression codecs on zstd 0.14 / zstd-safe 8.2.
+- **An advisory exception says why it is unreached and what clears it.** `deny.toml` excepts only
+  advisories no release of the crate that pulls them in can fix: zip 8 (candle-core requires
+  ^8.6 and never extracts an archive), zstd 0.13 (arrow, parquet, DataFusion and tantivy require
+  ^0.13 and call only the unaffected bulk and read paths), and unsafe-libyaml (a substrait build
+  dependency, linked into no binary). The two pyo3 exceptions name their real gate, arrow 59,
+  in place of a release freeze.
+- **`ci/dev.sh` starts every container for `JAMMI_CI_PLATFORM`.** Its free-space probe ran
+  the image for the host's platform, so a CUDA-image run on an arm64 host failed before it
+  began.
 - **A Postgres `money` column reads as the amount it holds.** The driver passed `money`'s binary
   form through as its value, an `int8` count of the currency's minor unit, so `12.34` read as
   `1234` and `SUM` was 100 times too large; a filter on the column was refused by Postgres, which

@@ -42,9 +42,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # explicitly-listed exceptions below, each with a rationale.
 yanked = "deny"
 
-# Each entry here is an advisory the current tree carries that the terminal-0.x
-# freeze knowingly accepts rather than take a risky dependency bump that would
-# destabilize the release. Every one is justified; none is a blanket silence.
+# Each entry here is an advisory the resolved tree carries because no release of
+# the crate that pulls it in accepts the fixed version. Every entry states why the
+# engine does not reach the affected code, and what clears it; when a fixed
+# version becomes reachable, the dependency moves and the entry goes. None is a
+# blanket silence.
 ignore = [
     # paste 1.0.15 — unmaintained (no security defect). Pulled transitively by
     # arrow-flight (proc-macro, build-time only). RustSec records "No safe
@@ -53,20 +55,54 @@ ignore = [
     # surface. Re-evaluate when arrow-flight drops the dependency.
     "RUSTSEC-2024-0436",
     # pyo3 0.28.2 — out-of-bounds read in `nth`/`nth_back` for `PyList`/`PyTuple`
-    # iterators. The fix is pyo3 >= 0.29, a minor bump that cascades into a
-    # `pyo3-arrow` bump (the Arrow<->PyO3 bridge), i.e. a manifest change across
-    # the PyO3 binding — too risky to land at the format/API freeze, and not
-    # covered by this gate's build lanes (jammi-python builds via maturin, not
-    # `cargo build --workspace`). Crucially, the vulnerable API is NOT reached:
-    # the binding uses `PyList::empty` + `append`/`set_item`, never `.nth()` /
-    # `.nth_back()` iterator indexing on a `PyList`/`PyTuple`. Sequenced for a
-    # deliberate post-freeze pyo3/pyo3-arrow upgrade.
+    # iterators. The fix is pyo3 >= 0.29, which the Arrow<->PyO3 bridge reaches
+    # only at pyo3-arrow >= 0.19, and every such pyo3-arrow requires arrow 59: the
+    # workspace is on arrow 58 (the DataFusion 54 line, fenced in `[bans]`). The
+    # binding builds lists with `PyList::empty` + `append`/`set_item` and never
+    # indexes a `PyList`/`PyTuple` iterator with `.nth()`/`.nth_back()`
+    # (grep-verified over `crates/jammi-python` and `packaging/`). Clears with the
+    # move to arrow 59.
     "RUSTSEC-2026-0176",
     # pyo3 0.28.2 — missing `Sync` bound on `PyCFunction::new_closure` closures.
-    # Same fix (pyo3 >= 0.29) and same freeze rationale as above. The binding
-    # calls `new_closure` nowhere (grep-verified), so the unsound path is not
-    # reachable. Sequenced with RUSTSEC-2026-0176 for the post-freeze upgrade.
+    # Same fix and the same arrow-59 gate as RUSTSEC-2026-0176. The binding calls
+    # `new_closure` nowhere (grep-verified), so the unsound path is not reached.
     "RUSTSEC-2026-0177",
+    # unsafe-libyaml 0.2.11 — unmaintained (no security defect); RustSec records
+    # no safe upgrade. Its only path is serde_yaml as a BUILD dependency of
+    # substrait 0.63 (datafusion-substrait 54 -> datafusion-flight-sql-server),
+    # whose build script parses substrait's own vendored YAML schema. substrait's
+    # runtime YAML parsing sits behind its `extensions`/`parse` features, which
+    # datafusion-substrait does not enable (`cargo tree -e normal -i
+    # unsafe-libyaml` prints nothing), so no shipped binary links it. Clears when
+    # substrait's build script stops using serde_yaml.
+    "RUSTSEC-2024-0449",
+    # zip 8.6.0 — three flaws in `ZipArchive::extract` / `ZipStreamReader::extract`:
+    # SUID/SGID bits kept (0367), symlink targets outside the destination (0368),
+    # permissions applied through symlinks (0369). The fix is zip >= 9; zip's only
+    # path is candle-core, and every candle-core release up to 0.11.0 (the newest,
+    # the workspace's pin) requires zip ^8.6. candle reads `.npz`/`.pth` entries by
+    # name and writes `.npz`; it never extracts an archive to disk, and nothing
+    # in the engine extracts one. Clears when a candle-core release takes zip 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # zstd 0.13.3 / zstd-safe 7.2.4 — a reused stream context leaks an abandoned
+    # stream's data (0391, the `with_context` stream constructors); `Seekable::
+    # decompress` overruns its `Vec` (0398, the `seekable` feature); a failed
+    # legacy-frame decode exposes uninitialized memory (0403, `DCtx::
+    # decompress_stream` into a `Vec`, i.e. `zstd::stream::write::Decoder`). The
+    # fixes are zstd >= 0.14.3 / zstd-safe >= 8.2, which async-compression's
+    # codecs already resolve; the 0.13 line stays because arrow-ipc, parquet,
+    # datafusion, datafusion-datasource and tantivy all require zstd ^0.13, on
+    # this line and on arrow 59 / DataFusion 55 alike. None reaches the affected
+    # code: arrow-ipc, parquet and tantivy use the `zstd::bulk` API, and
+    # datafusion-datasource reads with `zstd::Decoder::new` (the read decoder,
+    # which RUSTSEC-2026-0403 names as unaffected); `seekable` is not enabled
+    # (`cargo tree -e features -i zstd-safe@7.2.4`). Clears when those crates
+    # take zstd 0.14.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
     # --- Feature-gated paths, surfaced by the `--all-features` advisory lane ---
     # These reach the tree only through a cargo feature, so the DEFAULT-feature
     # graph — the bare `jammi-server` crate as published to crates.io, built

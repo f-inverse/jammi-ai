@@ -30,8 +30,8 @@ use jammi_db::catalog::model_repo::{ModelBackendKind, ModelDescriptor};
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{
-    FileFormat, SourceConnection, SourceDescription, SourceTable, SourceTableDescription,
-    SourceType,
+    CaCertificate, FileFormat, SourceConnection, SourceDescription, SourceTable,
+    SourceTableDescription, SourceType,
 };
 use jammi_db::store::{ReconcileOptions, ReconcileReport};
 use jammi_db::trigger::ids::TopicId;
@@ -89,10 +89,16 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
         } else {
             Some(conn.url)
         };
+        let ca_certificate = conn
+            .ca_certificate
+            .map(CaCertificate::from_pem)
+            .transpose()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(SourceConnection {
             url,
             format: file_format_from_proto(conn.format)?,
             tenant_column: conn.tenant_column,
+            ca_certificate,
             ..Default::default()
         })
     }
@@ -100,10 +106,10 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
 
 /// Encode the engine's [`SourceConnection`] into the proto message for an
 /// `AddSource` request — the inverse of the decode above, for the
-/// the remote client send side. The URL, format and tenant column cross the
-/// wire (matching what the decode reads back): cloud credentials, file-extension
-/// overrides, and driver options are server-side and have no wire field, so the
-/// send side does not carry them. A `None` URL encodes as the empty string the
+/// the remote client send side. The URL, format, tenant column and CA
+/// certificate cross the wire (matching what the decode reads back): cloud
+/// credentials and file-extension overrides are server-side and have no wire
+/// field, so the send side does not carry them. A `None` URL encodes as the empty string the
 /// decode reads back as `None`; an unset format encodes as
 /// `FILE_FORMAT_UNSPECIFIED`, which the decode maps to "let the engine infer".
 impl From<SourceConnection> for pb::SourceConnection {
@@ -112,6 +118,7 @@ impl From<SourceConnection> for pb::SourceConnection {
             url: conn.url.unwrap_or_default(),
             format: file_format_to_proto(conn.format) as i32,
             tenant_column: conn.tenant_column,
+            ca_certificate: conn.ca_certificate.map(String::from),
         }
     }
 }
@@ -728,6 +735,32 @@ mod tests {
             assert_eq!(decoded.url.as_deref(), Some("file:///data/notes.parquet"));
             assert_eq!(decoded.format, Some(FileFormat::Parquet));
         }
+    }
+
+    /// A database source's CA certificate crosses the wire as its PEM, and a
+    /// text holding no certificate is refused where it is decoded.
+    #[test]
+    fn a_source_connection_carries_its_ca_certificate() {
+        let pem = include_str!("../../../tests/fixtures/isrg-root-x1.pem");
+        let connection = SourceConnection {
+            url: Some("postgres://reader@db.example/sales".into()),
+            ca_certificate: Some(CaCertificate::from_pem(pem).unwrap()),
+            ..Default::default()
+        };
+        let decoded = SourceConnection::try_from(pb::SourceConnection::from(connection))
+            .expect("a well-formed connection decodes");
+        assert_eq!(
+            decoded.ca_certificate.as_ref().map(CaCertificate::pem),
+            Some(pem)
+        );
+
+        let refused = SourceConnection::try_from(pb::SourceConnection {
+            url: "postgres://reader@db.example/sales".into(),
+            ca_certificate: Some("/etc/ssl/ca.pem".into()),
+            ..Default::default()
+        })
+        .expect_err("a path is not a certificate");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     }
 
     /// An out-of-range `i32` (no compiled `FileFormat` variant claims it) is

@@ -1321,6 +1321,7 @@ class RemoteDatabase:
         url: str,
         format: Optional[str] = None,
         tenant_column: Optional[str] = None,
+        ca_certificate: Optional[str] = None,
     ) -> None:
         """Register a data source on the remote engine, by the URL that names it.
 
@@ -1332,7 +1333,10 @@ class RemoteDatabase:
         `gs://`, `azure://`). `tenant_column` names the column whose value is
         each row's tenant: a tenant-bound session then reads only its own rows
         and the rows with no tenant, through every verb that reads the source.
-        Maps to `CatalogService.AddSource`.
+        `ca_certificate` is the PEM text of the certificate authority a
+        database's server certificate is verified against, for a server whose
+        certificate the engine's host does not trust; the source then connects
+        verified. Maps to `CatalogService.AddSource`.
         """
         kind = _database_source_kind(url)
         if kind is not None:
@@ -1340,7 +1344,9 @@ class RemoteDatabase:
                 raise InvalidArgument(
                     f"a database source takes no format (got {format!r} for {url!r})"
                 )
-            connection = catalog_pb2.SourceConnection(url=url, tenant_column=tenant_column)
+            connection = catalog_pb2.SourceConnection(
+                url=url, tenant_column=tenant_column, ca_certificate=ca_certificate
+            )
         else:
             try:
                 file_format = _FILE_FORMAT[format]
@@ -1351,7 +1357,10 @@ class RemoteDatabase:
                 ) from None
             kind = catalog_pb2.SourceKind.SOURCE_KIND_FILE
             connection = catalog_pb2.SourceConnection(
-                url=_local_source_url(url), format=file_format, tenant_column=tenant_column
+                url=_local_source_url(url),
+                format=file_format,
+                tenant_column=tenant_column,
+                ca_certificate=ca_certificate,
             )
         self._call(
             self._catalog.AddSource,

@@ -14,7 +14,6 @@ pub mod schema_provider;
 // source after exporting to Parquet/CSV.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::storage::{CloudConfig, StorageUrl};
 
@@ -111,6 +110,55 @@ impl std::str::FromStr for FileFormat {
     }
 }
 
+/// The certificate authority a database source verifies its server against:
+/// one or more PEM `CERTIFICATE` sections, as the text a client sent. A client
+/// that cannot reach the engine's host hands over the certificate itself,
+/// never a path on that host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CaCertificate(String);
+
+impl CaCertificate {
+    /// `pem` as a CA certificate: every `CERTIFICATE` section it holds must
+    /// decode, and it must hold one.
+    pub fn from_pem(pem: impl Into<String>) -> crate::error::Result<Self> {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::CertificateDer;
+
+        let pem = pem.into();
+        let refused = |reason: String| crate::error::JammiError::InvalidArgument {
+            argument: "ca_certificate".into(),
+            reason,
+        };
+        let certificates = CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| refused(format!("not a PEM certificate: {e}")))?;
+        if certificates.is_empty() {
+            return Err(refused("holds no PEM `CERTIFICATE` section".into()));
+        }
+        Ok(Self(pem))
+    }
+
+    /// The PEM text.
+    pub fn pem(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CaCertificate {
+    type Error = crate::error::JammiError;
+
+    fn try_from(pem: String) -> crate::error::Result<Self> {
+        Self::from_pem(pem)
+    }
+}
+
+impl From<CaCertificate> for String {
+    fn from(ca: CaCertificate) -> Self {
+        ca.0
+    }
+}
+
 /// Connection parameters for a data source.
 ///
 /// Structural equality is the identity a session's source cache is keyed on
@@ -143,9 +191,11 @@ pub struct SourceConnection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudConfig>,
 
-    /// Arbitrary key-value options passed to the source driver.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub options: HashMap<String, String>,
+    /// The certificate authority a database source verifies its server's
+    /// certificate against, when the server's certificate is not signed by
+    /// one the engine's host trusts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_certificate: Option<CaCertificate>,
 
     /// Name of the tenant-discriminator column on this federated source, when
     /// its rows carry tenancy under a column other than `tenant_id`. Consulted
@@ -318,6 +368,24 @@ pub(crate) fn table_name_from_url(url: &str) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn a_ca_certificate_is_pem_holding_a_certificate() {
+        let pem = include_str!("../../../../tests/fixtures/isrg-root-x1.pem");
+        assert_eq!(CaCertificate::from_pem(pem).unwrap().pem(), pem);
+        for refused in [
+            "/etc/ssl/certs/ca.pem",
+            "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+            "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        ] {
+            let error = CaCertificate::from_pem(refused).unwrap_err();
+            assert_eq!(
+                error.class(),
+                crate::error::ErrorClass::InvalidArgument,
+                "{refused}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn file_format_round_trips_through_display_and_from_str() {

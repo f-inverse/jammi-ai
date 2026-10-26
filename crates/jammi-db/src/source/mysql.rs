@@ -18,11 +18,19 @@ use url::Url;
 
 use crate::error::{JammiError, Result};
 use crate::federation::remote::{self, Remote};
-use crate::source::{database, SourceConnection, SourceTable};
+use crate::source::database::{self, TlsModes};
+use crate::source::{SourceConnection, SourceTable};
 
 /// The URL parameter that sets the TLS mode: the driver's own, which
 /// `mysql_async` does not parse.
 const TLS_MODE: &str = "sslmode";
+
+/// The driver's TLS modes: `required`, which verifies the server's
+/// certificate and the host it names, unless the URL names another.
+const TLS: TlsModes = TlsModes {
+    default: "required",
+    verifying: &["required"],
+};
 
 /// Create table providers for all tables of the MySQL database the URL names,
 /// each handing MySQL only what it runs with the engine's meaning ([`remote`]).
@@ -34,8 +42,12 @@ pub async fn create_mysql_tables(
         source_id: source_id.into(),
         message,
     };
+    let ca = match &connection.ca_certificate {
+        Some(ca) => Some(database::ca_file(source_id, ca).await?),
+        None => None,
+    };
     let (params, schema) =
-        pool_params(database::url(source_id, connection)?, &connection.options).map_err(failed)?;
+        pool_params(database::url(source_id, connection)?, ca.as_deref()).map_err(failed)?;
     let pool = MySQLConnectionPool::new(params)
         .await
         .map_err(|e| failed(format!("Failed to connect to MySQL: {e}")))?;
@@ -70,17 +82,23 @@ pub async fn create_mysql_tables(
 /// `preferred` or `required` (the default), the driver's own and unknown to
 /// `mysql_async` — is taken out first and handed to the driver beside it. The
 /// driver's `preferred` still refuses a server without TLS, so a local server
-/// that has none is reached with `sslmode=disabled`. `options` are the
-/// driver's own parameters and override what the URL says.
+/// that has none is reached with `sslmode=disabled`; `preferred` does not
+/// verify the server's certificate. `ca` is the file the source's CA
+/// certificate was written to ([`database::ca_file`]): the driver reads it as
+/// `sslrootcert`, and the source connects with a mode that verifies the
+/// server ([`TLS`]).
 fn pool_params(
     url: &str,
-    options: &HashMap<String, String>,
+    ca: Option<&std::path::Path>,
 ) -> std::result::Result<(HashMap<String, SecretString>, String), String> {
     let mut parsed = Url::parse(url).map_err(|e| format!("invalid MySQL URL: {e}"))?;
-    let (tls, rest): (Vec<_>, Vec<_>) = parsed
+    let (named, rest): (Vec<_>, Vec<_>) = parsed
         .query_pairs()
         .into_owned()
         .partition(|(key, _)| key == TLS_MODE);
+    let mode = TLS.mode(named.last().map(|(_, mode)| mode.as_str()), ca.is_some())?;
+    let tls = std::iter::once((TLS_MODE.to_string(), mode))
+        .chain(ca.map(|ca| ("sslrootcert".to_string(), ca.display().to_string())));
     parsed.set_query(None);
     if !rest.is_empty() {
         parsed.query_pairs_mut().extend_pairs(&rest);
@@ -94,7 +112,6 @@ fn pool_params(
     let params = [("connection_string".to_string(), parsed.to_string())]
         .into_iter()
         .chain(tls)
-        .chain(options.clone())
         .map(|(key, value)| (key, SecretString::from(value)))
         .collect();
     Ok((params, schema))
@@ -153,7 +170,7 @@ mod tests {
     fn the_tls_mode_is_the_drivers_and_the_rest_is_the_url() {
         let (params, schema) = pool_params(
             "mysql://reader:pw@127.0.0.1:3307/shop?sslmode=disabled",
-            &HashMap::new(),
+            None,
         )
         .unwrap();
         assert_eq!(schema, "shop");
@@ -167,15 +184,24 @@ mod tests {
     }
 
     #[test]
-    fn source_options_override_the_url() {
-        let options = HashMap::from([("sslmode".to_string(), "required".to_string())]);
-        let (params, _) = pool_params("mysql://u@h/shop?sslmode=disabled", &options).unwrap();
-        assert_eq!(params["sslmode"].expose_secret(), "required");
+    fn a_ca_certificate_is_the_drivers_root_and_verifies_the_server() {
+        let ca = std::path::Path::new("/tmp/jammi-source-ca/x.pem");
+        let (params, _) = pool_params("mysql://u@h/shop", Some(ca)).unwrap();
+        assert_eq!(
+            exposed(&params),
+            HashMap::from([
+                ("connection_string", "mysql://u@h/shop"),
+                ("sslmode", "required"),
+                ("sslrootcert", "/tmp/jammi-source-ca/x.pem"),
+            ])
+        );
+        assert!(pool_params("mysql://u@h/shop?sslmode=preferred", Some(ca)).is_err());
+        assert!(pool_params("mysql://u@h/shop?sslmode=disabled", Some(ca)).is_err());
     }
 
     #[test]
     fn a_url_without_a_database_or_with_an_unknown_parameter_is_refused() {
-        assert!(pool_params("mysql://u@h", &HashMap::new()).is_err());
-        assert!(pool_params("mysql://u@h/shop?frobnicate=1", &HashMap::new()).is_err());
+        assert!(pool_params("mysql://u@h", None).is_err());
+        assert!(pool_params("mysql://u@h/shop?frobnicate=1", None).is_err());
     }
 }

@@ -347,6 +347,7 @@ class EmbeddedBackend:
         url: str,
         format: Optional[str] = None,
         tenant_column: Optional[str] = None,
+        ca_certificate: Optional[str] = None,
     ) -> None:
         """Register a data source on the embedded engine, by the URL that names it.
 
@@ -355,9 +356,17 @@ class EmbeddedBackend:
         they take no `format`. Anything else is a file read in `format`.
         `tenant_column` names the column whose value is each row's tenant: a
         tenant-bound session then reads only its own rows and the rows with no
-        tenant, through every verb that reads the source.
+        tenant, through every verb that reads the source. `ca_certificate` is the
+        PEM text of the certificate authority a database's server certificate is
+        verified against; the source then connects verified.
         """
-        self._native.add_source(name, url=url, format=format, tenant_column=tenant_column)
+        self._native.add_source(
+            name,
+            url=url,
+            format=format,
+            tenant_column=tenant_column,
+            ca_certificate=ca_certificate,
+        )
 
     def list_sources(self) -> List[Dict[str, Any]]:
         """A descriptor for every source registered to the current tenant."""

@@ -254,6 +254,14 @@ impl SourceRegistry {
         let connection = &definition.connection;
         match &definition.source_type {
             SourceType::File => {
+                if connection.ca_certificate.is_some() {
+                    return Err(JammiError::InvalidArgument {
+                        argument: "ca_certificate".into(),
+                        reason: format!(
+                            "File source '{source_id}' connects to no database server for a CA certificate to verify"
+                        ),
+                    });
+                }
                 let format =
                     connection
                         .format

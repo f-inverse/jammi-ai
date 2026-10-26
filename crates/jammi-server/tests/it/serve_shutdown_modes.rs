@@ -224,6 +224,7 @@ async fn add_source(ch: Channel, source_id: &str, file: &str, format: FileFormat
                 url: fixture_url(file),
                 format: format as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await

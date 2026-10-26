@@ -161,6 +161,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -235,6 +236,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -309,6 +311,7 @@ async fn embed_corpus(
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -600,6 +603,7 @@ async fn catalog_service_rejects_unspecified_source_kind() {
                 url: "file:///tmp/whatever.parquet".into(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -695,6 +699,7 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
                 url: format!("file://{}", source_parquet.display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await

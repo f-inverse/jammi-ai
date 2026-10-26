@@ -75,6 +75,7 @@ where
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await

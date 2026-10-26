@@ -11,6 +11,8 @@ mod channels;
 mod common;
 mod concurrent_writers;
 mod create_table_as;
+#[cfg(any(feature = "live-postgres-tests", feature = "live-mysql-tests"))]
+mod database_tls;
 mod datafusion_version;
 mod docs_config_fences;
 mod domain_hash_prefix_free_gate;

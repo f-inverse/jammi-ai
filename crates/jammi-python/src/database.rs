@@ -16,7 +16,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
-use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
+use jammi_db::source::{CaCertificate, FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
@@ -556,20 +556,28 @@ impl PyDatabase {
     /// read in `format` — a local path (parsed into `file://...`) or any
     /// storage URL the build was compiled with (`s3://`, `gs://`, `azure://`).
     /// `tenant_column` names the column whose value is each row's tenant,
-    /// persisted with the source.
-    #[pyo3(signature = (name, *, url, format=None, tenant_column=None))]
+    /// persisted with the source. `ca_certificate` is the PEM text of the
+    /// certificate authority a database's server certificate is verified
+    /// against.
+    #[pyo3(signature = (name, *, url, format=None, tenant_column=None, ca_certificate=None))]
     fn add_source(
         &self,
         name: &str,
         url: &str,
         format: Option<&str>,
         tenant_column: Option<String>,
+        ca_certificate: Option<String>,
     ) -> PyResult<()> {
         self.check_open()?;
         let format = format.map(parse_file_format).transpose()?;
         let definition = SourceDefinition::from_url(url, format).map_err(to_pyerr)?;
+        let ca_certificate = ca_certificate
+            .map(CaCertificate::from_pem)
+            .transpose()
+            .map_err(to_pyerr)?;
         let connection = SourceConnection {
             tenant_column,
+            ca_certificate,
             ..definition.connection
         };
         crate::released(

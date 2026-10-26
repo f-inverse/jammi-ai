@@ -96,6 +96,7 @@ async fn add_training_source(
             url: training_url(),
             format: FileFormat::Csv as i32,
             tenant_column: None,
+            ca_certificate: None,
         }),
     };
     match session {

@@ -17,7 +17,8 @@ use secrecy::SecretString;
 
 use crate::error::{JammiError, Result};
 use crate::pg_uri::{Keyword, PgUri};
-use crate::source::{database, SourceConnection, SourceTable};
+use crate::source::database::{self, TlsModes};
+use crate::source::{SourceConnection, SourceTable};
 
 use self::pool::{Address, ReachablePool};
 
@@ -38,7 +39,11 @@ pub async fn create_postgres_tables(
         message,
     };
     let url = database::url(source_id, connection)?;
-    let params = pool_params(url, &connection.options).map_err(failed)?;
+    let ca = match &connection.ca_certificate {
+        Some(ca) => Some(database::ca_file(source_id, ca).await?),
+        None => None,
+    };
+    let params = pool_params(url, ca.as_deref()).map_err(failed)?;
     let address = address(url).map_err(failed)?;
     let pool = PostgresConnectionPool::new(params)
         .await
@@ -90,8 +95,10 @@ fn address(url: &str) -> std::result::Result<Address, String> {
 /// reads them, [`PgUri`]) become the driver's, and an absent `sslmode` is
 /// `prefer`, libpq's default, as it is to the catalog's driver reading the
 /// same URL. The driver takes no client certificate, so a URI naming one is
-/// refused rather than connected without it. `options` are the driver's own
-/// parameters and override what the URI says.
+/// refused rather than connected without it. `ca` is the file the source's CA
+/// certificate was written to ([`database::ca_file`]): the driver reads it as
+/// `sslrootcert`, the source connects with a mode that verifies the server
+/// ([`TLS`]), and a URI naming its own `sslrootcert` as well is refused.
 ///
 /// Every session runs at UTC ([`SESSION`]), whatever `options` the URI
 /// names besides.
@@ -102,18 +109,24 @@ fn address(url: &str) -> std::result::Result<Address, String> {
 /// would otherwise split into a second keyword.
 fn pool_params(
     url: &str,
-    options: &HashMap<String, String>,
+    ca: Option<&std::path::Path>,
 ) -> std::result::Result<HashMap<String, SecretString>, String> {
     let uri = PgUri::parse(url).map_err(|e| e.to_string())?;
-    let from_uri = uri
+    let mut params = uri
         .params()
         .map(|(keyword, value)| Ok((driver_parameter(keyword)?.to_string(), value.to_string())))
-        .collect::<std::result::Result<Vec<_>, String>>()?;
-    let mut params: HashMap<String, String> = [("sslmode".to_string(), "prefer".to_string())]
-        .into_iter()
-        .chain(from_uri)
-        .chain(options.clone())
-        .collect();
+        .collect::<std::result::Result<HashMap<_, _>, String>>()?;
+    if ca.is_some() && params.contains_key("sslrootcert") {
+        return Err(
+            "the URI names `sslrootcert` and the source holds a CA certificate; name the CA once"
+                .into(),
+        );
+    }
+    let mode = TLS.mode(params.get("sslmode").map(String::as_str), ca.is_some())?;
+    params.insert("sslmode".into(), mode);
+    if let Some(ca) = ca {
+        params.insert("sslrootcert".into(), ca.display().to_string());
+    }
     let session = params
         .remove("options")
         .map_or_else(|| SESSION.to_string(), |named| format!("{named} {SESSION}"));
@@ -130,6 +143,14 @@ fn pool_params(
         })
         .collect())
 }
+
+/// libpq's TLS modes: `prefer` when the URI names none, as libpq's own default,
+/// and `verify-full` — the certificate and the host it names — for a source
+/// holding a CA certificate.
+const TLS: TlsModes = TlsModes {
+    default: "prefer",
+    verifying: &["verify-full", "verify-ca"],
+};
 
 /// The session settings every connection runs with, last on its `options`
 /// so they hold over any the URI names: `TimeZone` is UTC, as the engine's
@@ -172,7 +193,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     fn params(url: &str) -> HashMap<String, String> {
-        pool_params(url, &HashMap::new())
+        pool_params(url, None)
             .unwrap()
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
@@ -246,10 +267,18 @@ mod tests {
     }
 
     #[test]
-    fn source_options_override_the_uri() {
-        let options = HashMap::from([("sslmode".to_string(), "disable".to_string())]);
-        let got = pool_params("postgres://u@h/d?sslmode=require", &options).unwrap();
-        assert_eq!(got["sslmode"].expose_secret(), "disable");
+    fn a_ca_certificate_is_the_drivers_root_and_verifies_the_server() {
+        let ca = std::path::Path::new("/tmp/jammi-source-ca/x.pem");
+        let got = pool_params("postgres://u@h/d", Some(ca)).unwrap();
+        assert_eq!(
+            got["sslrootcert"].expose_secret(),
+            "/tmp/jammi-source-ca/x.pem"
+        );
+        assert_eq!(got["sslmode"].expose_secret(), "verify-full");
+        let got = pool_params("postgres://u@h/d?sslmode=verify-ca", Some(ca)).unwrap();
+        assert_eq!(got["sslmode"].expose_secret(), "verify-ca");
+        assert!(pool_params("postgres://u@h/d?sslmode=require", Some(ca)).is_err());
+        assert!(pool_params("postgres://u@h/d?sslrootcert=/etc/ca.pem", Some(ca)).is_err());
     }
 
     #[test]
@@ -287,8 +316,8 @@ mod tests {
 
     #[test]
     fn a_uri_the_driver_cannot_honour_is_refused() {
-        assert!(pool_params("not a url", &HashMap::new()).is_err());
-        assert!(pool_params("postgres://u@h/d?host=a,b", &HashMap::new()).is_err());
-        assert!(pool_params("postgres://u@h/d?sslcert=/etc/ssl/me.pem", &HashMap::new()).is_err());
+        assert!(pool_params("not a url", None).is_err());
+        assert!(pool_params("postgres://u@h/d?host=a,b", None).is_err());
+        assert!(pool_params("postgres://u@h/d?sslcert=/etc/ssl/me.pem", None).is_err());
     }
 }

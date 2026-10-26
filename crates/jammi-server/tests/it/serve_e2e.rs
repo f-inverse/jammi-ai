@@ -203,6 +203,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -281,6 +282,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", fixture("patents.parquet").display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -293,6 +295,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", fixture("relevance.csv").display()),
                 format: FileFormat::Csv as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await

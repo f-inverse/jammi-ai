@@ -313,6 +313,11 @@ message SourceConnection {
   // and the rows with no tenant. Unset: the source is scoped by a `tenant_id`
   // column if it has one, and readable by every tenant otherwise.
   optional string tenant_column = 3;
+  // A database source's certificate authority, as PEM text: the server's
+  // certificate is verified against it, so the source connects with a TLS
+  // mode that verifies (its URL naming one that does not is refused).
+  // Refused for a file source.
+  optional string ca_certificate = 4;
 }
 
 message AddSourceRequest {

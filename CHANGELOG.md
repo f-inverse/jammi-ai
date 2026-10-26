@@ -249,6 +249,17 @@ The dependency audit is green again on the live advisory database, and database 
   "columns"}` with `columns` a `pyarrow.Schema`, and a remote descriptor's `source_type` reads
   `file`, `postgres` or `mysql`, as the embedded one does, where it read `File`, `Postgres` or
   `MySql`.
+- **A database source verifies its server against a CA the client hands over.** A remote client
+  had no way to: a server whose certificate a private CA signed was reachable only unverified
+  (`sslmode=preferred` skips verification) or with the CA added to the server's own trust store
+  (#753). `SourceConnection.ca_certificate` holds the CA as PEM text, on the wire and in Python's
+  `add_source(..., ca_certificate=...)`; the source then connects with a mode that verifies —
+  `required` for MySQL, `verify-full` for Postgres unless its URL names `verify-ca` — and a URL
+  naming a mode that does not verify is refused with it, as is a file source holding one. Live
+  tests serve Postgres and MySQL over TLS and register a source holding the server's CA (it
+  connects) and one holding an unrelated CA (it is refused). **BREAKING** (Rust API):
+  `SourceConnection.options`, a map passed to the driver that no remote client could set and the
+  URL already carries, is gone.
 - **A mutable table has no chunk size.** `MutableTableDefinition.chunk_size`, its builder
   method, `MutableTableDefinition.chunk_size` on the wire and the Python `chunk_size=` argument
   set a value no read consulted: `scan_after` returns its rows whole and a trigger replay steps

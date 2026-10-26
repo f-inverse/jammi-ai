@@ -20,6 +20,7 @@ resolves the format) before any channel I/O, so no server is contacted.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -27,6 +28,8 @@ import pytest
 import jammi
 from jammi._assembly import _FILE_FORMAT
 from jammi._generated.jammi.v1 import catalog_pb2
+
+REPO = Path(__file__).resolve().parents[3]
 
 
 def test_file_format_vocabulary_covers_every_wire_token_including_both_jsonl_spellings():
@@ -110,6 +113,16 @@ def test_a_database_url_is_sent_as_its_database_kind_with_the_url_verbatim(url, 
     assert sent.connection.url == url
     assert sent.connection.format == catalog_pb2.FileFormat.FILE_FORMAT_UNSPECIFIED
     assert sent.connection.tenant_column == "org"
+
+
+def test_a_database_ca_certificate_is_sent_as_its_pem():
+    """The CA a database's server is verified against crosses as the PEM text
+    the caller holds; an unset one crosses as absent."""
+    pem = (REPO / "tests" / "fixtures" / "isrg-root-x1.pem").read_text()
+    sent = _sent("mysql://reader:pw@db.internal:3306/registry", ca_certificate=pem)
+    assert sent.connection.ca_certificate == pem
+    unset = _sent("mysql://reader:pw@db.internal:3306/registry")
+    assert not unset.connection.HasField("ca_certificate")
 
 
 def test_a_file_url_is_sent_as_a_file_in_its_format():

@@ -105,8 +105,28 @@ out: `postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`
 `prefer` (the default, as in libpq), `require`, `verify-ca` or `verify-full`.
 
 A MySQL URL is `mysql://user:password@host:port/database`, and must name its database.
-Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`; a server
-with no TLS — a local development instance — is reached with `sslmode=disabled`.
+Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`. `required`
+verifies the server's certificate and the host it names; `preferred` encrypts without
+verifying either; a server with no TLS — a local development instance — is reached with
+`sslmode=disabled`.
+
+### A server certificate the engine's host does not trust
+
+A database whose certificate a private CA signed — a managed database's own CA, or a
+self-hosted server's — is verified against that CA when the source holds it: pass the
+CA's PEM text, not a path, so a remote client hands it over the same way the embedded
+engine takes it.
+
+```python
+ca = open("private-ca.pem").read()
+db.add_source("orders", url="mysql://reader:secret@orders.internal:3306/shop", ca_certificate=ca)
+```
+
+A source holding a CA connects with a mode that verifies the server: `required` for
+MySQL, `verify-full` for Postgres when the URL names no mode. A URL naming a mode that
+does not verify (`preferred`, `disabled`, `prefer`, `require`, `disable`) is refused with
+the CA, as is a Postgres URL that also names its own `sslrootcert`, a path on the engine's
+host. A file source takes no CA.
 
 ## What runs in the database
 

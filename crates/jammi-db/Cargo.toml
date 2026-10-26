@@ -93,6 +93,9 @@ bytes = "1"
 # tempfile is needed by storage::sidecar_layout to bridge USearch's
 # path-based FFI into object_store's byte-stream API for cloud schemes.
 tempfile = "3"
+# Mints the certificate authority and server certificate the live TLS tests
+# serve a database with.
+rcgen = "0.14"
 
 # Config
 serde.workspace = true
@@ -123,6 +126,8 @@ thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
 url.workspace = true
+# Reads a database source's CA certificate from the PEM a client sends.
+rustls-pki-types.workspace = true
 percent-encoding = "2"
 async-trait.workspace = true
 

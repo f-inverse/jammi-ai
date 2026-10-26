@@ -1001,10 +1001,10 @@ mod from_record_tests {
 /// A training set is not read this way: its handle, [`TrainingSetTable`],
 /// reads through [`TrainingSetTable::scan`] alone (this minter is what that
 /// scan resolves its relation through, inside this module). Two relation
-/// shapes are NOT this minter's: a source-side federation relation
-/// (`"{source_id}".public."{table}"`) and a `FROM "{backing}"` read of a
-/// caller-named backing table — neither is a session-registered result
-/// table.
+/// shapes are NOT this minter's: a source's own table
+/// ([`crate::source::SourceTable`], `"{source}"."{schema}"."{table}"`) and a
+/// `FROM "{backing}"` read of a caller-named backing table — neither is a
+/// session-registered result table.
 pub fn result_table_relation(table_name: &str) -> RelationKey {
     RelationKey(format!("jammi.{table_name}"))
 }

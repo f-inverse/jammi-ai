@@ -667,7 +667,7 @@ async fn fine_tune_job_creates_and_trains_from_a_training_set_table() {
             // order would name a table it does not describe.
             assert_eq!(
                 source,
-                r#"SELECT "text_a", "text_b", "score" FROM "training".public."training_pairs""#
+                r#"SELECT "text_a", "text_b", "score" FROM "training"."public"."training_pairs""#
             );
             assert_eq!(columns, parity_columns());
             assert_eq!(task, ModelTask::TextEmbedding);
@@ -1169,7 +1169,8 @@ async fn recompute_re_anchors_every_recorded_relation() {
 
     let columns = parity_columns();
     let source_sql =
-        r#"SELECT "text_a", "text_b", "score" FROM "training".public."training_pairs""#.to_string();
+        r#"SELECT "text_a", "text_b", "score" FROM "training"."public"."training_pairs""#
+            .to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let spec = TrainingSetSpec {
         source_id: "training",

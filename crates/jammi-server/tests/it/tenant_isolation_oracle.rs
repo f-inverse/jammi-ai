@@ -1848,35 +1848,65 @@ async fn assert_lexical_isolated() {
     );
 }
 
-/// `asof_join` resolves its two input relations through the tenant-scoped source
-/// catalog: a peer cannot resolve a tenant's registered source, so it cannot
-/// point either side of the join at that source. This drives the real source
-/// resolution gate — `get_source` / `list_sources` are tenant-filtered.
+/// Source resolution is tenant-scoped on every path a verb or a query takes:
+/// tenant A's private source resolves for A, and for tenant B — or a caller
+/// that names no tenant — it is not found by its table listing, by name in
+/// SQL, nor among the catalogs `information_schema` lists. The source holds
+/// no tenant column, so nothing but resolution stands between B and its rows.
 async fn assert_source_resolver_isolated() {
-    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
-    cat_a
-        .register_source("asof_src_a", SourceType::File, &parquet_connection())
+    let dir = tempdir().unwrap();
+    let session = JammiSession::new(test_config(dir.path())).await.unwrap();
+    let session = &session;
+    session
+        .with_tenant_scoped(tenant_a(), |_| async move {
+            session
+                .add_source("asof_src_a", SourceType::File, parquet_connection())
+                .await
+        })
         .await
         .unwrap();
-    assert!(
-        cat_a.get_source("asof_src_a").await.unwrap().is_some(),
-        "tenant A must resolve its own asof_join input source"
-    );
-    assert!(
-        cat_b.get_source("asof_src_a").await.unwrap().is_none(),
-        "CROSS-TENANT LEAK: tenant B resolved tenant A's source to asof-join against it"
-    );
-    let b_ids: Vec<String> = cat_b
-        .list_sources()
+    let query = "SELECT COUNT(*) AS n FROM asof_src_a.public.patents";
+    session
+        .with_tenant_scoped(tenant_a(), |scope| async move { scope.sql(query).await })
         .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.source_id)
-        .collect();
-    assert!(
-        !b_ids.contains(&"asof_src_a".to_string()),
-        "CROSS-TENANT READ LEAK: tenant B lists tenant A's asof_join source: {b_ids:?}"
-    );
+        .expect("tenant A reads its own source");
+
+    let tables = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || session.source_tables("asof_src_a"))
+            .await
+    };
+    let rows = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || session.sql(query))
+            .await
+    };
+    let catalogs = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || async {
+                session.context().state().catalog_list().catalog_names()
+            })
+            .await
+    };
+    assert!(tables(Some(tenant_a())).await.is_ok());
+    assert!(catalogs(Some(tenant_a()))
+        .await
+        .contains(&"asof_src_a".to_string()));
+    for (who, tenant) in [("tenant B", Some(tenant_b())), ("an unscoped caller", None)] {
+        let err = tables(tenant).await.expect_err(who);
+        assert_eq!(
+            err.class(),
+            jammi_db::error::ErrorClass::NotFound,
+            "CROSS-TENANT LEAK: {who} resolved tenant A's source: {err}"
+        );
+        rows(tenant).await.expect_err(&format!(
+            "CROSS-TENANT READ LEAK: {who} read tenant A's source by name"
+        ));
+        assert!(
+            !catalogs(tenant).await.contains(&"asof_src_a".to_string()),
+            "CROSS-TENANT LEAK: {who} lists tenant A's source"
+        );
+    }
 }
 
 /// `verify_materialization` recomputes the stored Parquet digest and checks it

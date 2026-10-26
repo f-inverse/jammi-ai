@@ -147,6 +147,20 @@ impl TenantBinding {
         self.current().tenant()
     }
 
+    /// Whether what `owner` owns is visible to a call entering now
+    /// ([`Self::visible`] under this binding's tenant).
+    pub fn sees(&self, owner: Option<TenantId>) -> bool {
+        Self::visible(owner, self.current_tenant())
+    }
+
+    /// Whether what `owner` owns is visible to a call scoped to `tenant`: all
+    /// of it in an admin scope, a global resource (`owner` `None`) always, a
+    /// tenant's own to that tenant — the `tenant_id = $current OR tenant_id
+    /// IS NULL` every tenant-scoped read applies.
+    pub fn visible(owner: Option<TenantId>, tenant: Option<TenantId>) -> bool {
+        Self::is_admin_scope() || owner.is_none() || owner == tenant
+    }
+
     /// Bind `ctx` as the session's tenant: what a call enters with when no
     /// task-local override is installed. Has no effect on a call already
     /// inside a scope, nor on a query already planned.
@@ -604,9 +618,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule()
-            .analyze(plan, &scoped(tenant_a()))
-            .unwrap();
+        let out = rule().analyze(plan, &scoped(tenant_a())).unwrap();
 
         let predicate = first_predicate_above_scan(&out);
         assert_or_eq_isnull(&predicate, "tenant_id", tenant_a());
@@ -631,9 +643,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule()
-            .analyze(plan, &scoped(tenant_a()))
-            .unwrap();
+        let out = rule().analyze(plan, &scoped(tenant_a())).unwrap();
 
         assert_eq!(
             count_tenant_filters_over(&out, "sources"),
@@ -669,9 +679,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule()
-            .analyze(outer, &scoped(tenant_a()))
-            .unwrap();
+        let out = rule().analyze(outer, &scoped(tenant_a())).unwrap();
 
         // Both `sources` (inside the subquery alias) and `models` (outer scan)
         // must have one tenant filter each.
@@ -690,9 +698,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule()
-            .analyze(plan, &scoped(tenant_a()))
-            .unwrap();
+        let out = rule().analyze(plan, &scoped(tenant_a())).unwrap();
 
         // Top-level node is still an Aggregate.
         let agg = match &out {
@@ -722,9 +728,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let out = rule()
-            .analyze(plan, &unscoped())
-            .unwrap();
+        let out = rule().analyze(plan, &unscoped()).unwrap();
 
         let predicate = first_predicate_above_scan(&out);
         assert_isnull_only(&predicate, "tenant_id");
@@ -765,14 +769,15 @@ mod tests {
     #[test]
     fn sql_cannot_set_the_tenant_scope() {
         let mut options = scoped(tenant_a());
-        let err = options
-            .set("jammi_tenant.context", "Unscoped")
-            .unwrap_err();
+        let err = options.set("jammi_tenant.context", "Unscoped").unwrap_err();
         assert!(err.to_string().contains("SQL cannot set"), "{err}");
         assert_eq!(
             TenantConfig::of(&options).unwrap(),
             TenantConfig::new(TenantContext::Scoped(tenant_a()))
         );
-        assert!(options.entries().iter().all(|e| !e.key.starts_with("jammi_tenant")));
+        assert!(options
+            .entries()
+            .iter()
+            .all(|e| !e.key.starts_with("jammi_tenant")));
     }
 }

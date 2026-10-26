@@ -34,7 +34,9 @@ use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::store::statement::{MaterializationPlanner, StatementClass};
 use crate::tenant::{TenantContext, TenantId};
-use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantConfig, TenantScopeAnalyzerRule};
+use crate::tenant_scope::{
+    SourceTenantColumns, TenantBinding, TenantConfig, TenantScopeAnalyzerRule,
+};
 use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, TriggerBroker};
 
 /// Primary entry point for the Jammi query engine.
@@ -472,10 +474,10 @@ impl JammiSession {
     /// from the row.
     async fn preload_sources(&self) -> Result<()> {
         for record in self.catalog.list_all_sources().await? {
-            let source_id = record.source_id.clone();
+            let (source_id, owner) = (record.source_id.clone(), record.owner);
             if let Err(e) = self
                 .sources
-                .adopt(&source_id, record.into_definition())
+                .adopt(&source_id, record.into_definition(), owner)
                 .await
             {
                 tracing::warn!(source_id = %source_id, "Failed to build source at startup: {e}");
@@ -556,7 +558,12 @@ impl JammiSession {
                 &definition.connection,
             )
             .await?;
-        self.sources.admit(source_id, definition, built.tables);
+        self.sources.admit(
+            source_id,
+            definition,
+            self.catalog.current_tenant(),
+            built.tables,
+        );
 
         Ok(())
     }
@@ -1308,12 +1315,13 @@ impl QueryPlanner for JammiQueryPlanner {
 /// [`RowRewritePlanner`], and, in a build that carries a database source,
 /// federation's ([`crate::federation::RemotePlanner`]).
 fn extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-        vec![Arc::new(MaterializationPlanner), Arc::new(RowRewritePlanner)];
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+        Arc::new(MaterializationPlanner),
+        Arc::new(RowRewritePlanner),
+    ];
     #[cfg(any(feature = "postgres", feature = "mysql"))]
-    let planners = std::iter::once(
-        Arc::new(crate::federation::RemotePlanner::new()) as Arc<dyn ExtensionPlanner + Send + Sync>
-    )
+    let planners = std::iter::once(Arc::new(crate::federation::RemotePlanner::new())
+        as Arc<dyn ExtensionPlanner + Send + Sync>)
     .chain(planners)
     .collect();
     planners

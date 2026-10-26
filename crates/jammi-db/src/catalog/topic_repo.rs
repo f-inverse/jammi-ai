@@ -298,7 +298,7 @@ struct RawTopicRow {
     topic_id: String,
     name: String,
     schema_json: String,
-    tenant_id: Option<String>,
+    tenant_id: Option<TenantId>,
     backing_table: String,
 }
 
@@ -316,17 +316,11 @@ fn materialize_topic(raw: RawTopicRow) -> Result<TopicDefinition, TriggerError> 
     let id = TopicId::from_str(&raw.topic_id)
         .map_err(|e| TriggerError::Catalog(format!("topic_id parse: {e}")))?;
     let schema = Arc::new(decode_schema_json(&raw.schema_json)?);
-    let tenant = match raw.tenant_id {
-        Some(s) => Some(
-            TenantId::from_str(&s).map_err(|e| TriggerError::Catalog(format!("tenant: {e}")))?,
-        ),
-        None => None,
-    };
     Ok(TopicDefinition {
         id,
         name: raw.name,
         schema,
-        tenant,
+        tenant: raw.tenant_id,
     })
 }
 

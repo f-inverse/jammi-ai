@@ -40,10 +40,15 @@
 //! never the catalog: they serve `information_schema` and diagnostics, not
 //! name resolution.
 //!
-//! Tenant scope does not enter here: provider resolution is tenant-agnostic
-//! (a source's row is read across tenants, exactly as the startup preload
-//! lists them), and tenant isolation is enforced on the rows a scan returns
-//! by the analyzer, not by which providers resolve.
+//! A source resolves only where the caller's scope sees its row — its
+//! owner's tenant, every tenant for a global source, any in an admin scope
+//! ([`crate::tenant_scope::TenantBinding::sees`]) — so another tenant's
+//! source is not found by name, exactly as `list_sources` omits it. A row
+//! that exists but is not visible is not-found to that caller and leaves the
+//! owner's providers cached; a row that is gone evicts them. The cache keeps
+//! each source's owner, and the synchronous listings report only what the
+//! caller sees. The startup preload builds every source across tenants;
+//! which a caller may resolve is decided at resolution, never at build.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,7 +64,8 @@ use super::{table_name_from_url, SourceDefinition, SourceTable, SourceType};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageRegistry, StorageUrl};
-use crate::tenant_scope::SourceTenantColumns;
+use crate::tenant::TenantId;
+use crate::tenant_scope::{SourceTenantColumns, TenantBinding};
 
 /// A source's DataFusion table providers, each keyed by the table it serves,
 /// in the source's order ([`SourceTable::order_key`]).
@@ -84,6 +90,8 @@ pub(crate) struct BuiltSource {
 /// they were built from — the cache entry a resolution revalidates against.
 pub(crate) struct ResolvedSource {
     definition: SourceDefinition,
+    /// The tenant that owns the source, or `None` for a global one.
+    owner: Option<TenantId>,
     tables: SourceTables,
 }
 
@@ -168,15 +176,31 @@ impl SourceRegistry {
         }
     }
 
-    /// Resolve `source_id` from its catalog row: the cached providers when
-    /// the row still carries the definition they were built from, freshly
-    /// built ones when it does not, and [`JammiError::NotFound`] —
-    /// after evicting whatever was cached — when there is no row.
+    /// Resolve `source_id` from its catalog row as the caller's scope sees
+    /// it: the cached providers when the row still carries the definition
+    /// they were built from, freshly built ones when it does not, and
+    /// [`JammiError::NotFound`] when the caller sees no row — after evicting
+    /// whatever was cached, when no tenant does.
     pub(crate) async fn resolve(&self, source_id: &str) -> Result<Arc<ResolvedSource>> {
-        match self.catalog.get_source_across_tenants(source_id).await? {
-            Some(record) => self.adopt(source_id, record.into_definition()).await,
+        let visible = if TenantBinding::is_admin_scope() {
+            self.catalog.get_source_across_tenants(source_id).await?
+        } else {
+            self.catalog.get_source(source_id).await?
+        };
+        match visible {
+            Some(record) => {
+                let owner = record.owner;
+                self.adopt(source_id, record.into_definition(), owner).await
+            }
             None => {
-                self.evict(source_id);
+                if self
+                    .catalog
+                    .get_source_across_tenants(source_id)
+                    .await?
+                    .is_none()
+                {
+                    self.evict(source_id);
+                }
                 Err(JammiError::NotFound(Missing::Source {
                     source_id: source_id.into(),
                 }))
@@ -192,6 +216,7 @@ impl SourceRegistry {
         &self,
         source_id: &str,
         definition: SourceDefinition,
+        owner: Option<TenantId>,
     ) -> Result<Arc<ResolvedSource>> {
         if let Some(hit) = self.cached_for(source_id, &definition) {
             return Ok(hit);
@@ -201,7 +226,7 @@ impl SourceRegistry {
             return Ok(hit);
         }
         let built = self.build(source_id, &definition).await?;
-        Ok(self.admit(source_id, definition, built.tables))
+        Ok(self.admit(source_id, definition, owner, built.tables))
     }
 
     /// Build the DataFusion table providers for `definition` — the ONE
@@ -292,12 +317,14 @@ impl SourceRegistry {
         &self,
         source_id: &str,
         definition: SourceDefinition,
+        owner: Option<TenantId>,
         tables: SourceTables,
     ) -> Arc<ResolvedSource> {
         self.tenant_columns
             .set(source_id, definition.connection.tenant_column.clone());
         let resolved = Arc::new(ResolvedSource {
             definition,
+            owner,
             tables: ordered(tables),
         });
         self.cached
@@ -313,22 +340,39 @@ impl SourceRegistry {
         self.cached.write().remove(source_id);
     }
 
-    /// The source ids this process currently holds providers for.
+    /// The source ids this process holds providers for that the caller's
+    /// scope sees.
     pub(crate) fn cached_ids(&self) -> Vec<String> {
-        self.cached.read().keys().cloned().collect()
+        self.cached
+            .read()
+            .iter()
+            .filter(|(_, resolved)| self.catalog.sees(resolved.owner))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
+    /// The providers held for `source_id`, when the caller's scope sees it.
     fn cached(&self, source_id: &str) -> Option<Arc<ResolvedSource>> {
-        self.cached.read().get(source_id).cloned()
+        self.cached
+            .read()
+            .get(source_id)
+            .filter(|resolved| self.catalog.sees(resolved.owner))
+            .cloned()
     }
 
+    /// The providers held for `source_id` when they were built from
+    /// `definition` — whoever the caller is: which caller may resolve the
+    /// source was decided before its providers are asked for.
     fn cached_for(
         &self,
         source_id: &str,
         definition: &SourceDefinition,
     ) -> Option<Arc<ResolvedSource>> {
-        self.cached(source_id)
+        self.cached
+            .read()
+            .get(source_id)
             .filter(|resolved| resolved.definition == *definition)
+            .cloned()
     }
 }
 

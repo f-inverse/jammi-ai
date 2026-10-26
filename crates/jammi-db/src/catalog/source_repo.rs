@@ -1,5 +1,6 @@
 use crate::error::{JammiError, Result};
 use crate::source::{SourceConnection, SourceDefinition, SourceType};
+use crate::tenant::TenantId;
 
 use super::backend::{SqlValue, TxOptions};
 use super::result_repo::ResultTableRecord;
@@ -44,6 +45,9 @@ pub struct SourceRecord {
     pub created_at: String,
     /// ISO-8601 timestamp of last update.
     pub updated_at: String,
+    /// The tenant that owns the source, or `None` for a global one, which
+    /// every tenant reads.
+    pub owner: Option<TenantId>,
 }
 
 impl SourceRecord {
@@ -117,7 +121,7 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT source_id, source_type, options, schema_json, \
-                                'active' AS status, created_at, updated_at \
+                                'active' AS status, created_at, updated_at, tenant_id \
                              FROM sources WHERE source_id = $1 \
                                AND (tenant_id = $2 OR tenant_id IS NULL)",
                             &[
@@ -148,7 +152,7 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query(
                             "SELECT source_id, source_type, options, schema_json, \
-                                'active' AS status, created_at, updated_at \
+                                'active' AS status, created_at, updated_at, tenant_id \
                              FROM sources \
                              WHERE tenant_id = $1 OR tenant_id IS NULL \
                              ORDER BY created_at",
@@ -180,7 +184,7 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT source_id, source_type, options, schema_json, \
-                                'active' AS status, created_at, updated_at \
+                                'active' AS status, created_at, updated_at, tenant_id \
                              FROM sources WHERE source_id = $1",
                             &[SqlValue::TextOwned(sid)],
                             read_source_row,
@@ -210,7 +214,7 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query(
                             "SELECT source_id, source_type, options, schema_json, \
-                                'active' AS status, created_at, updated_at \
+                                'active' AS status, created_at, updated_at, tenant_id \
                              FROM sources \
                              ORDER BY created_at",
                             &[],
@@ -307,6 +311,7 @@ struct RawSourceRow {
     status: String,
     created_at: String,
     updated_at: String,
+    tenant_id: Option<TenantId>,
 }
 
 fn read_source_row(
@@ -320,6 +325,7 @@ fn read_source_row(
         status: row.get("status")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        tenant_id: row.try_get("tenant_id")?,
     })
 }
 
@@ -342,5 +348,6 @@ fn parse_source_row(raw: RawSourceRow) -> Result<SourceRecord> {
         status: raw.status,
         created_at: raw.created_at,
         updated_at: raw.updated_at,
+        owner: raw.tenant_id,
     })
 }

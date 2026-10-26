@@ -885,6 +885,7 @@ impl_from_sql_text!(super::status::JobKinds);
 impl_from_sql_text!(super::status::JobPhase);
 impl_from_sql_text!(super::status::JobExecution);
 impl_from_sql_text!(super::jobs_repo::WorkerState);
+impl_from_sql_text!(crate::tenant::TenantId);
 
 impl FromSqlValue for uuid::Uuid {
     fn from_sqlite_row(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Self, BackendError> {

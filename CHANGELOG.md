@@ -225,6 +225,11 @@ The dependency audit is green again on the live advisory database, and database 
   the address and the cause; a reachable database leaves the query waiting on a busy pool.
   Every Postgres read runs through one path that keeps that error typed, where the driver's
   flattened it to text.
+- **A tenant reaches only the sources it sees, by name as by listing.** A source resolved from
+  its catalog row whichever tenant owned it, so a tenant, or a request naming none, that named
+  another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
+  owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
+  the catalogs a query sees and `information_schema` list the same set.
 - **A mutable table has no chunk size.** `MutableTableDefinition.chunk_size`, its builder
   method, `MutableTableDefinition.chunk_size` on the wire and the Python `chunk_size=` argument
   set a value no read consulted: `scan_after` returns its rows whole and a trigger replay steps

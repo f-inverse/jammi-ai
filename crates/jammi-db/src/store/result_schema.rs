@@ -143,7 +143,7 @@ impl ResultTableSchemaProvider {
             .read()
             .map_err(|e| DataFusionError::Internal(format!("result-table schema lock: {e}")))?;
         Ok(match guard.get(name) {
-            Some(entry) if self.visible(entry.owner) => Some(entry.binding.clone()),
+            Some(entry) if self.binding.sees(entry.owner) => Some(entry.binding.clone()),
             // Present-but-invisible resolves the same not-found as absent, so a
             // peer's private result table is indistinguishable from one that
             // was never created.
@@ -241,15 +241,6 @@ impl ResultTableSchemaProvider {
             .expect("result-table schema lock poisoned")
             .clear();
     }
-
-    /// Whether a table owned by `owner` is visible to the current scope — the
-    /// same `(tenant_id = $current OR tenant_id IS NULL)` + admin-scope bypass
-    /// [`crate::catalog::Catalog::get_result_table`] applies: an admin scan
-    /// sees everything, a GLOBAL (`owner = None`) table is visible to all, and
-    /// a tenant-owned table is visible only to that tenant.
-    fn visible(&self, owner: Option<TenantId>) -> bool {
-        TenantBinding::is_admin_scope() || owner.is_none() || owner == self.binding.current_tenant()
-    }
 }
 
 #[async_trait]
@@ -258,7 +249,7 @@ impl SchemaProvider for ResultTableSchemaProvider {
         match self.tables.read() {
             Ok(guard) => guard
                 .iter()
-                .filter(|(_, e)| self.visible(e.owner))
+                .filter(|(_, e)| self.binding.sees(e.owner))
                 .map(|(name, _)| name.clone())
                 .collect(),
             Err(e) => {
@@ -277,7 +268,7 @@ impl SchemaProvider for ResultTableSchemaProvider {
         match self.tables.read() {
             Ok(guard) => guard
                 .get(name)
-                .map(|e| self.visible(e.owner))
+                .map(|e| self.binding.sees(e.owner))
                 .unwrap_or(false),
             Err(e) => {
                 tracing::error!("result-table schema lock poisoned in table_exist: {e}");

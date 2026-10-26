@@ -120,9 +120,7 @@ async fn serve_assembled(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("serve");
     });
@@ -182,8 +180,7 @@ async fn downstream_mounts_a_service_beside_the_engine_and_both_answer() {
         "the mounted service saw the stamped session id alongside the bearer"
     );
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// A chain assembled with nothing mounted answers `UNIMPLEMENTED` for a
@@ -206,8 +203,7 @@ async fn an_unmounted_service_answers_unimplemented() {
         "an unmounted service answers UNIMPLEMENTED, got: {err:?}"
     );
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// `with_bearer` is fallible: a non-ASCII token cannot
@@ -231,8 +227,7 @@ async fn with_bearer_rejects_a_non_ascii_token() {
         Ok(_) => panic!("a non-ascii bearer must be rejected, not silently accepted"),
     }
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// The single-listener `into_axum_router` path: assemble, mount the
@@ -284,9 +279,7 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .with_graceful_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("axum serve");
     });
@@ -313,8 +306,7 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
     // Keep the worker guard (if any) alive until after serving, per the contract.
     let _keep = parts.worker;
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// Wrap a proto-encoded payload in a single gRPC-Web data frame: 1 flag byte
@@ -433,9 +425,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .with_graceful_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("axum serve");
     });
@@ -502,8 +492,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
     // Hold the worker guard (if any) alive until after serving, per the contract.
     let _keep = parts.worker;
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +799,5 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
         "an invalid credential on the Flight lane must be Unauthenticated, got {flight_err:?}"
     );
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }

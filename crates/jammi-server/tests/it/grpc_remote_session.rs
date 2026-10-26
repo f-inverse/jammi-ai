@@ -234,8 +234,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         "remote and local agree on the failure variant after removal"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Lexical search over the wire returns the rows a local `Session` returns —
@@ -295,8 +294,7 @@ async fn remote_lexical_search_ranks_like_local() {
     );
     assert_eq!(remote_rows, local_rows);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `add_source` over the wire, proven interchangeable with a local `Session`. The
@@ -387,8 +385,7 @@ async fn remote_add_source_round_trips_like_local() {
         "remote carries the same add_source failure message the engine produced"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// THE error-parity proof. A search against a source that has no ready
@@ -445,8 +442,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
         "the refusal names the verb that builds the index: {remote_err}"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Error-parity, second distinct variant on THIS surface. `encode_query` runs
@@ -509,8 +505,7 @@ async fn remote_reconstructs_a_model_error_from_an_inference_failure() {
         other => panic!("expected a faithful Model error from both transports, got {other:?}"),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Tenant trio over the wire: a `bind_tenant` (now async) followed by a
@@ -543,8 +538,7 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
         "after unbind the tenant is cleared"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Parity: the remote `CatalogService.Reconcile` and a local
@@ -769,8 +763,7 @@ async fn remote_reconcile_reports_like_local() {
          {remote_report_all:?}"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// The denied-by-default oracle: a server that never wires an
@@ -803,8 +796,7 @@ async fn remote_reconcile_all_is_denied_by_default_without_an_authorizer() {
         .await
         .expect("all=false never consults the admin authorizer");
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Topics over the wire: the data-plane client registers a topic, publishes a
@@ -874,8 +866,7 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
         "the dropped topic is gone on both transports"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Subscribe streaming over the wire. The data-plane client opens a server-streaming
@@ -937,8 +928,7 @@ async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
     // awaiting `server.handle` with a live stream would hang the test.
     drop(remote_stream);
     drop(local_stream);
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Trigger error parity. A subscribe predicate that references a column the
@@ -996,8 +986,7 @@ async fn remote_reconstructs_the_exact_trigger_error_variant_local_returns() {
         ),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Audit over the wire: the data-plane client (tenant-bound) logs a record, fetches
@@ -1070,8 +1059,7 @@ async fn remote_round_trips_audit_log_and_fetch_like_local() {
         "fetch_recent includes the logged record"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Audit error parity. An audit log on an UNSCOPED session fails inside the
@@ -1122,8 +1110,7 @@ async fn remote_reconstructs_the_exact_audit_error_variant_local_returns() {
         ),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// The two front doors run the same verb interchangeably. `DataClient::connect`
@@ -1196,8 +1183,7 @@ async fn front_doors_run_the_same_verb_over_either_transport() {
          vector shape the data-plane client does — same surface, either transport"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Offset 0 — the replay-from-earliest starting point for the subscribe tests.

@@ -292,8 +292,7 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
         );
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `encode_query`'s TWO-COMPUTE form on GPU: remote and local each run an
@@ -357,6 +356,5 @@ async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated()
         if bitwise_equal { "matched" } else { "diverged" }
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

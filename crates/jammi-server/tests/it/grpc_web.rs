@@ -322,8 +322,7 @@ async fn grpc_web_set_tenant_round_trip() {
         "session store must reflect the gRPC-Web SetTenant call"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 /// A detail-bearing engine error returned by a unary handler MUST reach a
@@ -461,6 +460,5 @@ async fn grpc_web_error_carries_in_body_trailer_with_detail() {
         ),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

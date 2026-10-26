@@ -192,8 +192,7 @@ async fn build_propagate_assemble_over_the_wire() {
         "context_size matches the member count"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -281,8 +280,7 @@ async fn recompute_over_the_wire_replays_a_derived_table() {
         );
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -390,6 +388,5 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
         "TENANT_B cannot resolve TENANT_A's source — assemble_context is rejected"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

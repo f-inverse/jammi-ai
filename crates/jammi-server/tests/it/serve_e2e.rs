@@ -149,9 +149,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_task = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
     });
 

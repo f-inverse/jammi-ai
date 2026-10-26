@@ -490,7 +490,7 @@ impl ChaosRank {
             return Ok(());
         }
         if let Some(tell) = self.tell.lock().unwrap().take() {
-            let _ = tell.send(());
+            tell.send(()).expect("the test waits to be told");
         }
         let resume = self
             .resume

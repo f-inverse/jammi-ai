@@ -132,10 +132,11 @@ async fn ring_empty_fallback_is_registered_and_scraped_on_metrics() {
         .unwrap()
         .expect("one segment exists");
     let query = jammi_test_utils::vq(&[1.0, 0.0, 0.0, 0.0]);
-    let _ = placed
+    let hits = placed
         .search_final_placed(&query, 1, 1, &jammi_db::index::Admission::Every)
         .await
         .expect("an all-local fallback plan still searches this process's own segment");
+    assert_eq!(hits.len(), 1, "the one row the segment holds: {hits:?}");
 
     let after = scrape_bare_counter(server.health_addr, "jammi_placement_ring_empty_total")
         .await
@@ -146,6 +147,5 @@ async fn ring_empty_fallback_is_registered_and_scraped_on_metrics() {
     );
 
     table.abort().await.unwrap();
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

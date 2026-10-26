@@ -61,17 +61,10 @@ fn env_lock() -> &'static Mutex<()> {
 struct Fixture {
     addr: SocketAddr,
     engine: Arc<InferenceSession>,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Dropped with the fixture, which stops its server ([`super::common::grpc::stopped`]).
+    _shutdown: oneshot::Sender<()>,
     _dir: TempDir,
     _handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-    }
 }
 
 async fn start_fixture() -> Fixture {
@@ -105,7 +98,7 @@ async fn start_fixture() -> Fixture {
     Fixture {
         addr,
         engine,
-        shutdown: Some(shutdown_tx),
+        _shutdown: shutdown_tx,
         _dir: dir,
         _handle: handle,
     }

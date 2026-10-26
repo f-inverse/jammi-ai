@@ -208,6 +208,5 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
         "hits must be ordered by descending score, got {hits:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }

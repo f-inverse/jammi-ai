@@ -133,9 +133,7 @@ async fn graceful_shutdown_completes_cleanly() {
 
     // Oneshot channel acts as our shutdown trigger.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown = async move {
-        let _ = rx.await;
-    };
+    let shutdown = crate::common::grpc::stopped(rx);
 
     let app = jammi_server::build_router();
     let server_handle = tokio::spawn(async move {

@@ -215,8 +215,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
         "query vector must be L2-normalized, got norm={norm}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -290,8 +289,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
         "query vector must be L2-normalized, got norm={norm}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 /// Register the synthetic corpus and embed it (AUDIO modality). Shared setup
@@ -380,8 +378,7 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
         "hits must be ordered by descending score, got {hits:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -410,8 +407,7 @@ async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
     assert_eq!(hits.len(), 3, "k=3 over a three-row corpus");
     assert_eq!(hits[0].0, "clip_2", "the query row ranks first");
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -474,8 +470,7 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
         assert_eq!(clip_id, key, "projected clip_id must equal the row key");
     }
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -507,8 +502,7 @@ async fn remove_source_drops_the_source_over_the_wire() {
         .await
         .expect_err("search against a removed source must fail: the source no longer resolves");
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -530,8 +524,7 @@ async fn search_requires_a_query_over_the_wire() {
         .expect_err("a search with no query must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -553,8 +546,7 @@ async fn generate_embeddings_rejects_unspecified_modality() {
         .expect_err("unspecified modality must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -586,8 +578,7 @@ async fn encode_query_rejects_input_modality_mismatch() {
         .expect_err("audio modality with text input must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -610,8 +601,7 @@ async fn catalog_service_rejects_unspecified_source_kind() {
         .expect_err("unspecified source kind must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 /// The `_row_id` keys the imported vectors are keyed by — the values a
@@ -781,8 +771,7 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
         "the query row is its own nearest neighbor, hydrated with its source's column"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -806,8 +795,7 @@ async fn import_embeddings_rejects_dimension_mismatch_over_the_wire() {
         .expect_err("a width mismatch must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -830,8 +818,7 @@ async fn import_embeddings_requires_core_fields_over_the_wire() {
         .expect_err("dimensions must be > 0");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -850,6 +837,5 @@ async fn encode_query_rejects_empty_data() {
         .expect_err("empty data must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }

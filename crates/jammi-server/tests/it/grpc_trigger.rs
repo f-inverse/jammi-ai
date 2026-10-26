@@ -149,21 +149,10 @@ impl TopicSeed {
 struct ServerFixture {
     addr: SocketAddr,
     _store: SessionStore,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Dropped with the fixture, which stops its server ([`super::common::grpc::stopped`]).
+    _shutdown: oneshot::Sender<()>,
     _dir: TempDir,
     _handle: JoinHandle<()>,
-}
-
-impl Drop for ServerFixture {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            // The receiver may already have been dropped if the server
-            // task exited on its own; either way, we don't care about
-            // the result — we just want the signal sent before the
-            // listener address is freed.
-            let _ = tx.send(());
-        }
-    }
 }
 
 /// Spin up an in-process gRPC server hosting the control plane +
@@ -230,7 +219,7 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
     ServerFixture {
         addr,
         _store: store,
-        shutdown: Some(shutdown_tx),
+        _shutdown: shutdown_tx,
         _dir: dir,
         _handle: handle,
     }

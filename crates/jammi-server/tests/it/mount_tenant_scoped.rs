@@ -175,9 +175,7 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("serve");
     });
@@ -200,8 +198,7 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
         "a resolved Tenant scope must bind SessionTenant(Some(tenant))"
     );
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// Rejection path: a `mount_tenant_scoped` service's handler is NOT called
@@ -227,9 +224,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
     let (tx_scoped, rx_scoped) = oneshot::channel::<()>();
     let h_scoped = tokio::spawn(async move {
         bound_scoped
-            .serve_with_shutdown(async move {
-                let _ = rx_scoped.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(rx_scoped))
             .await
             .expect("serve");
     });
@@ -243,8 +238,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
         "the rejection must surface the resolver's status, got {err:?}"
     );
 
-    let _ = tx_scoped.send(());
-    let _ = h_scoped.await;
+    crate::common::grpc::stop(tx_scoped, h_scoped).await;
 
     // The plain-`mount` listener: the IDENTICAL rejecting credential must NOT
     // stop the handler — `mount` is un-gated by the resolver entirely.
@@ -261,9 +255,7 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
     let (tx_plain, rx_plain) = oneshot::channel::<()>();
     let h_plain = tokio::spawn(async move {
         bound_plain
-            .serve_with_shutdown(async move {
-                let _ = rx_plain.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(rx_plain))
             .await
             .expect("serve");
     });
@@ -276,6 +268,5 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
         "a plain-mounted service must never observe a SessionTenant extension"
     );
 
-    let _ = tx_plain.send(());
-    let _ = h_plain.await;
+    crate::common::grpc::stop(tx_plain, h_plain).await;
 }

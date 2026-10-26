@@ -99,10 +99,10 @@ struct Served {
 
 impl Served {
     fn drain(&self) {
-        let _ = self.drain_tx.send(true);
+        self.drain_tx.send_replace(true);
     }
     fn release(&self) {
-        let _ = self.release_tx.send(true);
+        self.release_tx.send_replace(true);
     }
     async fn finish(self, bound: Duration) -> Result<ShutdownOutcome, ServerError> {
         tokio::time::timeout(bound, self.task)
@@ -853,7 +853,7 @@ async fn bound_server_holds_the_worker_guard_when_worker_enabled() {
         let (_release_tx, release_rx) = watch::channel(false);
         let task = tokio::spawn(bound.serve_with_signals(drain_rx, release_rx));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = drain_tx.send(true);
+        drain_tx.send_replace(true);
         let outcome = tokio::time::timeout(Duration::from_secs(30), task)
             .await
             .unwrap()
@@ -1321,13 +1321,13 @@ async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
         .expect("search")
         .into_inner();
     assert_eq!(super::common::grpc::ranked(hits).len(), 5);
-    let _ = catalog
+    catalog
         .list_index_segments(ListIndexSegmentsRequest {
             table_name: table.clone(),
         })
         .await
         .expect("list_index_segments");
-    let _ = catalog
+    catalog
         .list_sources(ListSourcesRequest {})
         .await
         .expect("list_sources");

@@ -122,8 +122,8 @@ async fn healthz_flips_to_503_within_one_heartbeat_after_the_keeper_thread_dies(
     assert_eq!(body["status"], "unhealthy");
     assert_eq!(body["lease_keeper"], false);
 
-    let _ = served.drain_tx.send(true);
-    let _ = served.release_tx.send(true);
+    served.drain_tx.send_replace(true);
+    served.release_tx.send_replace(true);
     // Producer-driven oracle: the
     // keeper thread is dead, so its per-hold pass can never be confirmed to
     // have run — `release_outcome` must read that as `ReleaseDegraded`, not
@@ -194,7 +194,7 @@ async fn healthz_stays_200_while_draining() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let _ = served.drain_tx.send(true);
+    served.drain_tx.send_replace(true);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (status, body) = healthz(&served.health_addr).await;
     assert_eq!(status, 200, "{body}");
@@ -203,7 +203,7 @@ async fn healthz_stays_200_while_draining() {
     assert_eq!(ready, 503, "{body}");
     assert_eq!(body["detail"], "draining");
 
-    let _ = served.release_tx.send(true);
+    served.release_tx.send_replace(true);
     let outcome = tokio::time::timeout(Duration::from_secs(30), served.task)
         .await
         .unwrap()
@@ -225,7 +225,7 @@ async fn healthz_503_when_the_claim_loop_task_panics() {
     assert_eq!(body["claim_loop"], "failed");
     assert_eq!(body["lease_keeper"], true);
 
-    let _ = served.drain_tx.send(true);
+    served.drain_tx.send_replace(true);
     let outcome = tokio::time::timeout(Duration::from_secs(60), served.task)
         .await
         .unwrap()

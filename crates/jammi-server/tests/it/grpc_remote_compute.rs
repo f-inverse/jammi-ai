@@ -180,8 +180,7 @@ async fn remote_infer_round_trips_like_local() {
     );
     assert_batches_byte_identical(&remote_rows, &local_rows, &["_latency_ms"]);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// The approximate evaluation of the patents' most-recent table both
@@ -265,8 +264,7 @@ async fn remote_eval_round_trips_like_local() {
         other => panic!("remote and local eval_compare disagreed on success: {other:?}"),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Error parity on the eval surface: evaluating a source that has no embedding
@@ -299,8 +297,7 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
         "remote carries the same eval failure message the engine produced"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Fine-tune `start` over the wire, exercising the full request encode
@@ -420,8 +417,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     poll_until_failed(&local, &local_job).await;
     poll_until_failed(&remote, &remote_job).await;
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `fine_tune_status` on an unknown id fails inside the engine; both transports
@@ -449,8 +445,7 @@ async fn remote_fine_tune_status_reconstructs_the_exact_error_variant() {
     );
     assert_eq!(local_err.to_string(), remote_err.to_string());
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// The contrastive columns the engine detects as `(text_a, text_b, score)`
@@ -753,8 +748,7 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
          val_loss_curve over the wire, got {remote_metrics:?}"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// A realistic mutable-table definition: a `patents_dim` companion keyed on a
@@ -819,8 +813,7 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .await
         .expect("local can recreate after the remote drop");
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// THE fold-closure proof. Creating a mutable table under a reserved `_jammi_*`
@@ -878,8 +871,7 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
         other => panic!("remote did not reconstruct MutableTable::InvalidId faithfully: {other:?}"),
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -942,8 +934,7 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
         .await
         .expect("local add_channel_columns on the same channel");
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Every column of `a` and `b` — schema (names and types, after the
@@ -1097,8 +1088,7 @@ async fn remote_and_embedded_submits_persist_the_identical_multi_rank_spec() {
          must persist byte-identical specs"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// PARITY, the unset boundary. A submission that chooses no count persists the
@@ -1151,8 +1141,7 @@ async fn an_unset_count_persists_the_identical_single_rank_spec_on_both_paths() 
         "an unset count must persist byte-identically through both surfaces"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,8 +1213,7 @@ async fn a_fine_tune_cache_use_persists_the_identical_spec_on_both_paths() {
          must persist byte-identical specs"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// PARITY, the unset boundary. A submission that chooses no cache policy
@@ -1279,8 +1267,7 @@ async fn an_unset_cache_policy_persists_the_identical_bypass_spec_on_both_paths(
         "an unset cache policy must persist byte-identically through both surfaces"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// REFUSAL, over the REMOTE path. A count the deployment cannot serve
@@ -1344,6 +1331,5 @@ async fn a_count_beyond_the_devices_is_refused_from_the_wire_and_enqueues_nothin
         "a refused submission must enqueue nothing -- on either path"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

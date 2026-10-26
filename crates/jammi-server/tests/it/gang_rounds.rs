@@ -193,7 +193,8 @@ impl GangService for HoldLoopShaped {
             }
         });
         let slot = self.hand_off.lock().unwrap().take().expect("one admission");
-        let _ = slot.send(link);
+        slot.send(link)
+            .unwrap_or_else(|_| panic!("the test awaits the admitted member's link"));
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
         )))

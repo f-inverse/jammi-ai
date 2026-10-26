@@ -304,8 +304,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
     );
 
     table.abort().await.unwrap();
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ExactRescore over peer_bind == in-process rescore on an Int8 table;
@@ -394,8 +393,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
     table.abort().await.unwrap();
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // Input-edge reconciliation at the OWNER: every value that arrives over the
@@ -558,8 +556,7 @@ async fn owner_refuses_non_conforming_requests() {
     assert_eq!(ok.hits.len(), 2);
 
     table.abort().await.unwrap();
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // Input-edge reconciliation at the OWNER: every value that arrives over the
@@ -702,6 +699,5 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
     assert_eq!(ok.hits.len(), 2);
 
     table.abort().await.unwrap();
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

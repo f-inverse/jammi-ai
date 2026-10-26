@@ -57,6 +57,8 @@ mod reconcile_artifacts;
 mod recovery;
 mod register_computed_embedding;
 mod registry_read_only;
+#[cfg(feature = "live-postgres-tests")]
+mod remote_conformance;
 #[cfg(feature = "test-hooks")]
 mod rendezvous_ring;
 mod replace_table;

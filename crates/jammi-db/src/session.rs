@@ -12,7 +12,7 @@ use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 
@@ -23,7 +23,6 @@ use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
-use crate::federation::{EngineFunctions, FederatedScanPlanner, LocalFunctionFederation};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
@@ -76,10 +75,6 @@ pub struct JammiSession {
     /// [`JammiSession::with_signing_key_store`], so the sign path routes through
     /// a caller-chosen store.
     signing_key_store: Arc<dyn SigningKeyStore>,
-    /// The functions [`JammiSession::install_functions`] installed, shared
-    /// with the federation rule so no sub-plan calling one is sent to a
-    /// remote source.
-    engine_functions: Arc<EngineFunctions>,
 }
 
 impl JammiSession {
@@ -232,17 +227,7 @@ impl JammiSession {
         let base_ctx = SessionContext::new_with_config(session_config);
         let base_state = base_ctx.state();
 
-        let mut rules = base_state.optimizer().rules.clone();
-        let insert_pos = rules
-            .iter()
-            .position(|r| r.name() == "scalar_subquery_to_join")
-            .map(|pos| pos + 1)
-            .unwrap_or(rules.len());
-        let engine_functions = Arc::new(EngineFunctions::default());
-        rules.insert(
-            insert_pos,
-            Arc::new(LocalFunctionFederation::new(Arc::clone(&engine_functions))),
-        );
+        let rules = federating(base_state.optimizer().rules.clone());
 
         // The tenant-scope analyzer rule, applied before federation,
         // projection pruning and the rest. It reads each query's scope from
@@ -340,7 +325,6 @@ impl JammiSession {
             publisher,
             subscriber,
             signing_key_store,
-            engine_functions,
         };
         session.preload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -965,14 +949,8 @@ impl JammiSession {
         let ctx = self.ctx.inner();
         for function in functions {
             match function {
-                QueryFunction::Scalar(udf) => {
-                    self.engine_functions.insert(udf.name(), udf.aliases());
-                    ctx.register_udf(udf);
-                }
-                QueryFunction::Aggregate(udaf) => {
-                    self.engine_functions.insert(udaf.name(), udaf.aliases());
-                    ctx.register_udaf(udaf);
-                }
+                QueryFunction::Scalar(udf) => ctx.register_udf(udf),
+                QueryFunction::Aggregate(udaf) => ctx.register_udaf(udaf),
                 QueryFunction::Table { name, function } => ctx.register_udtf(&name, function),
             }
         }
@@ -1320,14 +1298,49 @@ impl QueryPlanner for JammiQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        DefaultPhysicalPlanner::with_extension_planners(vec![
-            Arc::new(FederatedScanPlanner::new()),
-            Arc::new(MaterializationPlanner),
-            Arc::new(RowRewritePlanner),
-        ])
-        .create_physical_plan(logical_plan, session_state)
-        .await
+        DefaultPhysicalPlanner::with_extension_planners(extension_planners())
+            .create_physical_plan(logical_plan, session_state)
+            .await
     }
+}
+
+/// The session's extension planners: [`MaterializationPlanner`],
+/// [`RowRewritePlanner`], and, in a build that carries a database source,
+/// federation's ([`crate::federation::RemotePlanner`]).
+fn extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+        vec![Arc::new(MaterializationPlanner), Arc::new(RowRewritePlanner)];
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    let planners = std::iter::once(
+        Arc::new(crate::federation::RemotePlanner::new()) as Arc<dyn ExtensionPlanner + Send + Sync>
+    )
+    .chain(planners)
+    .collect();
+    planners
+}
+
+/// The session's optimizer rules: DataFusion's, and, in a build that
+/// carries a database source, federation
+/// ([`crate::federation::RemoteFederation`]) right after
+/// `scalar_subquery_to_join`, so the sub-plans it hands a remote are
+/// decorrelated.
+fn federating(
+    rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
+) -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    let rules = {
+        let mut rules = rules;
+        let after = rules
+            .iter()
+            .position(|r| r.name() == "scalar_subquery_to_join")
+            .map_or(rules.len(), |pos| pos + 1);
+        rules.insert(
+            after,
+            Arc::new(crate::federation::RemoteFederation::default()),
+        );
+        rules
+    };
+    rules
 }
 
 /// Resolve the signing-key store selected by `config.signing_key`:

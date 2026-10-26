@@ -13,8 +13,8 @@ sits in one place: the documents live in an operational Postgres, a reference ta
 in a MySQL database another team runs, a label set in a CSV someone exported. Jammi
 reads all three where they are. A database is registered by its URL, like a file,
 and each of its tables becomes a table in the SQL surface — queried in place, with
-filters, projections and limits pushed down to the database, and joined with
-anything else the engine can read.
+the part of each query the database reads exactly as the engine does run in the
+database, the rest in the engine, and joined with anything else the engine can read.
 
 This chapter runs that: a Postgres installed with `pip` (`pgserver`), a MariaDB
 installed with the system package manager, and a CSV file, federated into one query,

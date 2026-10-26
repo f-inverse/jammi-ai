@@ -219,7 +219,7 @@ async fn a_filter_on_a_postgres_column_stays_above_the_federated_scan() {
         })
         .expect("EXPLAIN shows the physical plan");
     let filter = physical.find("FilterExec: state@");
-    let scan = physical.find("FederatedScanExec");
+    let scan = physical.find("RemoteExec");
     assert!(
         matches!((filter, scan), (Some(filter), Some(scan)) if filter < scan),
         "{physical}"

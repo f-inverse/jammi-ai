@@ -189,6 +189,19 @@ The dependency audit is green again on the live advisory database, and database 
   names no tenant runs global on every verb. SQL cannot set a query's scope, and a plan planned
   without one is refused. `TenantBoundProvider` is `ResolvedFlightScope`, a `FlightScope`, and
   `GrpcChain` has no `flight_binding`.
+- **A database is sent only what it reads as the engine does.** Federation handed a
+  database the largest sub-plan over its tables whatever it contained, and some of it meant
+  something else there or did not exist there: MySQL read `||` as OR, `DATE - DATE` as a
+  number, `=` on strings case-insensitively and sorted NULLs first; Postgres was sent
+  `approx_distinct` (#750), a session's installed function in a `WHERE` (#765), and a decimal
+  `AVG` with more places than the engine planned (#745); a plan holding `unnest` crashed the
+  federation rule (#748). One allowlist, read through each database's semantics, now decides
+  what a database runs: Postgres compares strings for equality, concatenates, divides, sorts
+  non-string keys, averages numbers, counts distinct values and full-joins in the database;
+  MySQL does none of those. Everything else stays in the engine, over the rows the database
+  returns. The rows a database produces are a `RemoteExec`, a source no engine optimizer
+  reaches into, so a filter or sort above them stays above them (#739). A live test runs every
+  admitted and refused construct over Postgres and over the same rows in a file.
 
 - **A filter on a database column holds when the query also joins a file.** The engine ran such a
   filter above the federated scan, and physical filter pushdown handed it to that scan, which took

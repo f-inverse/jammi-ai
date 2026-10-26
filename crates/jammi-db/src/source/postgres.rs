@@ -8,11 +8,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion::common::TableReference;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
+use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use secrecy::SecretString;
 
 use crate::error::{JammiError, Result};
+use crate::federation::remote::{self, Remote};
 use crate::pg_uri::{Keyword, PgUri};
 use crate::source::{database, SourceConnection};
 
@@ -21,9 +25,10 @@ const SCHEMA: &str = "public";
 
 /// Create table providers for all public tables in a Postgres database.
 ///
-/// Returns `(table_name, Arc<dyn TableProvider>)` pairs with filter/projection/limit
-/// pushdown handled automatically by `datafusion-table-providers`. A table
-/// with a `money` column is read through [`money`], as the amounts it holds.
+/// Returns `(table_name, Arc<dyn TableProvider>)` pairs, each a
+/// [`Remote::Postgres`] table: Postgres is sent only what it runs as the
+/// engine does ([`remote`]). A table with a `money` column is read through
+/// [`money`], as the amounts it holds.
 pub async fn create_postgres_tables(
     source_id: &str,
     connection: &SourceConnection,
@@ -38,7 +43,6 @@ pub async fn create_postgres_tables(
         .await
         .map_err(|e| failed(format!("Failed to connect to Postgres: {e}")))?;
     let pool = Arc::new(pool);
-    let factory = PostgresTableFactory::new(Arc::clone(&pool));
     let money_columns = money::money_columns(&pool, SCHEMA)
         .await
         .map_err(|e| failed(format!("listing the `money` columns of `{SCHEMA}`: {e}")))?;
@@ -49,14 +53,34 @@ pub async fn create_postgres_tables(
             .await
             .map_err(|e| failed(format!("reading the database's money scale: {e}")))?
     };
-    let (pool, factory, money_columns) = (&pool, &factory, &money_columns);
+    let (pool, money_columns) = (&pool, &money_columns);
     database::schema_tables(source_id, pool.as_ref(), SCHEMA, move |table| async move {
         match money_columns.get(table.table()) {
             Some(money) => money::table_provider(pool, table, money, scale).await,
-            None => factory.table_provider(table).await,
+            None => remote_table(pool, table).await,
         }
     })
     .await
+}
+
+/// `table` as a [`Remote::Postgres`] table: the driver's scan of it, and the
+/// driver's executor for the SQL federation writes for it.
+async fn remote_table(
+    pool: &Arc<PostgresConnectionPool>,
+    table: TableReference,
+) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    let dyn_pool: Arc<DynPostgresConnectionPool> = Arc::clone(pool) as _;
+    let sql_table = Arc::new(
+        SqlTable::new("postgres", &dyn_pool, table.clone())
+            .await?
+            .with_dialect(Arc::new(PostgreSqlDialect {})),
+    );
+    Ok(remote::table_provider(
+        Remote::Postgres,
+        table,
+        Arc::clone(&sql_table) as _,
+        sql_table,
+    ))
 }
 
 /// The driver's pool parameters for a libpq connection URI.

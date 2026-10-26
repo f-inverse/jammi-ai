@@ -13,6 +13,7 @@ pub mod config;
 pub mod ephemeral;
 pub mod error;
 pub mod evidence_channel;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 mod federation;
 pub mod index;
 pub mod memory_pool;

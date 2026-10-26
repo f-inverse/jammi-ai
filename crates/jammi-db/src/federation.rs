@@ -1,24 +1,25 @@
-//! Federation that keeps the engine's own functions in the engine.
+//! Federation that sends a database source only what it runs as the engine
+//! does.
 //!
 //! `datafusion-federation` hands the largest sub-plan whose scans share one
-//! remote to that remote as SQL, whatever functions the sub-plan calls. A
-//! function the session installed ([`crate::session::JammiSession::install_functions`])
-//! exists only here, so a remote asked to run it fails. [`LocalFunctionFederation`]
-//! federates only the maximal sub-plans that call none: a node that calls an
-//! engine function — anywhere beneath it, subqueries included — stays in the
-//! engine, and each of its inputs is federated on its own.
+//! remote to that remote as SQL. SQL that reads the same can mean something
+//! else there, and a function the engine has — DataFusion's own or one the
+//! session installed — may not exist there at all. [`RemoteFederation`]
+//! therefore federates only the maximal sub-plans [`remote::federable`]
+//! admits: ones that scan a remote, every node of which every remote they
+//! scan runs with the engine's meaning (each remote's allowlist, which names
+//! DataFusion's own implementations, so an installed function is never on
+//! one). Any other node stays in the engine, and each of its inputs is
+//! federated on its own.
 //!
-//! A filter the engine runs above a federated sub-plan stays in the engine
-//! too: [`FederatedScanPlanner`] plans each sub-plan behind a
-//! [`FederatedScanExec`], which takes no filter from the plan above it.
+//! The sub-plan a remote runs is planned as a [`RemoteExec`]: a source of rows
+//! to the engine, whose plan no engine optimizer reaches into. A filter or a
+//! sort the engine runs above a remote's rows stays in the engine, whether
+//! the rows come from a federated sub-plan or from a remote table's own scan;
+//! only a limit reaches the remote.
 
-//! The same holds for what a database source would read differently from the
-//! engine ([`remote`]): a node a source's SQL would carry with another
-//! meaning is not federated, and its inputs are federated on their own.
-
-use std::collections::HashSet;
 use std::fmt;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Statistics;
@@ -26,110 +27,34 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::execution_plan::CardinalityEffect;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
+use datafusion::physical_plan::{
+    displayable, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 
-#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub(crate) mod remote;
 
-/// The names of the functions a session installed: what no remote can run.
+/// The federation optimizer rule, applied only to the sub-plans
+/// [`remote::federable`] admits.
 #[derive(Debug, Default)]
-pub(crate) struct EngineFunctions(RwLock<HashSet<String>>);
-
-impl EngineFunctions {
-    /// Record the function called `name`, or any of its `aliases`, as the
-    /// engine's own.
-    pub(crate) fn insert(&self, name: &str, aliases: &[String]) {
-        self.0
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(std::iter::once(name.to_string()).chain(aliases.iter().cloned()));
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(name)
-    }
-
-    /// Whether `plan` calls one of these functions anywhere, subqueries
-    /// included.
-    fn called_by(&self, plan: &LogicalPlan) -> Result<bool> {
-        let mut called = false;
-        plan.apply_with_subqueries(|node| {
-            for expr in node.expressions() {
-                expr.apply(|e| {
-                    called = function_name(e).is_some_and(|name| self.contains(name));
-                    Ok(if called {
-                        TreeNodeRecursion::Stop
-                    } else {
-                        TreeNodeRecursion::Continue
-                    })
-                })?;
-                if called {
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        Ok(called)
-    }
-}
-
-/// The function `expr` calls at its root, by the name it is registered under.
-fn function_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::ScalarFunction(f) => Some(f.func.name()),
-        Expr::AggregateFunction(f) => Some(f.func.name()),
-        Expr::WindowFunction(f) => Some(f.fun.name()),
-        _ => None,
-    }
-}
-
-/// Whether every database source `plan` scans runs it with the engine's
-/// meaning ([`remote::runs`]); a build without database sources has none.
-fn remotes_run(plan: &LogicalPlan) -> Result<bool> {
-    #[cfg(any(feature = "postgres", feature = "mysql"))]
-    return remote::runs(plan);
-    #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-    {
-        let _ = plan;
-        Ok(true)
-    }
-}
-
-/// The federation optimizer rule, applied only to sub-plans that call no
-/// engine function and that their sources run with the engine's meaning.
-#[derive(Debug)]
-pub(crate) struct LocalFunctionFederation {
-    functions: Arc<EngineFunctions>,
+pub(crate) struct RemoteFederation {
     federation: FederationOptimizerRule,
 }
 
-impl LocalFunctionFederation {
-    pub(crate) fn new(functions: Arc<EngineFunctions>) -> Self {
-        Self {
-            functions,
-            federation: FederationOptimizerRule::new(),
-        }
-    }
-}
-
-impl OptimizerRule for LocalFunctionFederation {
+impl OptimizerRule for RemoteFederation {
     fn rewrite(
         &self,
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_down(|node| {
-            if self.functions.called_by(&node)? || !remotes_run(&node)? {
+            if !remote::federable(&node)? {
                 return Ok(Transformed::no(node));
             }
             let federated = self.federation.rewrite(node, config)?;
@@ -146,28 +71,28 @@ impl OptimizerRule for LocalFunctionFederation {
     }
 
     fn name(&self) -> &str {
-        "local_function_federation"
+        "remote_federation"
     }
 }
 
 /// Federation's physical planner, each federated sub-plan it plans behind a
-/// [`FederatedScanExec`].
-pub(crate) struct FederatedScanPlanner(FederatedPlanner);
+/// [`RemoteExec`].
+pub(crate) struct RemotePlanner(FederatedPlanner);
 
-impl fmt::Debug for FederatedScanPlanner {
+impl fmt::Debug for RemotePlanner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FederatedScanPlanner")
+        f.write_str("RemotePlanner")
     }
 }
 
-impl FederatedScanPlanner {
+impl RemotePlanner {
     pub(crate) fn new() -> Self {
         Self(FederatedPlanner::new())
     }
 }
 
 #[async_trait::async_trait]
-impl ExtensionPlanner for FederatedScanPlanner {
+impl ExtensionPlanner for RemotePlanner {
     async fn plan_extension(
         &self,
         planner: &dyn PhysicalPlanner,
@@ -186,66 +111,63 @@ impl ExtensionPlanner for FederatedScanPlanner {
                 session_state,
             )
             .await?;
-        Ok(federated.map(|plan| Arc::new(FederatedScanExec::new(plan)) as _))
+        Ok(federated.map(|plan| Arc::new(RemoteExec::new(plan)) as _))
     }
 }
 
-/// A federated sub-plan, which takes no filter from the plan above it.
+/// Rows a remote produces — a federated sub-plan's, or a remote table's own
+/// scan — as a source to the engine.
 ///
-/// Physical filter pushdown offers a `FilterExec`'s predicate to the plan
-/// beneath it and drops the `FilterExec` once that plan takes it.
-/// `datafusion-federation`'s `VirtualExecutionPlan` takes every predicate
-/// offered and hands it to its SQL executor, and the executor
-/// `datafusion-table-providers` gives a database source ignores it: the
-/// predicate is neither in the statement the database runs nor applied to the
-/// rows it returns. A filter the engine runs above a federated sub-plan — one
-/// on a database column in a query that also joins a file — would be lost
-/// that way. Above this node it stays in its `FilterExec`: a plan takes part
-/// in filter pushdown only by opting in, and this one does not. It is
-/// otherwise its input, unchanged.
+/// The remote's plan is held, not exposed as a child: no engine optimizer
+/// reaches into it. Physical filter pushdown would hand it a `FilterExec`'s
+/// predicate and drop the `FilterExec`; sort enforcement would move a
+/// `SortExec` beneath any node that keeps its input's order, onto a remote
+/// scan whose own sort pushdown writes the sort into its statement. A
+/// remote's plan writes what it takes in the remote's dialect and with the
+/// remote's meaning — or, for `datafusion-federation`'s plan, takes a
+/// predicate and applies it nowhere. Above this node both stay in the engine.
+/// The filters a remote runs as the engine does reach it at planning, through
+/// the remote's own provider. A limit is the remote's to apply — any `n` rows
+/// are any `n` rows — and is the one thing this node passes down.
 #[derive(Debug)]
-pub(crate) struct FederatedScanExec {
-    input: Arc<dyn ExecutionPlan>,
+pub(crate) struct RemoteExec {
+    remote: Arc<dyn ExecutionPlan>,
 }
 
-impl FederatedScanExec {
-    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        Self { input }
+impl RemoteExec {
+    pub(crate) fn new(remote: Arc<dyn ExecutionPlan>) -> Self {
+        Self { remote }
     }
 }
 
-impl DisplayAs for FederatedScanExec {
+/// The remote's plan on one line, outermost node first, down to the
+/// statement the remote is sent.
+impl DisplayAs for RemoteExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FederatedScanExec")
+        let plan = displayable(self.remote.as_ref()).indent(false).to_string();
+        let nodes = plan.lines().map(str::trim).collect::<Vec<_>>();
+        write!(f, "RemoteExec: {}", nodes.join(" <- "))
     }
 }
 
-impl ExecutionPlan for FederatedScanExec {
+impl ExecutionPlan for RemoteExec {
     fn name(&self) -> &str {
-        "FederatedScanExec"
+        "RemoteExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
+        self.remote.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        Vec::new()
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children.swap_remove(0))))
+        Ok(self)
     }
 
     fn execute(
@@ -253,20 +175,28 @@ impl ExecutionPlan for FederatedScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.input.execute(partition, context)
+        self.remote.execute(partition, context)
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        self.remote.partition_statistics(partition)
     }
 
-    fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
+    fn supports_limit_pushdown(&self) -> bool {
+        self.remote.supports_limit_pushdown()
     }
 
-    /// No filter from above reaches the federated sub-plan (see the type's
-    /// doc); written out, not left to the default, so a change to the
-    /// default cannot quietly change it.
+    fn fetch(&self) -> Option<usize> {
+        self.remote.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let remote = self.remote.with_fetch(limit)?;
+        Some(Arc::new(Self::new(remote)))
+    }
+
+    /// No filter from above reaches the remote; written out, not left to the
+    /// default, so a change to the default cannot quietly change it.
     fn gather_filters_for_pushdown(
         &self,
         _phase: FilterPushdownPhase,
@@ -278,29 +208,12 @@ impl ExecutionPlan for FederatedScanExec {
             &self.children(),
         ))
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::functions::expr_fn::{lower, upper};
-    use datafusion::logical_expr::{lit, LogicalPlanBuilder};
-
-    fn plan(expr: Expr) -> LogicalPlan {
-        LogicalPlanBuilder::empty(true)
-            .project([expr])
-            .unwrap()
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn a_plan_calls_an_installed_function_by_its_name_at_any_depth() {
-        let nested = plan(lower(upper(lit("a"))));
-        let functions = EngineFunctions::default();
-        assert!(!functions.called_by(&nested).unwrap());
-        functions.insert("upper", &[]);
-        assert!(functions.called_by(&nested).unwrap());
-        assert!(!functions.called_by(&plan(lower(lit("a")))).unwrap());
+    /// No sort from above reaches the remote; written out for the same reason.
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }

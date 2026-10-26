@@ -6,11 +6,11 @@
 
 Jammi federates external databases alongside local files. Register a database by its
 URL and every table in it becomes a table of the SQL surface, queried in place: the
-largest part of a query that reads only one database's tables — filters, projections,
-joins, aggregates, limits — runs in that database, and the engine joins the result with
-any other source. A function only the engine has (one it installs, such as the content
-hash an embedding job computes) is never sent to a database: the part of the query that
-calls it runs in the engine, over the rows the database returns.
+largest part of a query that reads only one database's tables, and that the database
+reads exactly as the engine does, runs in that database, and the engine joins the result
+with any other source. Anything the database would read otherwise stays in the engine,
+over the rows the database returns, so an answer never depends on where it was computed
+([What runs in the database](#what-runs-in-the-database)).
 
 ## Python
 
@@ -73,6 +73,30 @@ out: `postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`
 A MySQL URL is `mysql://user:password@host:port/database`, and must name its database.
 Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`; a server
 with no TLS — a local development instance — is reached with `sslmode=disabled`.
+
+## What runs in the database
+
+A database is sent only constructs it is known to mean as the engine means them, each
+backed by a test that runs it over the database and over the same rows in a file. Every
+database runs scans, projections, filters, limits, inner, left and right joins, boolean
+logic, `IS [NOT] NULL`, comparisons and `BETWEEN` on numbers, booleans, dates and
+zone-less timestamps, `+ - *` on numbers, integer casts, `COUNT`, `SUM` over numbers, and
+`MIN`/`MAX` over ordered types.
+
+| Construct | PostgreSQL | MySQL |
+|---|---|---|
+| `=`, `<>`, `IN`, grouping and join keys on strings | in the database (byte equality) | in the engine (the default collation folds case) |
+| `\|\|` | in the database | in the engine (a logical OR in MySQL) |
+| `/` and `%` on integers and floats | in the database | in the engine (`/` on integers is decimal division) |
+| `ORDER BY` on non-string keys | in the database | in the engine (NULLs sort first ascending) |
+| `AVG` over integers and floats | in the database | in the engine (a four-place decimal) |
+| `COUNT(DISTINCT …)`, `FULL JOIN` | in the database | in the engine |
+
+Always in the engine: ordering comparisons and sorts on strings (a database orders them
+by its collation), `AVG` over decimals, date arithmetic, string casts, every scalar
+function — DataFusion's (`approx_distinct`, `date_trunc`, `upper`) and every function a
+session installs — and `unnest`. A filter or a sort the engine runs above a database's
+rows stays above them; only a limit reaches the database.
 
 ## Cross-source joins
 

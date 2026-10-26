@@ -138,7 +138,11 @@ async fn every_column_reads_as_the_value_it_holds() {
         );
         assert_eq!(
             columns[10],
-            ["1958-12-08T10:30:00", "1850-01-01T00:00:00", "1973-07-01T00:00:00"],
+            [
+                "1958-12-08T10:30:00",
+                "1850-01-01T00:00:00",
+                "1973-07-01T00:00:00"
+            ],
             "{filter}"
         );
         assert_eq!(columns[15], ["12.34", "-7.25", "NULL"], "{filter}");
@@ -174,6 +178,10 @@ async fn a_filter_on_a_column_read_through_postgres_compares_the_value_read() {
         .unwrap();
     assert_eq!(
         displayed(&batches),
-        [["1958-12-01T00:00:00", "1850-01-01T00:00:00", "1973-07-01T00:00:00"]]
+        [[
+            "1958-12-01T00:00:00",
+            "1850-01-01T00:00:00",
+            "1973-07-01T00:00:00"
+        ]]
     );
 }

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::get_tables;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::mysql::sql_table::MySQLTable;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::get_tables;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use secrecy::SecretString;
 use url::Url;
 
@@ -55,7 +55,10 @@ pub async fn create_mysql_tables(
     Ok(tables
         .into_iter()
         .map(|(name, provider)| {
-            (SourceTable::new(source_id, SourceTable::PUBLIC, &name), provider)
+            (
+                SourceTable::new(source_id, SourceTable::PUBLIC, &name),
+                provider,
+            )
         })
         .collect())
 }

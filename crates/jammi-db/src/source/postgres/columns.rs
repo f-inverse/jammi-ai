@@ -84,7 +84,9 @@ impl Column {
         };
         match &self.read {
             Read::Direct => self.domain.as_ref().map(|_| value),
-            Read::Money { scale } => Some(format!("({value})::numeric({MONEY_PRECISION}, {scale})")),
+            Read::Money { scale } => {
+                Some(format!("({value})::numeric({MONEY_PRECISION}, {scale})"))
+            }
             Read::AtUtc => Some(format!("({value}) AT TIME ZONE 'UTC'")),
             Read::Text => Some(format!("({value})::text")),
         }
@@ -160,13 +162,16 @@ pub(super) async fn columns(
     let mut tables: BTreeMap<(String, String), Vec<Column>> = BTreeMap::new();
     for column in described {
         let (data_type, read) = reading(&column, money_scale)?;
-        tables.entry((column.schema, column.table)).or_default().push(Column {
-            name: column.name,
-            data_type,
-            nullable: !column.not_null,
-            domain: column.domain.then_some(column.formatted),
-            read,
-        });
+        tables
+            .entry((column.schema, column.table))
+            .or_default()
+            .push(Column {
+                name: column.name,
+                data_type,
+                nullable: !column.not_null,
+                domain: column.domain.then_some(column.formatted),
+                read,
+            });
     }
     Ok(tables)
 }
@@ -207,14 +212,23 @@ fn reading(column: &Described, money_scale: Option<i8>) -> Result<(DataType, Rea
         "bytea" => direct(DataType::Binary),
         "date" => direct(DataType::Date32),
         "time" => direct(DataType::Time64(TimeUnit::Nanosecond)),
-        "timestamptz" => direct(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))),
+        "timestamptz" => direct(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        )),
         "interval" => direct(DataType::Interval(IntervalUnit::MonthDayNano)),
         "timestamp" => (DataType::Timestamp(TimeUnit::Nanosecond, None), Read::AtUtc),
         "money" => {
             let scale = money_scale.ok_or_else(|| {
-                format!("`{}` is money, and the money scale was not read", column.name)
+                format!(
+                    "`{}` is money, and the money scale was not read",
+                    column.name
+                )
             })?;
-            (DataType::Decimal128(MONEY_PRECISION, scale), Read::Money { scale })
+            (
+                DataType::Decimal128(MONEY_PRECISION, scale),
+                Read::Money { scale },
+            )
         }
         _ => match column.element.as_deref().and_then(array_element) {
             Some(element) => direct(DataType::List(Arc::new(Field::new("item", element, true)))),
@@ -269,10 +283,13 @@ pub(super) fn remote_table(
             .with_dialect(Arc::new(PostgresUnparserDialect {})),
     );
     let derived = DerivedTable::of(&table, columns);
-    let reads = derived.clone().map(|derived| -> Reads {
-        Arc::new(move |statement| derived.rewrite(statement))
-    });
-    let executor = Arc::new(PostgresExecutor::new(Arc::clone(&sql_table), Arc::clone(pool)));
+    let reads = derived
+        .clone()
+        .map(|derived| -> Reads { Arc::new(move |statement| derived.rewrite(statement)) });
+    let executor = Arc::new(PostgresExecutor::new(
+        Arc::clone(&sql_table),
+        Arc::clone(pool),
+    ));
     let scan = Arc::new(PostgresScan::new(sql_table, Arc::clone(pool), derived));
     remote::table_provider(Remote::Postgres, table, scan, executor, reads)
 }
@@ -415,7 +432,12 @@ fn names(name: &ObjectName) -> Option<TableReference> {
 mod tests {
     use super::*;
 
-    fn described(type_name: &str, formatted: &str, domain: bool, element: Option<&str>) -> Described {
+    fn described(
+        type_name: &str,
+        formatted: &str,
+        domain: bool,
+        element: Option<&str>,
+    ) -> Described {
         Described {
             schema: "public".into(),
             table: "t".into(),
@@ -461,10 +483,38 @@ mod tests {
     #[test]
     fn each_type_is_read_as_the_driver_reads_it_or_through_postgres() {
         for (type_name, formatted, domain, element, data_type, read) in [
-            ("int4", "integer", false, None, DataType::Int32, Read::Direct),
-            ("numeric", "numeric(10,2)", false, None, DataType::Decimal128(10, 2), Read::Direct),
-            ("numeric", "numeric", false, None, DataType::Decimal128(38, 20), Read::Direct),
-            ("numeric", "numeric(7)", false, None, DataType::Decimal128(7, 0), Read::Direct),
+            (
+                "int4",
+                "integer",
+                false,
+                None,
+                DataType::Int32,
+                Read::Direct,
+            ),
+            (
+                "numeric",
+                "numeric(10,2)",
+                false,
+                None,
+                DataType::Decimal128(10, 2),
+                Read::Direct,
+            ),
+            (
+                "numeric",
+                "numeric",
+                false,
+                None,
+                DataType::Decimal128(38, 20),
+                Read::Direct,
+            ),
+            (
+                "numeric",
+                "numeric(7)",
+                false,
+                None,
+                DataType::Decimal128(7, 0),
+                Read::Direct,
+            ),
             ("int4", "integer", true, None, DataType::Int32, Read::Direct),
             (
                 "timestamp",
@@ -474,12 +524,33 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 Read::AtUtc,
             ),
-            ("money", "money", false, None, DataType::Decimal128(19, 2), Read::Money { scale: 2 }),
+            (
+                "money",
+                "money",
+                false,
+                None,
+                DataType::Decimal128(19, 2),
+                Read::Money { scale: 2 },
+            ),
             ("jsonb", "jsonb", false, None, DataType::Utf8, Read::Text),
             ("json", "json", false, None, DataType::Utf8, Read::Text),
             ("citext", "citext", false, None, DataType::Utf8, Read::Text),
-            ("timetz", "time with time zone", false, None, DataType::Utf8, Read::Text),
-            ("tsvector", "tsvector", false, None, DataType::Utf8, Read::Text),
+            (
+                "timetz",
+                "time with time zone",
+                false,
+                None,
+                DataType::Utf8,
+                Read::Text,
+            ),
+            (
+                "tsvector",
+                "tsvector",
+                false,
+                None,
+                DataType::Utf8,
+                Read::Text,
+            ),
             ("inet", "inet", false, None, DataType::Utf8, Read::Text),
             (
                 "_int4",
@@ -489,7 +560,14 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
                 Read::Direct,
             ),
-            ("_jsonb", "jsonb[]", false, Some("jsonb"), DataType::Utf8, Read::Text),
+            (
+                "_jsonb",
+                "jsonb[]",
+                false,
+                Some("jsonb"),
+                DataType::Utf8,
+                Read::Text,
+            ),
         ] {
             let column = described(type_name, formatted, domain, element);
             assert_eq!(
@@ -504,11 +582,15 @@ mod tests {
     fn a_column_read_as_stored_names_itself_and_a_domain_reads_its_base() {
         assert_eq!(column("c", Read::Direct, None).expression(), None);
         assert_eq!(
-            column("c", Read::Direct, Some("integer")).expression().as_deref(),
+            column("c", Read::Direct, Some("integer"))
+                .expression()
+                .as_deref(),
             Some(r#"("c")::integer"#)
         );
         assert_eq!(
-            column("c", Read::Text, Some("numeric(4,1)")).expression().as_deref(),
+            column("c", Read::Text, Some("numeric(4,1)"))
+                .expression()
+                .as_deref(),
             Some(r#"(("c")::numeric(4,1))::text"#)
         );
         assert_eq!(
@@ -521,7 +603,10 @@ mod tests {
     fn a_table_read_as_stored_has_no_derived_table() {
         assert!(DerivedTable::of(
             &TableReference::bare("t"),
-            &[column("id", Read::Direct, None), column("name", Read::Direct, None)]
+            &[
+                column("id", Read::Direct, None),
+                column("name", Read::Direct, None)
+            ]
         )
         .is_none());
     }
@@ -534,10 +619,16 @@ mod tests {
         );
         assert!(
             sql.starts_with(r#"SELECT sum("prices"."amount") FROM (SELECT "id", "#)
-                && sql.ends_with(r#" AS "amount" FROM "prices") AS "prices" WHERE "prices"."amount" > 1"#),
+                && sql.ends_with(
+                    r#" AS "amount" FROM "prices") AS "prices" WHERE "prices"."amount" > 1"#
+                ),
             "{sql}"
         );
-        assert_eq!(sql.matches("NUMERIC(19, 2)").count() + sql.matches("NUMERIC(19,2)").count(), 1, "{sql}");
+        assert_eq!(
+            sql.matches("NUMERIC(19, 2)").count() + sql.matches("NUMERIC(19,2)").count(),
+            1,
+            "{sql}"
+        );
     }
 
     #[test]
@@ -546,7 +637,10 @@ mod tests {
             &prices(),
             r#"SELECT p."amount" FROM "public"."prices" AS p JOIN "items" AS i ON p."id" = i."id""#,
         );
-        assert!(sql.contains(r#"FROM "public"."prices") AS p JOIN "items" AS i"#), "{sql}");
+        assert!(
+            sql.contains(r#"FROM "public"."prices") AS p JOIN "items" AS i"#),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -555,7 +649,11 @@ mod tests {
             &prices(),
             r#"SELECT a."id" FROM "prices" AS a WHERE a."amount" > (SELECT avg(b."amount") FROM "prices" AS b)"#,
         );
-        assert_eq!(sql.matches(r#"AS "amount" FROM "prices")"#).count(), 2, "{sql}");
+        assert_eq!(
+            sql.matches(r#"AS "amount" FROM "prices")"#).count(),
+            2,
+            "{sql}"
+        );
     }
 
     #[test]
@@ -566,6 +664,9 @@ mod tests {
         )
         .unwrap();
         let sql = rewritten(&derived, r#"SELECT * FROM "t""#);
-        assert!(sql.contains(r#"("pr""ice")"#) && sql.contains(r#"AS "pr""ice" FROM "t") AS "t""#), "{sql}");
+        assert!(
+            sql.contains(r#"("pr""ice")"#) && sql.contains(r#"AS "pr""ice" FROM "t") AS "t""#),
+            "{sql}"
+        );
     }
 }

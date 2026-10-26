@@ -589,8 +589,7 @@ impl InferenceSession {
             _ => String::new(),
         };
 
-        let sql =
-            format!("SELECT {projection} FROM {table}{where_clause}");
+        let sql = format!("SELECT {projection} FROM {table}{where_clause}");
         let batches = self
             .context()
             .sql(&sql)

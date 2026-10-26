@@ -60,10 +60,16 @@ async fn every_relation_of_every_schema_answers() {
         ("sales.orders", 3),
         (r#""Analytics"."Daily Totals""#, 1),
     ] {
-        assert_eq!(count(&session, &format!("{source}.{relation}")).await, rows, "{relation}");
+        assert_eq!(
+            count(&session, &format!("{source}.{relation}")).await,
+            rows,
+            "{relation}"
+        );
     }
     let filtered = session
-        .sql(&format!("SELECT id FROM {source}.sales.orders WHERE id >= 2 ORDER BY id"))
+        .sql(&format!(
+            "SELECT id FROM {source}.sales.orders WHERE id >= 2 ORDER BY id"
+        ))
         .await
         .unwrap();
     let ids = filtered[0]

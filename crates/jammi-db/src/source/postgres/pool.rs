@@ -20,7 +20,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Where a database listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Address {
-    Tcp { host: String, port: u16 },
+    Tcp {
+        host: String,
+        port: u16,
+    },
     /// A Unix-domain socket file.
     Socket(PathBuf),
 }
@@ -92,10 +95,8 @@ where
 {
     async fn connect(
         &self,
-    ) -> std::result::Result<
-        Box<dyn DbConnection<T, P>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> std::result::Result<Box<dyn DbConnection<T, P>>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let connect = self.pool.connect();
         tokio::pin!(connect);
         tokio::select! {

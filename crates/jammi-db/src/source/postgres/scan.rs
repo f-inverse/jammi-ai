@@ -179,7 +179,11 @@ impl<T: 'static, P: 'static> TableProvider for PostgresScan<T, P> {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let sql = self.statement(self.table.scan_to_sql(projection, filters, limit)?)?;
         let schema = project_schema(&self.schema(), projection)?;
-        Ok(Arc::new(PostgresRows::new(Arc::clone(&self.pool), sql, schema)))
+        Ok(Arc::new(PostgresRows::new(
+            Arc::clone(&self.pool),
+            sql,
+            schema,
+        )))
     }
 }
 

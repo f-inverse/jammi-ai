@@ -32,8 +32,8 @@ use futures::StreamExt;
 use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, TxOptions};
 
 use super::definition::MutableTableDefinition;
-use crate::tenant_scope::TenantConfig;
 use super::{keys_predicate, owned_rows, MutableBackend};
+use crate::tenant_scope::TenantConfig;
 
 /// How an incoming row relates to an existing row with the same primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

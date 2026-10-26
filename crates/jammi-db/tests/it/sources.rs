@@ -6,11 +6,11 @@ use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTa
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::{JammiError, Missing};
+use jammi_db::source::SourceTable;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
 };
-use jammi_db::source::SourceTable;
 use jammi_test_utils::{make_test_session, open_backend, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;

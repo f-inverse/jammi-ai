@@ -90,5 +90,4 @@ mod tests {
     fn quote_relation_doubles_embedded_quote_per_part() {
         assert_eq!(quote_relation(r#"cat.a"b"#), r#""cat"."a""b""#);
     }
-
 }

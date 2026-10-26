@@ -38,8 +38,8 @@ use datafusion::functions_aggregate::count::Count;
 use datafusion::functions_aggregate::min_max::{Max, Min};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::{
-    Aggregate, BinaryExpr, Expr, ExprSchemable, JoinType, LogicalPlan, Operator,
-    SortExpr, TableProviderFilterPushDown, TableScan, TableSource, TableType,
+    Aggregate, BinaryExpr, Expr, ExprSchemable, JoinType, LogicalPlan, Operator, SortExpr,
+    TableProviderFilterPushDown, TableScan, TableSource, TableType,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -255,9 +255,9 @@ fn aggregate_runs(semantics: Semantics, aggregate: &Aggregate) -> bool {
     let schema = aggregate.input.schema();
     !matches!(aggregate.input.as_ref(), LogicalPlan::Projection(_))
         && aggregate
-        .group_expr
-        .iter()
-        .all(|expr| equated(semantics, expr, schema))
+            .group_expr
+            .iter()
+            .all(|expr| equated(semantics, expr, schema))
         && aggregate.aggr_expr.iter().all(|expr| {
             let Expr::AggregateFunction(function) = unaliased(expr) else {
                 return false;
@@ -272,9 +272,13 @@ fn aggregate_runs(semantics: Semantics, aggregate: &Aggregate) -> bool {
                     .first()
                     .and_then(|arg| arg.get_type(schema).ok())
             };
-            let arguments_run = params.args.iter().all(|arg| core_runs(semantics, arg, schema));
+            let arguments_run = params
+                .args
+                .iter()
+                .all(|arg| core_runs(semantics, arg, schema));
             let implementation = function.func.inner();
-            let numeric_argument = || argument_type().is_some_and(|t| t.is_integer() || t.is_floating());
+            let numeric_argument =
+                || argument_type().is_some_and(|t| t.is_integer() || t.is_floating());
             let runs = if implementation.is::<Count>() {
                 !params.distinct
                     || (semantics.count_distinct
@@ -578,7 +582,9 @@ mod tests {
         fn dialect(&self) -> Arc<dyn Dialect> {
             match self.remote {
                 #[cfg(feature = "postgres")]
-                Remote::Postgres => Arc::new(datafusion::sql::unparser::dialect::PostgreSqlDialect {}),
+                Remote::Postgres => {
+                    Arc::new(datafusion::sql::unparser::dialect::PostgreSqlDialect {})
+                }
                 #[cfg(feature = "mysql")]
                 Remote::MySql => Arc::new(datafusion::sql::unparser::dialect::MySqlDialect {}),
             }
@@ -790,7 +796,8 @@ mod tests {
         #[cfg(feature = "mysql")]
         Remote::MySql,
     ];
-    const REMOTE_COUNT: usize = cfg!(feature = "postgres") as usize + cfg!(feature = "mysql") as usize;
+    const REMOTE_COUNT: usize =
+        cfg!(feature = "postgres") as usize + cfg!(feature = "mysql") as usize;
 
     #[cfg(feature = "mysql")]
     mod mysql {
@@ -858,7 +865,8 @@ mod tests {
                 assert!(statements.is_empty(), "{sql}: {statements:?}");
                 assert!(above_remote(&plan, "SortExec"), "{plan}");
             }
-            let (_, plan) = sent(Remote::MySql, "SELECT id FROM t WHERE status = 'Delivered'").await;
+            let (_, plan) =
+                sent(Remote::MySql, "SELECT id FROM t WHERE status = 'Delivered'").await;
             assert!(above_remote(&plan, "FilterExec"), "{plan}");
         }
     }

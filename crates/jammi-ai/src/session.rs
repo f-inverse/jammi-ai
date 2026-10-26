@@ -7,8 +7,8 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{FiniteQuery, SearchMethod};
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
-use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::source::SourceTable;
+use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::quote_ident;
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 

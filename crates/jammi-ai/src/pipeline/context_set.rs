@@ -799,9 +799,7 @@ impl InferenceSession {
         let source_table = self.first_table(source_id).await?;
         let df = self
             .context()
-            .sql(&format!(
-                "SELECT * FROM {source_table} LIMIT 0"
-            ))
+            .sql(&format!("SELECT * FROM {source_table} LIMIT 0"))
             .await
             .map_err(|e| JammiError::from(e.context("Key column check: schema introspection")))?;
         let fields = df.schema();

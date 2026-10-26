@@ -67,7 +67,10 @@ async fn a_query_over_a_stopped_database_fails_at_once_naming_it() {
         .await
         .unwrap();
     let query = format!("SELECT id FROM {source}.public.t");
-    session.sql(&query).await.expect("the database answers through the proxy");
+    session
+        .sql(&query)
+        .await
+        .expect("the database answers through the proxy");
 
     proxy.abort();
     proxy.await.ok();
@@ -75,7 +78,10 @@ async fn a_query_over_a_stopped_database_fails_at_once_naming_it() {
     let started = Instant::now();
     let err = session.sql(&query).await.expect_err("the database is gone");
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(2), "failed after {elapsed:?}: {err}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "failed after {elapsed:?}: {err}"
+    );
     assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
     let message = err.to_string();
     assert!(message.contains(&format!("127.0.0.1:{port}")), "{message}");

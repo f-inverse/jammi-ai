@@ -325,7 +325,10 @@ impl JammiFlightService {
     /// own state and encode its rows under the plan's schema — the schema
     /// the inner service advertised for it (`get_flight_info` derives the
     /// same one from the same logical plan).
-    async fn do_get_statement(&self, query: &str) -> Result<Response<BoxedStream<FlightData>>, Status> {
+    async fn do_get_statement(
+        &self,
+        query: &str,
+    ) -> Result<Response<BoxedStream<FlightData>>, Status> {
         let frame = self
             .scope
             .context()
@@ -461,7 +464,10 @@ impl FlightService for JammiFlightService {
                 self.entered_stream(&metadata, self.do_get_statement(&query))
                     .await
             }
-            None => self.entered_stream(&metadata, self.inner.do_get(request)).await,
+            None => {
+                self.entered_stream(&metadata, self.inner.do_get(request))
+                    .await
+            }
         }
     }
 

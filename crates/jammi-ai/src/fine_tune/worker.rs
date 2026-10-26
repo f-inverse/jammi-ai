@@ -1416,9 +1416,7 @@ pub(crate) async fn materialize_graph_training_set(
     let (src_name, dst_name) = sources.edges.columns();
     let edge_relation = match &sources.edges {
         GraphEdges::Table(table) => jammi_db::store::result_table_relation(table).to_string(),
-        GraphEdges::Source { source, .. } => {
-            session.first_table(source).await?.to_string()
-        }
+        GraphEdges::Source { source, .. } => session.first_table(source).await?.to_string(),
     };
     let src_col = quote_ident(src_name);
     let dst_col = quote_ident(dst_name);

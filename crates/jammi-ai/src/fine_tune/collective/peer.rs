@@ -617,8 +617,10 @@ impl<In: Inbound, Out: Outbound> Link<In, Out> {
         true
     }
 
+    /// Tell the far side the round faulted. A far side already gone has
+    /// left the round, and needs no telling.
     fn send_fault(&self, round: u64, detail: &str) {
-        let _ = self.send(Out::fault(RoundFault {
+        self.send(Out::fault(RoundFault {
             round,
             detail: detail.to_string(),
         }));

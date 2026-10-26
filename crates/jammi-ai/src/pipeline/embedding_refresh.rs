@@ -123,7 +123,12 @@ pub mod refresh_test_hooks {
             if self.state.parked.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), notified).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(30), notified)
+                .await
+                .is_err()
+            {
+                tracing::warn!("test hook: waited 30 s for a park that never came");
+            }
         }
 
         /// Whether the refresh is parked.
@@ -173,7 +178,12 @@ pub mod refresh_test_hooks {
         if state.released.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), released).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(60), released)
+            .await
+            .is_err()
+        {
+            tracing::warn!("test hook: the park released by its 60 s bound");
+        }
     }
 }
 

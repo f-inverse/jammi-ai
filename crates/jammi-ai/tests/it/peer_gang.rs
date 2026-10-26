@@ -107,10 +107,11 @@ impl GangService for MemberService {
             .unwrap()
             .take()
             .ok_or_else(|| Status::failed_precondition("one admission per fixture"))?;
-        let _ = slot.send(HandOff {
+        slot.send(HandOff {
             link,
             raw: events_tx,
-        });
+        })
+        .unwrap_or_else(|_| panic!("the test awaits the admitted member's hand-off"));
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(events_rx),
         )))

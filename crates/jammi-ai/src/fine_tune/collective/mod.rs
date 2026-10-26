@@ -206,7 +206,7 @@ fn reason_of(error: &JammiError) -> String {
 ///     let handle = BlockingCall::spawn_blocking(move |call| {
 ///         tokio::spawn(async move { noop.barrier(&call) })
 ///     });
-///     let _ = handle;
+///     drop(handle);
 /// });
 /// ```
 ///

@@ -428,9 +428,15 @@ impl HostAdmission {
     /// [`EmbeddedWorker`]'s `Drop` (unconditionally attempted, idempotent
     /// either way it lands).
     pub(crate) fn release_loop_claim(&self, generation: u64) {
-        let _ = self
+        match self
             .loop_owner
-            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            // Released, or a successor's generation holds the slot now and
+            // keeps it.
+            Ok(_released) => {}
+            Err(_successor) => {}
+        }
     }
 
     /// Install the process's [`MemberDialer`] — once. `false` when one is
@@ -3930,8 +3936,10 @@ impl EmbeddedWorker {
             return Ok(StopOutcome::NothingToJoin);
         };
         let mut state_rx = self.shared.state_receiver();
-        // The sender lives in `self.shared`, so this cannot error.
-        let _ = state_rx.wait_for(|s| *s != LoopState::Running).await;
+        state_rx
+            .wait_for(|s| *s != LoopState::Running)
+            .await
+            .expect("the loop's state sender lives in `self.shared`");
         // A join error here is a task panic inside `run_until` (every fallible
         // step inside its loop is already caught and logged, not propagated as
         // a panic — the guard reports `Failed`) or the task having been
@@ -7542,7 +7550,7 @@ pub mod training_test_hooks {
                 .map(|i| list.remove(i))
         };
         if let Some(ArmedPause { tx, .. }) = armed {
-            let _ = tx.send(());
+            tx.send(()).expect("the test awaits the pause");
             std::future::pending::<()>().await;
         }
     }

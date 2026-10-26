@@ -303,7 +303,7 @@ impl Drop for Fleet {
     fn drop(&mut self) {
         for w in &mut self.workers {
             sigkill(&mut w.child);
-            let _ = w.child.wait();
+            w.child.wait().expect("reap the killed worker");
         }
     }
 }

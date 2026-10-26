@@ -357,7 +357,9 @@ mod otlp {
         let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.extract(&extractor)
         });
-        let _ = span.set_parent(parent_cx);
+        if let Err(e) = span.set_parent(parent_cx) {
+            tracing::debug!("the request's trace context is not this span's parent: {e}");
+        }
     }
 
     /// Adapts an [`http::HeaderMap`] to OpenTelemetry's

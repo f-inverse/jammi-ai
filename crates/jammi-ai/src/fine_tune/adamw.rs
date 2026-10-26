@@ -763,11 +763,9 @@ mod admission_predicate {
     #[test]
     #[cfg(feature = "cuda")]
     fn grad_on_a_different_device_is_refused_with_the_exact_reason() {
-        let dev_cpu = Device::Cpu;
         let dev_cuda = jammi_test_resources::cuda_device(0);
         let (theta, m, v, _) = valid_quad();
         let g = Tensor::zeros((2, 3), DType::F32, &dev_cuda).unwrap();
-        let _ = &dev_cpu;
         assert_eq!(
             fused_admission_predicate(&theta, &m, &v, &g),
             (false, "theta_moments_grad_share_one_device")

@@ -423,7 +423,9 @@ async fn an_inline_run_now_never_touches_the_holder() {
         .try_hold_rank("rank-beside-inline", 1)
         .expect("a rank is admitted beside an inline run");
     park.release();
-    let _ = run.await.unwrap();
+    run.await
+        .unwrap()
+        .expect_err("the run names a model that does not exist, so released, it fails");
     assert_eq!(
         admission.holder(),
         Holder::Rank {

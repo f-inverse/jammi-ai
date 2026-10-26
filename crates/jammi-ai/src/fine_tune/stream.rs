@@ -313,7 +313,7 @@ async fn emit_step(
             tx.send(Ok(owned)).await.is_ok()
         }
         Err(e) => {
-            let _ = tx.send(Err(JammiError::from(e))).await;
+            end_with(tx, JammiError::from(e)).await;
             false
         }
     }
@@ -531,7 +531,7 @@ async fn walk_past_empty_steps(
         let fresh = match ChunkAccumulator::new_for(detected, label_vocab) {
             Ok(a) => a,
             Err(e) => {
-                let _ = tx.send(Err(e)).await;
+                end_with(tx, e).await;
                 return None;
             }
         };
@@ -600,7 +600,7 @@ async fn run_pump(
     let acc = match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
         Ok(a) => a,
         Err(e) => {
-            let _ = tx.send(Err(e)).await;
+            end_with(&tx, e).await;
             return;
         }
     };
@@ -630,7 +630,7 @@ async fn run_pump(
         let batch = match batch_result {
             Ok(b) => b,
             Err(e) => {
-                let _ = tx.send(Err(JammiError::from(e))).await;
+                end_with(&tx, JammiError::from(e)).await;
                 return;
             }
         };
@@ -671,7 +671,7 @@ async fn run_pump(
                     label_vocab.as_ref(),
                     &mut acc,
                 ) {
-                    let _ = tx.send(Err(e)).await;
+                    end_with(&tx, e).await;
                     return;
                 }
                 let finished = std::mem::replace(
@@ -679,7 +679,7 @@ async fn run_pump(
                     match ChunkAccumulator::new_for(detected, label_vocab.as_ref()) {
                         Ok(a) => a,
                         Err(e) => {
-                            let _ = tx.send(Err(e)).await;
+                            end_with(&tx, e).await;
                             return;
                         }
                     },
@@ -723,22 +723,33 @@ async fn run_pump(
             label_vocab.as_ref(),
             &mut acc,
         ) {
-            let _ = tx.send(Err(e)).await;
+            end_with(&tx, e).await;
             return;
         }
     }
 
     // The underlying read ended before this rank finished its own last
     // range — the table had fewer rows than `window` promised.
-    let _ = tx
-        .send(Err(JammiError::FineTune(format!(
+    end_with(
+        &tx,
+        JammiError::FineTune(format!(
             "streamed window ended after {local_idx} of {} row(s): the table has fewer rows than \
              the window [{}, {}) requires",
             window.len(),
             window.start,
             window.end
-        ))))
-        .await;
+        )),
+    )
+    .await;
+}
+
+/// Hand the trainer `error`, which ends its stream. A trainer that stopped
+/// reading is not told.
+async fn end_with(tx: &tokio::sync::mpsc::Sender<Result<OwnedChunk>>, error: JammiError) {
+    match tx.send(Err(error)).await {
+        Ok(()) => {}
+        Err(_unread) => {}
+    }
 }
 
 /// The load-time pre-pass (module doc): a schema check via the table's own

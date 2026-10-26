@@ -5843,7 +5843,7 @@ mod tests {
         );
         // Never panics on the degenerate empty case (a target with no
         // trainable vars at all is not this function's problem to refuse).
-        let _ = RankContext::canonical_vars_digest(&empty);
+        RankContext::canonical_vars_digest(&empty);
     }
 
     /// `RankContext::dropout_seed`'s own contract — rank 0 reproduces
@@ -7978,7 +7978,7 @@ mod gang_lockstep_oracle {
         // the OS reclaims it at process exit) — the same `TempDir::keep()`
         // precedent `gang_determinism_oracle::file_store` already uses for
         // an identical "must outlive this closure" reason.
-        let _ = dir.keep();
+        drop(dir.keep());
         (session, table)
     }
 
@@ -8999,7 +8999,7 @@ mod gang_determinism_oracle {
         // SAME job_id/backend, `config.epochs = TOTAL_EPOCHS` on BOTH calls ──
         let job_id = "det-job-resume";
         let resume_durable = durable(job_id);
-        let _ = drive_gang(
+        drive_gang(
             "killed",
             job_id,
             TOTAL_EPOCHS,
@@ -9126,7 +9126,7 @@ mod gang_determinism_oracle {
 
         let job_id = "det-job-resume-drop";
         let resume_durable = durable(job_id);
-        let _ = drive_gang(
+        drive_gang(
             "killed-drop",
             job_id,
             TOTAL_EPOCHS,
@@ -9639,13 +9639,13 @@ mod loss_curve_metrics {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {
             let subscriber = tracing_subscriber::registry().with(EpochLossLayer);
-            // Discarded: if some OTHER global default were already installed
-            // (nothing in this crate installs one — a genuine
-            // surprise, not a race, since `OnceLock` already serializes
-            // concurrent callers of THIS fn to one winner), failing softly
-            // here is still strictly better than panicking the whole test
-            // binary over a tracing-capture convenience harness.
-            let _ = tracing::subscriber::set_global_default(subscriber);
+            // Nothing in this crate installs another global default, and
+            // `OnceLock` serializes this fn's callers to one; a default some
+            // other code installed first keeps its place, which is better
+            // than failing the whole test binary over a capture harness.
+            if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+                eprintln!("tracing capture not installed: {e}");
+            }
         });
     }
 

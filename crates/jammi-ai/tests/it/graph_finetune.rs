@@ -274,18 +274,13 @@ fn graph_spec_round_trip_resamples_identical_pairs() {
     // independent deserialisations stand in for two worker attempts at the job.
     let json = serde_json::to_string(&spec).unwrap();
     let resample = |json: &str| -> Vec<jammi_ai::fine_tune::graph_sampler::SampledPair> {
-        let TrainingSpec::GraphFineTune {
-            sources,
-            sample_config,
-            ..
-        } = serde_json::from_str(json).unwrap()
+        let TrainingSpec::GraphFineTune { sample_config, .. } = serde_json::from_str(json).unwrap()
         else {
             panic!("round-trip must yield a GraphFineTune spec");
         };
         // The worker reads the sources from SQL; here the node/edge content is
         // fixed by the fixture, so the sampler input is the same — the only
         // variable across attempts is the seeded sampler, which the spec carries.
-        let _ = &sources;
         let (nodes, edges) = two_communities(EdgeProvenance::Declared);
         GraphSampler::build(nodes, edges, sample_config)
             .unwrap()
@@ -405,7 +400,9 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             )
             .await
             .unwrap();
-        let _ = job.wait().await;
+        job.wait()
+            .await
+            .expect_err("the model does not exist, so the job fails");
         graph_sample_fingerprint_for(job.job_id())
             .expect("materialize_graph_training_set must have sampled and recorded a fingerprint")
     }
@@ -627,7 +624,9 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
         )
         .await
         .unwrap();
-    let _ = job.wait().await;
+    job.wait()
+        .await
+        .expect_err("the model does not exist, so the job fails");
 
     let reserved = graph_sample_reservation_bytes_for(job.job_id())
         .expect("materialize_graph_training_set must have reserved and recorded its bytes");
@@ -722,7 +721,9 @@ async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
         )
         .await
         .unwrap();
-    let _ = job.wait().await;
+    job.wait()
+        .await
+        .expect_err("the model does not exist, so the job fails");
 
     assert_eq!(
         graph_sample_reservation_released_after_write_for(job.job_id()),
@@ -824,7 +825,9 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
         )
         .await
         .unwrap();
-    let _ = job.wait().await;
+    job.wait()
+        .await
+        .expect_err("the model does not exist, so the job fails");
 
     let ready = session
         .catalog()
@@ -1160,7 +1163,9 @@ async fn graph_training_set_recompute_is_byte_identical_over_unmoved_sources() {
         )
         .await
         .unwrap();
-    let _ = job.wait().await;
+    job.wait()
+        .await
+        .expect_err("the model does not exist, so the job fails");
 
     let ready = session
         .catalog()

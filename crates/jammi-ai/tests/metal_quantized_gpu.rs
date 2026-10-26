@@ -1015,13 +1015,13 @@ async fn gguf_vs_f32_metal_throughput_baseline() {
 
     let t0 = Instant::now();
     for &text in &rows {
-        let _ = gguf_gpu.encode_text_query(&gguf_model, text).await.unwrap();
+        gguf_gpu.encode_text_query(&gguf_model, text).await.unwrap();
     }
     let gguf_elapsed = t0.elapsed();
 
     let t0 = Instant::now();
     for &text in &rows {
-        let _ = f32_gpu.encode_text_query(&f32_model, text).await.unwrap();
+        f32_gpu.encode_text_query(&f32_model, text).await.unwrap();
     }
     let f32_elapsed = t0.elapsed();
 

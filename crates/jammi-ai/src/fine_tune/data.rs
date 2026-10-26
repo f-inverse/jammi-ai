@@ -649,11 +649,10 @@ impl TrainingDataLoader {
     /// use jammi_ai::fine_tune::data::TrainingDataLoader;
     ///
     /// let loader = TrainingDataLoader::from_rows(4);
-    /// let (train, _val) = loader.split(0.25);
+    /// let (_train, _val) = loader.split(0.25);
     /// // `loader` was moved into the call above; a second `split` on it
     /// // cannot compile.
     /// let (_train2, _val2) = loader.split(0.25);
-    /// # let _ = train;
     /// ```
     pub fn split(self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         let train_reservation = self.reservation.as_ref().map(|r| r.split(r.size()));

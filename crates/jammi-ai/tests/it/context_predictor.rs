@@ -2085,7 +2085,8 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
         .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
         .await;
 
-    let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+    std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore the weights' permissions");
 
     let err = match result {
         Ok(_) => panic!(

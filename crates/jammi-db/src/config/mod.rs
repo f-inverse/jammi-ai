@@ -2788,9 +2788,9 @@ impl JammiConfig {
         // `InstanceRegistration::from_config`, which `wrap_with`
         // calls (every `InferenceSession` constructor funnels through it),
         // is the ONLY other caller, so a struct-literal config that skips
-        // `load_from` entirely is still covered there. The `Option` is
-        // discarded; this call is for its early-failure side effect only.
-        let _ = crate::catalog::instance::MembershipConfig::validate(&config)?;
+        // `load_from` entirely is still covered there. Only its refusal is
+        // wanted here, not the membership it reads.
+        crate::catalog::instance::MembershipConfig::validate(&config).map(drop)?;
         // Refuse an `[inference]` fan-out or batch size no plan can be built
         // with, at load time and by name. The second call site (a
         // struct-literal `JammiConfig` that skips this function entirely) is

@@ -71,6 +71,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -270,9 +271,12 @@ impl TriggerBroker for PostgresBroker {
         if self.suppress_next_notify.swap(false, Ordering::SeqCst) {
             return Ok(Offset::new(offset, produced_at));
         }
-        // Best-effort enqueue: a full queue means many topics already
-        // have a pending NOTIFY in flight; the idle tick covers the drop.
-        let _ = self.wake_tx.try_send((topic_id, offset));
+        match self.wake_tx.try_send((topic_id, offset)) {
+            // A full queue means many topics already have a NOTIFY in flight,
+            // and the idle tick covers the dropped wake; a closed one means
+            // the notifier stopped with the broker.
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {}
+        }
         Ok(Offset::new(offset, produced_at))
     }
 
@@ -484,13 +488,13 @@ fn parse_payload(payload: &str) -> Option<(TopicId, u64)> {
 
 fn wake_topic(topics: &Topics, topic_id: TopicId, offset: Option<u64>) {
     if let Some(state) = topics.read().get(&topic_id) {
-        let _ = state.sender.send(offset);
+        super::fan_out(&state.sender, offset);
     }
 }
 
 fn wake_all(topics: &Topics) {
     for state in topics.read().values() {
-        let _ = state.sender.send(None);
+        super::fan_out(&state.sender, None);
     }
 }
 

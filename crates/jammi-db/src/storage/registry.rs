@@ -187,6 +187,6 @@ mod tests {
         let store = r
             .driver_for(&url, None)
             .expect("r2 driver builds via default cloud");
-        let _ = format!("{store}");
+        assert!(!store.to_string().is_empty(), "the driver names itself");
     }
 }

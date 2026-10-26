@@ -302,11 +302,11 @@ async fn broadcast_fan_out_to_two_subscribers(backend: BackendKind) {
         tokio::select! {
             biased;
             Some(b) = stream_x.next() => {
-                let _ = b.unwrap();
+                b.expect("a delivered batch");
                 count_x += 1;
             }
             Some(b) = stream_y.next() => {
-                let _ = b.unwrap();
+                b.expect("a delivered batch");
                 count_y += 1;
             }
         }

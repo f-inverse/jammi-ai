@@ -68,7 +68,7 @@ async fn ann_cache_lifecycle_and_concurrency() {
         handles.push(tokio::spawn(async move {
             let query = vec![i as f32; 32];
             cache.put("src", "tbl", &query, 10, vec![]).await;
-            let _ = cache.get("src", "tbl", &query, 10).await;
+            cache.get("src", "tbl", &query, 10).await;
             if i % 5 == 0 {
                 cache.invalidate_source("src").unwrap();
             }

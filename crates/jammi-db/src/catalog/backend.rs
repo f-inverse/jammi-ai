@@ -1081,10 +1081,15 @@ pub(crate) const CLOSE_DRAIN_CEILING: std::time::Duration = std::time::Duration:
 /// on a `Builder::new_current_thread()` runtime. Sleeping on a blocking-pool
 /// thread needs neither.
 pub(crate) async fn shutdown_wait_step() {
-    let _ = tokio::task::spawn_blocking(|| {
+    let slept = tokio::task::spawn_blocking(|| {
         std::thread::sleep(std::time::Duration::from_millis(1));
     })
     .await;
+    match slept {
+        // A runtime shutting down cancels the sleep: the step is over either
+        // way.
+        Ok(()) | Err(_) => {}
+    }
 }
 
 /// Close `pool` and wait until it holds **no** live connections.
@@ -1427,7 +1432,10 @@ mod close_barrier_tests {
         options.after_release(move |_conn, _meta| {
             let entered = entered.clone();
             Box::pin(async move {
-                let _ = entered.send(());
+                match entered.send(()) {
+                    // A release after the test stopped watching tells no one.
+                    Ok(()) | Err(_) => {}
+                }
                 tokio::time::sleep(RETURN_PARK).await;
                 Ok(true)
             })

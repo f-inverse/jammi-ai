@@ -275,14 +275,13 @@ impl ExecutionPlan for MaskExec {
         let mask = Arc::clone(&self.mask);
         let version = self.version;
         let row_id_index = self.row_id_index;
+        #[cfg(feature = "test-hooks")]
         let table = self.table_name.clone();
         // The input stream is opened AFTER the (test-only) park so a test can
         // delete the fragment object in the window before the drain.
         let stream = futures::stream::once(async move {
             #[cfg(feature = "test-hooks")]
             masked_scan_test_hooks::maybe_park_before_masked_scan_drain(&table).await;
-            #[cfg(not(feature = "test-hooks"))]
-            let _ = &table;
             match input.execute(partition, context) {
                 Ok(inner) => inner
                     .map(move |b| {
@@ -397,7 +396,12 @@ pub mod masked_scan_test_hooks {
             if self.state.arrivals.load(Ordering::SeqCst) > 0 {
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+                .await
+                .is_err()
+            {
+                tracing::warn!("test hook: waited 5 s for a scan that never parked");
+            }
         }
 
         /// How many scans have parked so far.
@@ -445,7 +449,12 @@ pub mod masked_scan_test_hooks {
         if state.released.load(Ordering::SeqCst) {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), released).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(30), released)
+            .await
+            .is_err()
+        {
+            tracing::warn!("test hook: the scan park released by its 30 s bound");
+        }
     }
 }
 

@@ -291,10 +291,7 @@ async fn run_tail_loop(
                 if off == cursor + 1 {
                     cursor = off;
                     if tenant_visible(tenant, delivered.tenant) {
-                        // A closed channel (zero receivers) is not a fan-out
-                        // failure — the same rule `InMemoryBroker::publish`
-                        // documents.
-                        let _ = sender.send(delivered);
+                        super::fan_out(&sender, delivered);
                     }
                 } else if off > cursor + 1 {
                     cursor = replay_and_fan_out(
@@ -383,7 +380,7 @@ async fn replay_and_fan_out(
                                 // `Subscriber::drain_replay`'s own replay path.
                                 tenant: None,
                             };
-                            let _ = sender.send(delivered);
+                            super::fan_out(sender, delivered);
                         }
                         cursor = new_cursor;
                         if drained {

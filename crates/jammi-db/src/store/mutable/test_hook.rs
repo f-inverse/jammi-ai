@@ -71,7 +71,9 @@ async fn signal_and_park(ready_file: PathBuf) {
         return;
     }
     if let Some(parent) = ready_file.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("checkpoint ready-file directory");
     }
     tokio::fs::write(&ready_file, b"ready")
         .await
@@ -351,9 +353,14 @@ pub async fn maybe_signal_point(point: MaterializationPoint, writer_id: &str) {
             tokio::pin!(released);
             released.as_mut().enable();
             if !state.released.load(Ordering::SeqCst) {
-                // Timeout is the documented bound, not a failure: the writer
-                // proceeds and the test's own assertions decide.
-                let _ = tokio::time::timeout(IN_PROCESS_PARK_TIMEOUT, released).await;
+                // The timeout is the park's documented bound, not a failure:
+                // the writer proceeds and the test's own assertions decide.
+                if tokio::time::timeout(IN_PROCESS_PARK_TIMEOUT, released)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("test hook: the park released by its timeout");
+                }
             }
         }
         return;
@@ -448,6 +455,12 @@ pub async fn maybe_signal_migration_ledger_read(kind: BackendKind) {
         release.notify_waiters();
         return;
     }
-    // Timeout is the documented bound, not a failure: the caller proceeds.
-    let _ = tokio::time::timeout(MIGRATION_LEDGER_BARRIER_TIMEOUT, notified).await;
+    // The timeout is the barrier's documented bound, not a failure: the caller
+    // proceeds.
+    if tokio::time::timeout(MIGRATION_LEDGER_BARRIER_TIMEOUT, notified)
+        .await
+        .is_err()
+    {
+        tracing::warn!("test hook: the migration barrier released by its timeout");
+    }
 }

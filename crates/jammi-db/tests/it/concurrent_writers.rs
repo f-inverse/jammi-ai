@@ -298,7 +298,7 @@ async fn begin_window_cancellation_does_not_poison_pool() {
             let catalog = Arc::clone(&catalog);
             handles.push(tokio::spawn(async move {
                 let backend = catalog.backend_arc();
-                let _ = backend
+                let written = backend
                     .transaction(TxOptions::default(), |tx| {
                         Box::pin(async move {
                             tx.execute("UPDATE begin_probe SET n = n + 1 WHERE id = 1", &[])
@@ -307,6 +307,11 @@ async fn begin_window_cancellation_does_not_poison_pool() {
                         })
                     })
                     .await;
+                // A writer racing the begin may land or lose the race; the
+                // round's assertions read what the survivors left.
+                match written {
+                    Ok(()) | Err(_) => {}
+                }
             }));
         }
 
@@ -316,7 +321,7 @@ async fn begin_window_cancellation_does_not_poison_pool() {
             let micros = 1 + (k as u64) * 37 + (round as u64 % 13);
             handles.push(tokio::spawn(async move {
                 let backend = catalog.backend_arc();
-                let _ = tokio::time::timeout(
+                let cancelled = tokio::time::timeout(
                     Duration::from_micros(micros),
                     backend.transaction(TxOptions::default(), |tx| {
                         Box::pin(async move {
@@ -327,6 +332,11 @@ async fn begin_window_cancellation_does_not_poison_pool() {
                     }),
                 )
                 .await;
+                // Cancelled at its deadline or done before it: either way the
+                // round reads what landed.
+                match cancelled {
+                    Ok(_) | Err(_) => {}
+                }
             }));
         }
 

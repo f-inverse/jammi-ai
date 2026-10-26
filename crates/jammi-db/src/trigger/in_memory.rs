@@ -141,14 +141,15 @@ impl TriggerBroker for InMemoryBroker {
             .get(&topic_id)
             .map(|s| s.sender.clone())
             .ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
-        // `Sender::send` returns Err only when there are zero receivers,
-        // which is not a delivery failure for fan-out semantics.
-        let _ = sender.send(DeliveredBatch {
-            offset: off,
-            produced_at,
-            batch,
-            tenant: publish_tenant,
-        });
+        super::fan_out(
+            &sender,
+            DeliveredBatch {
+                offset: off,
+                produced_at,
+                batch,
+                tenant: publish_tenant,
+            },
+        );
         Ok(off)
     }
 

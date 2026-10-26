@@ -1752,7 +1752,8 @@ async fn source_busy_rolls_back_the_whole_delete_not_only_the_busy_row(kind: Bac
         .await
         .unwrap()
         .is_some());
-    let _ = building; // keep the live lease held for the duration of the call above
+    // The live lease is held through every call above.
+    drop(building);
 }
 
 /// Two recoverers racing on ONE expired-lease row (valid Parquet + sidecar):

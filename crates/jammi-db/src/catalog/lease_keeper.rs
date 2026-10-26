@@ -374,9 +374,12 @@ impl LeaseKeeper {
                     Ok(rt) => rt,
                     Err(e) => {
                         error!(error = %e, "lease keeper: failed to build its dedicated runtime");
-                        let _ = ready_tx.send(Err(JammiError::Internal(format!(
-                            "lease keeper: failed to build its dedicated runtime: {e}"
-                        ))));
+                        report_ready(
+                            ready_tx,
+                            Err(JammiError::Internal(format!(
+                                "lease keeper: failed to build its dedicated runtime: {e}"
+                            ))),
+                        );
                         return;
                     }
                 };
@@ -385,7 +388,7 @@ impl LeaseKeeper {
                         Ok(c) => c,
                         Err(e) => {
                             error!(error = %e, "lease keeper: gave up opening its own catalog connection");
-                            let _ = ready_tx.send(Err(e));
+                            report_ready(ready_tx, Err(e));
                             return;
                         }
                     };
@@ -395,7 +398,7 @@ impl LeaseKeeper {
                     // dated from, so it runs before readiness is reported.
                     renew_all(&catalog, &thread_holds, &thread_liveness, intervals).await;
                     thread_liveness.alive.store(true, Ordering::SeqCst);
-                    let _ = ready_tx.send(Ok(()));
+                    report_ready(ready_tx, Ok(()));
                     loop {
                         // Wake on whichever comes first: the next heartbeat
                         // tick, or a shutdown signal — so
@@ -943,4 +946,13 @@ async fn release_job_holds_on_thread(
         "every attempted hold must land in exactly one of released/not_required/failed"
     );
     outcome
+}
+
+/// Report the keeper's readiness to `start`, which awaits it. A `start` that
+/// was cancelled first is no longer waiting, and there is no one to tell.
+fn report_ready(ready_tx: tokio::sync::oneshot::Sender<Result<()>>, readiness: Result<()>) {
+    match ready_tx.send(readiness) {
+        Ok(()) => {}
+        Err(_unheard) => {}
+    }
 }

@@ -51,6 +51,8 @@ mod mutable_federation;
 mod mutable_tables;
 #[cfg(feature = "live-postgres-tests")]
 mod postgres_money;
+#[cfg(feature = "live-postgres-tests")]
+mod postgres_types;
 mod read_vectors;
 mod reconcile;
 mod reconcile_artifacts;

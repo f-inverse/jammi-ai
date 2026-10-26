@@ -27,9 +27,26 @@ db.add_source("papers", url="/data/papers.parquet", format="parquet")
 db.sql("SELECT id, title FROM pg_data.public.articles WHERE published LIMIT 10")
 ```
 
-A Postgres source serves the tables of the database's `public` schema; a MySQL source
-serves the tables of the database its URL names. Both appear under the source's name
-with the `public` schema: `pg_data.public.articles`, `mysql_data.public.assignees`.
+A Postgres source serves the tables, views and materialized views of the database's
+`public` schema; a MySQL source serves the tables of the database its URL names. Both
+appear under the source's name with the `public` schema: `pg_data.public.articles`,
+`mysql_data.public.assignees`.
+
+## Postgres column types
+
+Every column of every type reads as the value it holds, and no column's type keeps its
+table, or any other table of the source, from registering. A column is read as stored
+when it is a number, a bounded or unbounded `numeric`, `boolean`, a string type, `uuid`,
+`bytea`, `date`, `time`, `timestamptz`, `interval`, or an array of numbers, booleans or
+strings. Postgres converts the rest before the engine reads them, and a filter, sort or
+aggregate the database runs compares the converted value:
+
+| Type | Read as |
+|---|---|
+| a domain | its base type |
+| `money` | `numeric(19, s)`, `s` the database's money scale (read when the source registers) |
+| `timestamp` | the instant it names at UTC; every session runs with `TimeZone` set to UTC |
+| every other type (`jsonb`, `json`, `citext`, `timetz`, an enum, `inet`, `tsvector`, `xml`, `bit`, …) | its text |
 
 ## Rust
 

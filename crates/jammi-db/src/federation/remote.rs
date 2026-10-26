@@ -42,7 +42,10 @@ use datafusion::logical_expr::{
     SortExpr, TableProviderFilterPushDown, TableScan, TableSource, TableType,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTable, SQLTableSource};
+use datafusion::sql::sqlparser::ast::Statement;
+use datafusion_federation::sql::{
+    AstAnalyzer, SQLExecutor, SQLFederationProvider, SQLTable, SQLTableSource,
+};
 use datafusion_federation::{get_table_source, FederatedTableProviderAdaptor};
 
 use super::RemoteExec;
@@ -114,14 +117,20 @@ impl Remote {
     }
 }
 
+/// How a remote reads a table it cannot read as stored: a rewrite of every
+/// statement that names the table.
+pub(crate) type Reads = Arc<dyn Fn(Statement) -> Result<Statement> + Send + Sync>;
+
 /// A table of `remote`: `provider` scans it and `executor` runs the SQL
-/// federation writes for it, and neither is handed a node or a filter the
-/// remote would read differently.
+/// federation writes for it — through `reads`, when the table is read
+/// through one — and neither is handed a node or a filter the remote would
+/// read differently.
 pub(crate) fn table_provider(
     remote: Remote,
     reference: TableReference,
     provider: Arc<dyn TableProvider>,
     executor: Arc<dyn SQLExecutor>,
+    reads: Option<Reads>,
 ) -> Arc<dyn TableProvider> {
     let schema = provider.schema();
     let source = SQLTableSource::new_with_table(
@@ -130,6 +139,7 @@ pub(crate) fn table_provider(
             remote,
             reference,
             schema,
+            reads,
         }),
     );
     Arc::new(FederatedTableProviderAdaptor::new_with_provider(
@@ -396,12 +406,23 @@ fn unaliased(expr: &Expr) -> &Expr {
 }
 
 /// The remote table federation writes SQL for; it marks the table as
-/// [`Remote`]'s so [`federable`] knows whose semantics apply.
-#[derive(Debug)]
+/// [`Remote`]'s so [`federable`] knows whose semantics apply, and carries
+/// how the remote reads it.
 struct RemoteTable {
     remote: Remote,
     reference: TableReference,
     schema: SchemaRef,
+    reads: Option<Reads>,
+}
+
+impl std::fmt::Debug for RemoteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteTable")
+            .field("remote", &self.remote)
+            .field("reference", &self.reference)
+            .field("reads", &self.reads.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SQLTable for RemoteTable {
@@ -415,6 +436,11 @@ impl SQLTable for RemoteTable {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        let reads = self.reads.clone()?;
+        Some(Box::new(move |statement| reads(statement)))
     }
 }
 
@@ -642,7 +668,13 @@ mod tests {
             sent: Arc::clone(&sent),
         });
         let table = MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap();
-        let provider = table_provider(remote, TableReference::bare("t"), Arc::new(table), executor);
+        let provider = table_provider(
+            remote,
+            TableReference::bare("t"),
+            Arc::new(table),
+            executor,
+            None,
+        );
         let base = SessionContext::new().state();
         let mut rules = base.optimizer().rules.clone();
         let at = rules

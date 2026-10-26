@@ -202,6 +202,15 @@ The dependency audit is green again on the live advisory database, and database 
   returns. The rows a database produces are a `RemoteExec`, a source no engine optimizer
   reaches into, so a filter or sort above them stays above them (#739). A live test runs every
   admitted and refused construct over Postgres and over the same rows in a file.
+- **Every Postgres column reads as the value it holds, and none fails its source.** The
+  driver named a column's type from its type name and failed the whole source's registration
+  on one it did not know — a domain, `jsonb`, `citext`, `timetz` (#740) — failed every query
+  selecting `tsvector`, `inet`, `xml` or `bit`, and dropped every `timestamp` before 1970 from
+  its column, failing the batch (#744). The engine now reads a source's columns from
+  Postgres's own catalog and, column by column, reads a type as stored where the driver reads
+  it correctly and through Postgres where it does not: a domain as its base type, `money` as
+  `numeric`, a `timestamp` as its instant at UTC (every session pins `TimeZone` to UTC), every
+  other type as its text. A source also serves its views and materialized views.
 
 - **A filter on a database column holds when the query also joins a file.** The engine ran such a
   filter above the federated scan, and physical filter pushdown handed it to that scan, which took

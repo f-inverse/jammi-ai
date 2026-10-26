@@ -2,33 +2,30 @@
 //!
 //! Gated behind the `postgres` feature flag.
 
-mod money;
+mod columns;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
-use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use secrecy::SecretString;
 
 use crate::error::{JammiError, Result};
-use crate::federation::remote::{self, Remote};
 use crate::pg_uri::{Keyword, PgUri};
 use crate::source::{database, SourceConnection};
 
 /// The schema whose tables a Postgres source serves.
 const SCHEMA: &str = "public";
 
-/// Create table providers for all public tables in a Postgres database.
+/// Create table providers for every table, view and materialized view of
+/// the database's `public` schema.
 ///
 /// Returns `(table_name, Arc<dyn TableProvider>)` pairs, each a
-/// [`Remote::Postgres`] table: Postgres is sent only what it runs as the
-/// engine does ([`remote`]). A table with a `money` column is read through
-/// [`money`], as the amounts it holds.
+/// [`crate::federation::remote::Remote::Postgres`] table: Postgres is sent
+/// only what it runs as the engine does, and each column is read as the
+/// engine reads its type ([`columns`]).
 pub async fn create_postgres_tables(
     source_id: &str,
     connection: &SourceConnection,
@@ -43,44 +40,17 @@ pub async fn create_postgres_tables(
         .await
         .map_err(|e| failed(format!("Failed to connect to Postgres: {e}")))?;
     let pool = Arc::new(pool);
-    let money_columns = money::money_columns(&pool, SCHEMA)
+    let tables = columns::columns(&pool, SCHEMA)
         .await
-        .map_err(|e| failed(format!("listing the `money` columns of `{SCHEMA}`: {e}")))?;
-    let scale = if money_columns.is_empty() {
-        0
-    } else {
-        money::money_scale(&pool)
-            .await
-            .map_err(|e| failed(format!("reading the database's money scale: {e}")))?
-    };
-    let (pool, money_columns) = (&pool, &money_columns);
-    database::schema_tables(source_id, pool.as_ref(), SCHEMA, move |table| async move {
-        match money_columns.get(table.table()) {
-            Some(money) => money::table_provider(pool, table, money, scale).await,
-            None => remote_table(pool, table).await,
-        }
-    })
-    .await
-}
-
-/// `table` as a [`Remote::Postgres`] table: the driver's scan of it, and the
-/// driver's executor for the SQL federation writes for it.
-async fn remote_table(
-    pool: &Arc<PostgresConnectionPool>,
-    table: TableReference,
-) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let dyn_pool: Arc<DynPostgresConnectionPool> = Arc::clone(pool) as _;
-    let sql_table = Arc::new(
-        SqlTable::new("postgres", &dyn_pool, table.clone())
-            .await?
-            .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
-    Ok(remote::table_provider(
-        Remote::Postgres,
-        table,
-        Arc::clone(&sql_table) as _,
-        sql_table,
-    ))
+        .map_err(|e| failed(format!("reading the columns of `{SCHEMA}`: {e}")))?;
+    Ok(tables
+        .into_iter()
+        .map(|(name, columns)| {
+            let provider =
+                columns::remote_table(&pool, TableReference::bare(name.as_str()), &columns);
+            (name, provider)
+        })
+        .collect())
 }
 
 /// The driver's pool parameters for a libpq connection URI.
@@ -92,6 +62,9 @@ async fn remote_table(
 /// same URL. The driver takes no client certificate, so a URI naming one is
 /// refused rather than connected without it. `options` are the driver's own
 /// parameters and override what the URI says.
+///
+/// Every session runs at UTC ([`SESSION`]), whatever `options` the URI
+/// names besides.
 ///
 /// The driver writes [`INTERPOLATED`] values into a keyword string unquoted
 /// and hands the rest to typed setters, so those values arrive quoted
@@ -106,10 +79,17 @@ fn pool_params(
         .params()
         .map(|(keyword, value)| Ok((driver_parameter(keyword)?.to_string(), value.to_string())))
         .collect::<std::result::Result<Vec<_>, String>>()?;
-    Ok([("sslmode".to_string(), "prefer".to_string())]
+    let mut params: HashMap<String, String> = [("sslmode".to_string(), "prefer".to_string())]
         .into_iter()
         .chain(from_uri)
         .chain(options.clone())
+        .collect();
+    let session = params
+        .remove("options")
+        .map_or_else(|| SESSION.to_string(), |named| format!("{named} {SESSION}"));
+    params.insert("options".into(), session);
+    Ok(params
+        .into_iter()
         .map(|(key, value)| {
             let value = if INTERPOLATED.contains(&key.as_str()) {
                 quoted(&value)
@@ -120,6 +100,12 @@ fn pool_params(
         })
         .collect())
 }
+
+/// The session settings every connection runs with, last on its `options`
+/// so they hold over any the URI names: `TimeZone` is UTC, as the engine's
+/// zoned timestamps are, and as a `timestamp` column is read and compared
+/// (its instant at UTC).
+const SESSION: &str = "-c TimeZone=UTC";
 
 /// The driver parameters it writes into its keyword connection string as
 /// given; every other parameter reaches the driver's config through a setter.
@@ -181,6 +167,7 @@ mod tests {
                 ("pass", "s@cret"),
                 ("db", "'sales'"),
                 ("sslmode", "prefer"),
+                ("options", "-c TimeZone=UTC"),
             ])
         );
     }
@@ -195,6 +182,7 @@ mod tests {
                 ("user", "'postgres'"),
                 ("db", "'postgres'"),
                 ("sslmode", "prefer"),
+                ("options", "-c TimeZone=UTC"),
             ])
         );
     }
@@ -232,6 +220,17 @@ mod tests {
         let options = HashMap::from([("sslmode".to_string(), "disable".to_string())]);
         let got = pool_params("postgres://u@h/d?sslmode=require", &options).unwrap();
         assert_eq!(got["sslmode"].expose_secret(), "disable");
+    }
+
+    /// Every session runs at UTC; options the URI names come first, so the
+    /// engine's setting holds over them.
+    #[test]
+    fn every_session_runs_at_utc_after_the_uris_own_options() {
+        assert_eq!(params("postgres://u@h/d")["options"], "-c TimeZone=UTC");
+        assert_eq!(
+            params("postgres://u@h/d?options=-c%20statement_timeout%3D5000")["options"],
+            "-c statement_timeout=5000 -c TimeZone=UTC"
+        );
     }
 
     #[test]

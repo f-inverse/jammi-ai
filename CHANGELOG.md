@@ -6,6 +6,16 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **Every advisory a reachable release fixes is fixed.** rustls 0.23.46, rustls-webpki 0.103.16,
+  webpki-roots 1.0.11, tokio 1.54.1, ctutils 0.4.6 and zstd-sys 2.1.2, and DataFusion's file
+  compression codecs on zstd 0.14 / zstd-safe 8.2.
+- **An advisory exception says why it is unreached and what clears it.** `deny.toml` excepts only
+  advisories no release of the crate that pulls them in can fix: zip 8 (candle-core requires
+  ^8.6 and never extracts an archive), zstd 0.13 (arrow, parquet, DataFusion and tantivy require
+  ^0.13 and call only the unaffected bulk and read paths), and unsafe-libyaml (a substrait build
+  dependency, linked into no binary). The two pyo3 exceptions name their real gate, arrow 59,
+  in place of a release freeze.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

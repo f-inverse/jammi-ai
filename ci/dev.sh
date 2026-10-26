@@ -108,11 +108,16 @@ if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker manifest inspect 
   exit 1
 fi
 
+# The platform every container of this run starts for: JAMMI_CI_PLATFORM's
+# when set, so an amd64-only image runs emulated on an arm64 host.
+platform=()
+[ -n "${JAMMI_CI_PLATFORM:-}" ] && platform=(--platform "$JAMMI_CI_PLATFORM")
+
 # A run that fills the Docker VM's disk halts the VM; refuse before that
 # point, naming the number, on both sides of the VM boundary.
 free_gib_host() { df -Pk / | awk 'NR==2 {printf "%d", $4 / 1048576}'; }
 free_gib_vm() {
-  docker run --rm -v jammi-dev-target:/cache/target "$image" df -Pk /cache/target \
+  docker run --rm ${platform[@]+"${platform[@]}"} -v jammi-dev-target:/cache/target "$image" df -Pk /cache/target \
     | awk 'NR==2 {printf "%d", $4 / 1048576}'
 }
 for side in host vm; do
@@ -142,7 +147,7 @@ case "$git_common" in
   "$repo"/*) ;;
   *) args+=(-v "$git_common:$git_common") ;;
 esac
-[ -n "${JAMMI_CI_PLATFORM:-}" ] && args+=(--platform "$JAMMI_CI_PLATFORM")
+args+=(${platform[@]+"${platform[@]}"})
 [ -t 0 ] && [ -t 1 ] && args+=(-it)
 # shellcheck disable=SC2206  # deliberate word-splitting of the caller's extra args
 [ -n "${JAMMI_DEV_DOCKER_ARGS:-}" ] && args+=(${JAMMI_DEV_DOCKER_ARGS})

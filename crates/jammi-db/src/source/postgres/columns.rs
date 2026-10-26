@@ -96,6 +96,7 @@ impl Column {
 
 /// One column as the catalog describes it.
 struct Described {
+    schema: String,
     table: String,
     name: String,
     not_null: bool,
@@ -108,17 +109,18 @@ struct Described {
     element: Option<String>,
 }
 
-/// The columns of every table, view and materialized view of `schema`, in
-/// column order, by relation name.
+/// The columns of every table, view and materialized view of every schema
+/// the connecting role may use — the system schemas aside — in column
+/// order, by `(schema, relation)`.
 pub(super) async fn columns(
     pool: &PostgresConnectionPool,
-    schema: &str,
-) -> Result<BTreeMap<String, Vec<Column>>, BoxError> {
+) -> Result<BTreeMap<(String, String), Vec<Column>>, BoxError> {
     let connection = pool.connect_direct().await?;
     let rows = connection
         .conn
         .query(
-            "SELECT c.relname::text, a.attname::text, a.attnotnull, et.typname::text, \
+            "SELECT n.nspname::text, c.relname::text, a.attname::text, a.attnotnull, \
+                    et.typname::text, \
                     format_type(et.oid, CASE WHEN t.typtype = 'd' THEN t.typtypmod \
                                              ELSE a.atttypmod END), \
                     t.typtype = 'd', el.typname::text \
@@ -129,23 +131,27 @@ pub(super) async fn columns(
              JOIN pg_type et ON et.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype \
                                               ELSE t.oid END \
              LEFT JOIN pg_type el ON el.oid = et.typelem AND et.typcategory = 'A' \
-             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%' \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
                AND NOT c.relispartition AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY c.relname, a.attnum",
-            &[&schema],
+             ORDER BY n.nspname, c.relname, a.attnum",
+            &[],
         )
         .await?;
     let described = rows
         .iter()
         .map(|row| {
             Ok(Described {
-                table: row.try_get(0)?,
-                name: row.try_get(1)?,
-                not_null: row.try_get(2)?,
-                type_name: row.try_get(3)?,
-                formatted: row.try_get(4)?,
-                domain: row.try_get(5)?,
-                element: row.try_get(6)?,
+                schema: row.try_get(0)?,
+                table: row.try_get(1)?,
+                name: row.try_get(2)?,
+                not_null: row.try_get(3)?,
+                type_name: row.try_get(4)?,
+                formatted: row.try_get(5)?,
+                domain: row.try_get(6)?,
+                element: row.try_get(7)?,
             })
         })
         .collect::<Result<Vec<_>, BoxError>>()?;
@@ -154,10 +160,10 @@ pub(super) async fn columns(
     } else {
         None
     };
-    let mut tables: BTreeMap<String, Vec<Column>> = BTreeMap::new();
+    let mut tables: BTreeMap<(String, String), Vec<Column>> = BTreeMap::new();
     for column in described {
-        let (data_type, read) = reading(&column, money_scale);
-        tables.entry(column.table).or_default().push(Column {
+        let (data_type, read) = reading(&column, money_scale)?;
+        tables.entry((column.schema, column.table)).or_default().push(Column {
             name: column.name,
             data_type,
             nullable: !column.not_null,
@@ -182,20 +188,24 @@ async fn money_scale(pool: &PostgresConnectionPool) -> Result<i8, BoxError> {
 
 /// The Arrow type a column is read as, and how. The types read as stored
 /// are those the driver both names and converts correctly; every other type
-/// is read through Postgres.
-fn reading(column: &Described, money_scale: Option<i8>) -> (DataType, Read) {
+/// is read through Postgres. `money_scale` is the database's, read whenever
+/// a `money` column exists.
+fn reading(column: &Described, money_scale: Option<i8>) -> Result<(DataType, Read), BoxError> {
     let direct = |data_type| (data_type, Read::Direct);
-    match column.type_name.as_str() {
+    Ok(match column.type_name.as_str() {
         "int2" => direct(DataType::Int16),
         "int4" => direct(DataType::Int32),
         "int8" => direct(DataType::Int64),
         "float4" => direct(DataType::Float32),
         "float8" => direct(DataType::Float64),
         "bool" => direct(DataType::Boolean),
-        "numeric" => {
-            let (precision, scale) = numeric_modifier(&column.formatted).unwrap_or(NUMERIC_DEFAULT);
-            direct(DataType::Decimal128(precision, scale))
-        }
+        "numeric" => match numeric_modifier(&column.formatted) {
+            Some((precision, scale)) => direct(DataType::Decimal128(precision, scale)),
+            None if column.formatted == "numeric" => {
+                direct(DataType::Decimal128(NUMERIC_DEFAULT.0, NUMERIC_DEFAULT.1))
+            }
+            None => (DataType::Utf8, Read::Text),
+        },
         "text" | "varchar" | "bpchar" | "name" | "uuid" => direct(DataType::Utf8),
         "bytea" => direct(DataType::Binary),
         "date" => direct(DataType::Date32),
@@ -203,15 +213,17 @@ fn reading(column: &Described, money_scale: Option<i8>) -> (DataType, Read) {
         "timestamptz" => direct(DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))),
         "interval" => direct(DataType::Interval(IntervalUnit::MonthDayNano)),
         "timestamp" => (DataType::Timestamp(TimeUnit::Nanosecond, None), Read::AtUtc),
-        "money" => match money_scale {
-            Some(scale) => (DataType::Decimal128(MONEY_PRECISION, scale), Read::Money { scale }),
-            None => (DataType::Utf8, Read::Text),
-        },
+        "money" => {
+            let scale = money_scale.ok_or_else(|| {
+                format!("`{}` is money, and the money scale was not read", column.name)
+            })?;
+            (DataType::Decimal128(MONEY_PRECISION, scale), Read::Money { scale })
+        }
         _ => match column.element.as_deref().and_then(array_element) {
             Some(element) => direct(DataType::List(Arc::new(Field::new("item", element, true)))),
             None => (DataType::Utf8, Read::Text),
         },
-    }
+    })
 }
 
 /// The element type of an array the driver reads as stored.
@@ -482,6 +494,7 @@ mod tests {
 
     fn described(type_name: &str, formatted: &str, domain: bool, element: Option<&str>) -> Described {
         Described {
+            schema: "public".into(),
             table: "t".into(),
             name: "c".into(),
             not_null: false,
@@ -557,7 +570,7 @@ mod tests {
         ] {
             let column = described(type_name, formatted, domain, element);
             assert_eq!(
-                reading(&column, Some(2)),
+                reading(&column, Some(2)).unwrap(),
                 (data_type, read),
                 "{formatted}"
             );

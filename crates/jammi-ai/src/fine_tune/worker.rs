@@ -155,7 +155,7 @@ use jammi_db::catalog::status::{JobKind, JobKinds, JobPhase};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
 };
@@ -1385,12 +1385,11 @@ pub(crate) async fn materialize_graph_training_set(
     sample_config: GraphSampleConfig,
     inputs: Vec<InputAnchor>,
 ) -> Result<jammi_db::store::TrainingSetTable> {
-    let node_table = session.find_table_name(&sources.node_source).await?;
+    let node_table = session.first_table(&sources.node_source).await?;
     let id_col = quote_ident(&sources.id_column);
     let text_col = quote_ident(&sources.text_column);
     let node_query = format!(
-        "SELECT {id_col}, {text_col} FROM {} ORDER BY {id_col} ASC NULLS FIRST, {text_col} ASC NULLS FIRST",
-        source_relation(&sources.node_source, &node_table)
+        "SELECT {id_col}, {text_col} FROM {node_table} ORDER BY {id_col} ASC NULLS FIRST, {text_col} ASC NULLS FIRST"
     );
     let node_batches = session.sql(&node_query).await?;
     let mut nodes = Vec::new();
@@ -1418,7 +1417,7 @@ pub(crate) async fn materialize_graph_training_set(
     let edge_relation = match &sources.edges {
         GraphEdges::Table(table) => jammi_db::store::result_table_relation(table).to_string(),
         GraphEdges::Source { source, .. } => {
-            source_relation(source, &session.find_table_name(source).await?)
+            session.first_table(source).await?.to_string()
         }
     };
     let src_col = quote_ident(src_name);

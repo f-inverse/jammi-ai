@@ -1205,7 +1205,7 @@ fn cases() -> Vec<IsolationCase> {
         ),
         // `asof_join` reads two tenant-scoped SOURCE relations (not embedding
         // tables): it resolves each through the session's tenant-scoped catalog
-        // (`find_table_name` over the per-tenant source list), so a caller cannot
+        // (`first_table` over the per-tenant source list), so a caller cannot
         // point either side at another tenant's relation. The join runs no model,
         // so this gate — source resolution — is the whole tenant boundary, and it
         // is asserted for real here. A peer cannot even resolve tenant A's source
@@ -1214,7 +1214,7 @@ fn cases() -> Vec<IsolationCase> {
             assert_source_resolver_isolated().await;
         }),
         // `build_lexical_index` reads one registered SOURCE, resolved through
-        // the session's tenant-scoped catalog (`find_table_name`) before any
+        // the session's tenant-scoped catalog (`first_table`) before any
         // row is planned, so source resolution is its whole tenant boundary —
         // the gate `AsofJoin` rides.
         case!(
@@ -1229,7 +1229,7 @@ fn cases() -> Vec<IsolationCase> {
         // `generate_structure_embeddings` reads no embedding table and runs no
         // model: its one input is the edge relation, a registered SOURCE it
         // resolves through the session's tenant-scoped catalog
-        // (`find_table_name`, inside `require_source_columns`) before any row
+        // (`first_table`, inside `require_source_columns`) before any row
         // is planned — and the edge scan itself runs through the tenant-scope
         // analyzer rule. Source resolution is therefore the whole tenant
         // boundary, the gate `AsofJoin` rides, asserted for real here.

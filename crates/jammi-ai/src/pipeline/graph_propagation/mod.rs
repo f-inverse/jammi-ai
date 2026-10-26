@@ -786,7 +786,7 @@ impl InferenceSession {
         }
     }
 
-    /// The SQL relation of the registered source `source_id`, once it is
+    /// The first table of the registered source `source_id`, once it is
     /// known to hold every one of `columns` — a column it lacks is the typed
     /// [`JammiError::Schema`], naming it, rather than a planner error from
     /// wherever the column is first read.
@@ -795,9 +795,8 @@ impl InferenceSession {
         ctx: &QueryContext,
         source_id: &str,
         columns: impl IntoIterator<Item = &String>,
-    ) -> Result<String> {
-        let table = self.find_table_name(source_id).await?;
-        let relation = jammi_db::sql::source_relation(source_id, &table);
+    ) -> Result<jammi_db::source::SourceTable> {
+        let relation = self.first_table(source_id).await?;
         let held = ctx
             .sql(&format!("SELECT * FROM {relation} LIMIT 0"))
             .await

@@ -8,7 +8,8 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{FiniteQuery, SearchMethod};
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::source::SourceTable;
+use jammi_db::sql::quote_ident;
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 
 use crate::eval::runner::EvalRunner;
@@ -1570,8 +1571,8 @@ impl InferenceSession {
             });
         }
 
-        let table_name = self.find_table_name(source_id).await?;
-        let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
+        let table = self.first_table(source_id).await?;
+        let query = self.build_source_query(&table, key_column, content_columns);
         let input_plan = self.plan_source_query(&query).await?;
         // Describe the model for the schema and the definition: its width,
         // its regression head's form, and the identity the environment
@@ -1723,8 +1724,7 @@ impl InferenceSession {
     /// plan reads by name in both roles.
     pub(crate) fn build_source_query(
         &self,
-        source_id: &str,
-        table_name: &str,
+        table: &SourceTable,
         key_column: &str,
         content_columns: &[String],
     ) -> String {
@@ -1754,7 +1754,7 @@ impl InferenceSession {
             "SELECT {select_list}, {}({hash_args}) AS {} FROM {}",
             crate::query::CONTENT_HASH_UDF_NAME,
             jammi_db::store::schema::CONTENT_HASH_COLUMN,
-            source_relation(source_id, table_name)
+            table
         )
     }
 
@@ -1781,13 +1781,13 @@ impl InferenceSession {
         df.create_physical_plan().await.map_err(scan_error)
     }
 
-    /// The first table a source serves, resolved through the catalog's
-    /// `sources` row ([`JammiSession::source_table_names`]) — a source
-    /// registered on any replica resolves here, and a missing one is
-    /// [`JammiError::NotFound`].
-    pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
+    /// The first table a source serves, in its order ([`SourceTable`]'s),
+    /// resolved through the catalog's `sources` row
+    /// ([`JammiSession::source_tables`]) — a source registered on any replica
+    /// resolves here, and a missing one is [`JammiError::NotFound`].
+    pub(crate) async fn first_table(&self, source_id: &str) -> Result<SourceTable> {
         self.inner
-            .source_table_names(source_id)
+            .source_tables(source_id)
             .await?
             .into_iter()
             .next()

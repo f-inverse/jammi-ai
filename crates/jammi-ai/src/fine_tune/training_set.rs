@@ -80,7 +80,7 @@
 
 use arrow::array::RecordBatch;
 use jammi_db::error::Result;
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{InputAnchor, ProducingDescriptor};
 use jammi_db::store::{TrainingSetInput, TrainingSetSpec, TrainingSetTable};
 
@@ -156,16 +156,13 @@ pub async fn materialize_projection_table(
     task: ModelTask,
     format: &str,
 ) -> Result<TrainingSetTable> {
-    let table_name = session.find_table_name(source_id).await?;
+    let table = session.first_table(source_id).await?;
     let projection = columns
         .iter()
         .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let source_sql = format!(
-        "SELECT {projection} FROM {}",
-        source_relation(source_id, &table_name)
-    );
+    let source_sql = format!("SELECT {projection} FROM {table}");
     materialize(
         session,
         training_set_spec(

@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::error::{JammiError, Result};
 use crate::federation::remote::{self, Remote};
-use crate::source::{database, SourceConnection};
+use crate::source::{database, SourceConnection, SourceTable};
 
 /// The URL parameter that sets the TLS mode: the driver's own, which
 /// `mysql_async` does not parse.
@@ -29,7 +29,7 @@ const TLS_MODE: &str = "sslmode";
 pub async fn create_mysql_tables(
     source_id: &str,
     connection: &SourceConnection,
-) -> Result<Vec<(String, Arc<dyn TableProvider>)>> {
+) -> Result<Vec<(SourceTable, Arc<dyn TableProvider>)>> {
     let failed = |message: String| JammiError::Source {
         source_id: source_id.into(),
         message,
@@ -41,7 +41,7 @@ pub async fn create_mysql_tables(
         .map_err(|e| failed(format!("Failed to connect to MySQL: {e}")))?;
     let pool = Arc::new(pool);
     let pool = &pool;
-    schema_tables(source_id, pool.as_ref(), &schema, |table| async move {
+    let tables = schema_tables(source_id, pool.as_ref(), &schema, |table| async move {
         let mysql = Arc::new(MySQLTable::new(pool, table.clone()).await?);
         Ok(remote::table_provider(
             Remote::MySql,
@@ -51,7 +51,13 @@ pub async fn create_mysql_tables(
             None,
         ))
     })
-    .await
+    .await?;
+    Ok(tables
+        .into_iter()
+        .map(|(name, provider)| {
+            (SourceTable::new(source_id, SourceTable::PUBLIC, &name), provider)
+        })
+        .collect())
 }
 
 /// The driver's pool parameters for a `mysql://` URL, and the database whose

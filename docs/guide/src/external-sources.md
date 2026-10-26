@@ -27,10 +27,11 @@ db.add_source("papers", url="/data/papers.parquet", format="parquet")
 db.sql("SELECT id, title FROM pg_data.public.articles WHERE published LIMIT 10")
 ```
 
-A Postgres source serves the tables, views and materialized views of the database's
-`public` schema; a MySQL source serves the tables of the database its URL names. Both
-appear under the source's name with the `public` schema: `pg_data.public.articles`,
-`mysql_data.public.assignees`.
+A Postgres source serves the tables, views and materialized views of every schema the
+connecting role may use, each under its own schema: `pg_data.public.articles`,
+`pg_data.sales.orders`. Which schemas and relations a source serves is the role's
+grants; the system schemas are never served. A MySQL source serves the tables of the
+database its URL names under `public`: `mysql_data.public.assignees`.
 
 ## Postgres column types
 
@@ -130,8 +131,9 @@ WHERE a.institution = 'MIT'
 ## Generate embeddings from external sources
 
 A database source feeds every verb a file does. A verb that names a source rather than a
-table — `generate_embeddings` among them — reads the source's first table in name order,
-so a database registered for one holds the table it reads first:
+table — `generate_embeddings` among them — reads the source's first table: its `public`
+schema's first relation in name order, or, with no `public` relation, the first schema's
+by name. A database registered for one holds the table it reads first:
 
 ```python
 db.generate_embeddings(

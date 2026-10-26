@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, TableReference};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::functions_aggregate::count::Count;
 use datafusion::functions_aggregate::min_max::{Max, Min};
@@ -494,22 +494,27 @@ impl TableProvider for RemoteFilters {
             .zip(&runs)
             .filter_map(|(filter, runs)| runs.then_some(*filter))
             .collect();
-        let mut answers = self
-            .provider
-            .supports_filters_pushdown(&handed)?
-            .into_iter();
-        Ok(runs
-            .into_iter()
+        // A provider answers once per filter it is handed, in order.
+        let answers = self.provider.supports_filters_pushdown(&handed)?;
+        if answers.len() != handed.len() {
+            return Err(DataFusionError::Internal(format!(
+                "a remote table's provider answered {} of the {} filters it was handed",
+                answers.len(),
+                handed.len()
+            )));
+        }
+        let mut answers = answers.into_iter();
+        runs.into_iter()
             .map(|runs| {
                 if runs {
-                    answers
-                        .next()
-                        .unwrap_or(TableProviderFilterPushDown::Unsupported)
+                    answers.next().ok_or_else(|| {
+                        DataFusionError::Internal("a remote table's filter went unanswered".into())
+                    })
                 } else {
-                    TableProviderFilterPushDown::Unsupported
+                    Ok(TableProviderFilterPushDown::Unsupported)
                 }
             })
-            .collect())
+            .collect()
     }
 
     async fn scan(

@@ -243,6 +243,51 @@ impl SourceDefinition {
     }
 }
 
+/// A table a source serves: the source, the schema the table sits in, and
+/// its name. A file's table and a MySQL database's tables sit in
+/// [`SourceTable::PUBLIC`]; a Postgres database's sit in their own schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceTable {
+    pub source: String,
+    pub schema: String,
+    pub table: String,
+}
+
+impl SourceTable {
+    /// The schema a source with no schemas of its own serves its tables in.
+    pub const PUBLIC: &'static str = "public";
+
+    /// A table of `source` in `schema`.
+    pub fn new(source: &str, schema: &str, table: &str) -> Self {
+        Self {
+            source: source.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// The order a source lists its tables in, and the first of which a verb
+    /// naming the source reads: the `public` schema first, then every other
+    /// schema by name, and each schema's tables by name.
+    pub(crate) fn order_key(&self) -> (bool, &str, &str) {
+        (self.schema != Self::PUBLIC, &self.schema, &self.table)
+    }
+}
+
+/// The table as SQL names it: `"source"."schema"."table"`, each part quoted.
+impl std::fmt::Display for SourceTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::sql::ident::quote_ident;
+        write!(
+            f,
+            "{}.{}.{}",
+            quote_ident(&self.source),
+            quote_ident(&self.schema),
+            quote_ident(&self.table)
+        )
+    }
+}
+
 /// Derive a DataFusion table name from a URL by extracting the file stem.
 ///
 /// Handles both Unix forward-slash paths and Windows backslash paths so that

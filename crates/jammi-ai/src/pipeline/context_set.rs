@@ -545,7 +545,7 @@ impl InferenceSession {
                 "Context split: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id).await?;
+        let source_table = self.first_table(source_id).await?;
 
         // The recorded `key_column` is provenance, not a proven fact — a
         // caller-declared import can record a name the source never had (see
@@ -570,7 +570,7 @@ impl InferenceSession {
             .context()
             .sql(&format!(
                 "SELECT arrow_cast(\"{key_col}\", 'Utf8') AS _context_key \
-                 FROM \"{source_id}\".public.\"{source_table}\" WHERE {split}"
+                 FROM {source_table} WHERE {split}"
             ))
             .await
             .map_err(|e| JammiError::Schema {
@@ -618,7 +618,7 @@ impl InferenceSession {
                 "Context hydrate: source '{source_id}' embedding table has no key column"
             ))
         })?;
-        let source_table = self.find_table_name(source_id).await?;
+        let source_table = self.first_table(source_id).await?;
 
         // See the matching guard in `filter_keys_by_split`: confirm the
         // recorded `key_column` before it is interpolated into the scan below.
@@ -636,7 +636,7 @@ impl InferenceSession {
             .context()
             .sql(&format!(
                 "SELECT {select_list}, arrow_cast(\"{key_col}\", 'Utf8') AS _context_key \
-                 FROM \"{source_id}\".public.\"{source_table}\""
+                 FROM {source_table}"
             ))
             .await
             .map_err(|e| JammiError::from(e.context("Context hydrate: scan")))?
@@ -796,11 +796,11 @@ impl InferenceSession {
         source_id: &str,
         column: &str,
     ) -> Result<()> {
-        let source_table = self.find_table_name(source_id).await?;
+        let source_table = self.first_table(source_id).await?;
         let df = self
             .context()
             .sql(&format!(
-                "SELECT * FROM \"{source_id}\".public.\"{source_table}\" LIMIT 0"
+                "SELECT * FROM {source_table} LIMIT 0"
             ))
             .await
             .map_err(|e| JammiError::from(e.context("Key column check: schema introspection")))?;

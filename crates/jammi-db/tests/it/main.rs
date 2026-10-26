@@ -52,6 +52,8 @@ mod mutable_tables;
 #[cfg(feature = "live-postgres-tests")]
 mod postgres_money;
 #[cfg(feature = "live-postgres-tests")]
+mod postgres_relations;
+#[cfg(feature = "live-postgres-tests")]
 mod postgres_types;
 mod read_vectors;
 mod reconcile;

@@ -817,13 +817,8 @@ impl InferenceSession {
     }
 
     async fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
-        let table_name = self.find_table_name(&params.source_id).await?;
-        Ok(self.build_source_query(
-            &params.source_id,
-            &table_name,
-            &params.key_column,
-            &params.columns,
-        ))
+        let table = self.first_table(&params.source_id).await?;
+        Ok(self.build_source_query(&table, &params.key_column, &params.columns))
     }
 
     /// Step 4: drain the whole source once through `KeyCheckExec` (a null key

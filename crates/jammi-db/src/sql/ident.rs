@@ -43,18 +43,6 @@ pub fn quote_relation(rel: &str) -> String {
         .join(".")
 }
 
-/// Quote a source-scoped table as the three-part relation a registered source's
-/// data is addressed by: `"<source>".public."<table>"`. Both the source name
-/// and the table name are quoted identifiers, so a hyphenated source (a user's
-/// `patents-2024`) or table resolves verbatim.
-pub fn source_relation(source_id: &str, table_name: &str) -> String {
-    format!(
-        "{}.public.{}",
-        quote_ident(source_id),
-        quote_ident(table_name)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,11 +91,4 @@ mod tests {
         assert_eq!(quote_relation(r#"cat.a"b"#), r#""cat"."a""b""#);
     }
 
-    #[test]
-    fn source_relation_quotes_both_parts() {
-        assert_eq!(
-            source_relation("my-source-2024", "papers-v2"),
-            r#""my-source-2024".public."papers-v2""#
-        );
-    }
 }

@@ -26,7 +26,7 @@ use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
-use crate::source::{SourceConnection, SourceDefinition, SourceType};
+use crate::source::{SourceConnection, SourceDefinition, SourceTable, SourceType};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::rewrite::RowRewritePlanner;
@@ -523,7 +523,7 @@ impl JammiSession {
                     continue;
                 };
                 return Err(JammiError::Schema {
-                    table: format!("{source_id}.public.{table}"),
+                    table: table.to_string(),
                     column: column.clone(),
                     expected: "the one tenant column of every table of the source".into(),
                     actual: actual.into(),
@@ -561,12 +561,12 @@ impl JammiSession {
         Ok(())
     }
 
-    /// The table names a source serves, in discovery order — resolved
-    /// through the catalog's `sources` row like every SQL reference to the
-    /// source is, so a source registered on another replica resolves here
-    /// and a source removed there is [`JammiError::NotFound`] here.
-    pub async fn source_table_names(&self, source_id: &str) -> Result<Vec<String>> {
-        Ok(self.sources.resolve(source_id).await?.table_names())
+    /// The tables a source serves, in its order ([`SourceTable`]'s) —
+    /// resolved through the catalog's `sources` row like every SQL reference
+    /// to the source is, so a source registered on another replica resolves
+    /// here and a source removed there is [`JammiError::NotFound`] here.
+    pub async fn source_tables(&self, source_id: &str) -> Result<Vec<SourceTable>> {
+        Ok(self.sources.resolve(source_id).await?.tables())
     }
 
     /// Remove a source and all associated state: catalog entries, result tables,

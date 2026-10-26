@@ -10,6 +10,7 @@ use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
 };
+use jammi_db::source::SourceTable;
 use jammi_test_utils::{make_test_session, open_backend, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
@@ -1423,8 +1424,8 @@ async fn source_registered_on_one_live_session_resolves_on_another_until_removed
     assert!(on_a > 0);
     assert_eq!(on_b, on_a, "B serves the same rows A registered");
     assert_eq!(
-        session_b.source_table_names(&source_id).await.unwrap(),
-        vec!["patents".to_string()]
+        session_b.source_tables(&source_id).await.unwrap(),
+        vec![SourceTable::new(&source_id, SourceTable::PUBLIC, "patents")]
     );
     let described = session_b
         .catalog()
@@ -1444,7 +1445,7 @@ async fn source_registered_on_one_live_session_resolves_on_another_until_removed
         .await
         .unwrap_err();
     assert_source_not_found(&err, &source_id);
-    let err = session_b.source_table_names(&source_id).await.unwrap_err();
+    let err = session_b.source_tables(&source_id).await.unwrap_err();
     assert_source_not_found(&err, &source_id);
     assert!(session_b
         .catalog()
@@ -1502,8 +1503,8 @@ async fn source_redefined_on_one_live_session_resolves_to_its_new_definition_on_
         .unwrap();
 
     assert_eq!(
-        session_b.source_table_names(&source_id).await.unwrap(),
-        vec!["scores".to_string()],
+        session_b.source_tables(&source_id).await.unwrap(),
+        vec![SourceTable::new(&source_id, SourceTable::PUBLIC, "scores")],
         "B resolves the id to its new definition"
     );
     assert_eq!(

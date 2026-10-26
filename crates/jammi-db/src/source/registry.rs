@@ -3,7 +3,7 @@
 //! resolution.
 //!
 //! A session's DataFusion context resolves a three-part name
-//! `<source>.public.<table>` through the `JammiCatalogList` installed as
+//! `<source>.<schema>.<table>` through the `JammiCatalogList` installed as
 //! its catalog list. Every name that is not one of the session's fixed
 //! catalogs (DataFusion's default catalog, where result tables live, and
 //! `mutable`) is a source id, and the catalog handed back for it is a lazy
@@ -55,16 +55,21 @@ use datafusion::execution::session_state::SessionState;
 use parking_lot::RwLock;
 
 use super::file_format;
-use super::schema_provider::PublicSchemaCatalog;
-use super::{table_name_from_url, SourceDefinition, SourceType};
+use super::{table_name_from_url, SourceDefinition, SourceTable, SourceType};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::tenant_scope::SourceTenantColumns;
 
-/// A source's DataFusion table providers keyed by table name, in the order
-/// the driver discovered them.
-pub(crate) type SourceTables = Vec<(String, Arc<dyn TableProvider>)>;
+/// A source's DataFusion table providers, each keyed by the table it serves,
+/// in the source's order ([`SourceTable::order_key`]).
+pub(crate) type SourceTables = Vec<(SourceTable, Arc<dyn TableProvider>)>;
+
+/// `tables` in the source's order.
+fn ordered(mut tables: SourceTables) -> SourceTables {
+    tables.sort_by(|(a, _), (b, _)| a.order_key().cmp(&b.order_key()));
+    tables
+}
 
 /// What one build of a source yields: its tables, plus the directory-listing
 /// extension [`file_format::create_listing_table`] resolved adaptively
@@ -83,15 +88,35 @@ pub(crate) struct ResolvedSource {
 }
 
 impl ResolvedSource {
-    /// The source's table names, in discovery order.
-    pub(crate) fn table_names(&self) -> Vec<String> {
-        self.tables.iter().map(|(name, _)| name.clone()).collect()
+    /// The tables the source serves, in its order.
+    pub(crate) fn tables(&self) -> Vec<SourceTable> {
+        self.tables.iter().map(|(table, _)| table.clone()).collect()
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    /// The schemas the source serves its tables in, in its order.
+    fn schema_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (table, _) in &self.tables {
+            if names.last() != Some(&table.schema) {
+                names.push(table.schema.clone());
+            }
+        }
+        names
+    }
+
+    /// The names of the tables in `schema`, in the source's order.
+    fn table_names(&self, schema: &str) -> Vec<String> {
         self.tables
             .iter()
-            .find(|(table, _)| table == name)
+            .filter(|(table, _)| table.schema == schema)
+            .map(|(table, _)| table.table.clone())
+            .collect()
+    }
+
+    fn table(&self, schema: &str, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables
+            .iter()
+            .find(|(table, _)| table.schema == schema && table.table == name)
             .map(|(_, provider)| Arc::clone(provider))
     }
 }
@@ -218,7 +243,14 @@ impl SourceRegistry {
                 )
                 .await?;
                 Ok(BuiltSource {
-                    tables: vec![(table_name_from_url(url.as_str()), table)],
+                    tables: vec![(
+                        SourceTable::new(
+                            source_id,
+                            SourceTable::PUBLIC,
+                            &table_name_from_url(url.as_str()),
+                        ),
+                        table,
+                    )],
                     resolved_extension,
                 })
             }
@@ -264,7 +296,10 @@ impl SourceRegistry {
     ) -> Arc<ResolvedSource> {
         self.tenant_columns
             .set(source_id, definition.connection.tenant_column.clone());
-        let resolved = Arc::new(ResolvedSource { definition, tables });
+        let resolved = Arc::new(ResolvedSource {
+            definition,
+            tables: ordered(tables),
+        });
         self.cached
             .write()
             .insert(source_id.to_string(), Arc::clone(&resolved));
@@ -297,11 +332,46 @@ impl SourceRegistry {
     }
 }
 
-/// The `public` schema of one source, resolved through the registry on
-/// every table lookup. See the module docs for which methods read through
-/// and which report the cache.
+/// One source as a DataFusion catalog: a schema for each of the source's
+/// schemas, each resolved through the registry on every table lookup. See
+/// the module docs for which methods read through and which report the
+/// cache.
+struct SourceCatalog {
+    source_id: String,
+    registry: Arc<SourceRegistry>,
+}
+
+impl std::fmt::Debug for SourceCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCatalog")
+            .field("source_id", &self.source_id)
+            .field("schemas", &self.schema_names())
+            .finish()
+    }
+}
+
+impl CatalogProvider for SourceCatalog {
+    fn schema_names(&self) -> Vec<String> {
+        self.registry
+            .cached(&self.source_id)
+            .map(|resolved| resolved.schema_names())
+            .unwrap_or_default()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        Some(Arc::new(SourceSchema {
+            source_id: self.source_id.clone(),
+            schema: name.to_string(),
+            registry: Arc::clone(&self.registry),
+        }))
+    }
+}
+
+/// One schema of one source, resolved through the registry on every table
+/// lookup.
 struct SourceSchema {
     source_id: String,
+    schema: String,
     registry: Arc<SourceRegistry>,
 }
 
@@ -309,6 +379,7 @@ impl std::fmt::Debug for SourceSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceSchema")
             .field("source_id", &self.source_id)
+            .field("schema", &self.schema)
             .field("tables", &self.table_names())
             .finish()
     }
@@ -319,7 +390,7 @@ impl SchemaProvider for SourceSchema {
     fn table_names(&self) -> Vec<String> {
         self.registry
             .cached(&self.source_id)
-            .map(|resolved| resolved.table_names())
+            .map(|resolved| resolved.table_names(&self.schema))
             .unwrap_or_default()
     }
 
@@ -329,13 +400,13 @@ impl SchemaProvider for SourceSchema {
             .resolve(&self.source_id)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(resolved.table(name))
+        Ok(resolved.table(&self.schema, name))
     }
 
     fn table_exist(&self, name: &str) -> bool {
         self.registry
             .cached(&self.source_id)
-            .is_some_and(|resolved| resolved.table(name).is_some())
+            .is_some_and(|resolved| resolved.table(&self.schema, name).is_some())
     }
 }
 
@@ -373,11 +444,10 @@ impl CatalogProviderList for JammiCatalogList {
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         self.fixed.catalog(name).or_else(|| {
-            let schema: Arc<dyn SchemaProvider> = Arc::new(SourceSchema {
+            Some(Arc::new(SourceCatalog {
                 source_id: name.to_string(),
                 registry: Arc::clone(&self.sources),
-            });
-            Some(Arc::new(PublicSchemaCatalog::new(schema)))
+            }) as Arc<dyn CatalogProvider>)
         })
     }
 }

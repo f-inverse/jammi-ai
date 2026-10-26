@@ -492,7 +492,7 @@ impl InferenceSession {
         key_column: &str,
         label_column: &str,
     ) -> Result<HashMap<String, String>> {
-        let table = self.find_table_name(source_id).await?;
+        let table = self.first_table(source_id).await?;
 
         // Both column names are caller-supplied and decidable right here (the
         // source is already resolved above), so a bad one is rejected with the
@@ -504,7 +504,7 @@ impl InferenceSession {
         let sql = format!(
             "SELECT arrow_cast(\"{key_column}\", 'Utf8') AS _k, \
              arrow_cast(\"{label_column}\", 'Utf8') AS _v \
-             FROM \"{source_id}\".public.\"{table}\""
+             FROM {table}"
         );
         let batches = self
             .context()
@@ -563,7 +563,7 @@ impl InferenceSession {
                 "load_registered_edges called on a non-registered edge source".into(),
             ));
         };
-        let table = self.find_table_name(source_id).await?;
+        let table = self.first_table(source_id).await?;
 
         let mut projection = format!(
             "arrow_cast(\"{src_column}\", 'Utf8') AS _src, \
@@ -590,7 +590,7 @@ impl InferenceSession {
         };
 
         let sql =
-            format!("SELECT {projection} FROM \"{source_id}\".public.\"{table}\"{where_clause}");
+            format!("SELECT {projection} FROM {table}{where_clause}");
         let batches = self
             .context()
             .sql(&sql)

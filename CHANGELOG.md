@@ -210,7 +210,14 @@ The dependency audit is green again on the live advisory database, and database 
   Postgres's own catalog and, column by column, reads a type as stored where the driver reads
   it correctly and through Postgres where it does not: a domain as its base type, `money` as
   `numeric`, a `timestamp` as its instant at UTC (every session pins `TimeZone` to UTC), every
-  other type as its text. A source also serves its views and materialized views.
+  other type as its text.
+- **A Postgres source serves every schema, view and materialized view.** It served the base
+  tables of `public` alone, so a table in any other schema, a view and a materialized view
+  were "not found" (#754). It now serves every relation of every schema its role may use,
+  each under its own schema (`pg.sales.orders`). A source's table is a `SourceTable` — source,
+  schema and table, rendering its quoted reference — in place of a name callers wrote under
+  `public` by hand; `JammiSession::source_tables` lists them `public` first, and a verb that
+  names a source reads the first.
 
 - **A filter on a database column holds when the query also joins a file.** The engine ran such a
   filter above the federated scan, and physical filter pushdown handed it to that scan, which took

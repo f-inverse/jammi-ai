@@ -14,22 +14,20 @@ use secrecy::SecretString;
 
 use crate::error::{JammiError, Result};
 use crate::pg_uri::{Keyword, PgUri};
-use crate::source::{database, SourceConnection};
-
-/// The schema whose tables a Postgres source serves.
-const SCHEMA: &str = "public";
+use crate::source::{database, SourceConnection, SourceTable};
 
 /// Create table providers for every table, view and materialized view of
-/// the database's `public` schema.
+/// every schema of the database the connecting role may use, each under its
+/// own schema.
 ///
-/// Returns `(table_name, Arc<dyn TableProvider>)` pairs, each a
+/// Returns `(table, Arc<dyn TableProvider>)` pairs, each a
 /// [`crate::federation::remote::Remote::Postgres`] table: Postgres is sent
 /// only what it runs as the engine does, and each column is read as the
 /// engine reads its type ([`columns`]).
 pub async fn create_postgres_tables(
     source_id: &str,
     connection: &SourceConnection,
-) -> Result<Vec<(String, Arc<dyn TableProvider>)>> {
+) -> Result<Vec<(SourceTable, Arc<dyn TableProvider>)>> {
     let failed = |message: String| JammiError::Source {
         source_id: source_id.into(),
         message,
@@ -40,15 +38,15 @@ pub async fn create_postgres_tables(
         .await
         .map_err(|e| failed(format!("Failed to connect to Postgres: {e}")))?;
     let pool = Arc::new(pool);
-    let tables = columns::columns(&pool, SCHEMA)
+    let tables = columns::columns(&pool)
         .await
-        .map_err(|e| failed(format!("reading the columns of `{SCHEMA}`: {e}")))?;
+        .map_err(|e| failed(format!("reading the database's columns: {e}")))?;
     Ok(tables
         .into_iter()
-        .map(|(name, columns)| {
-            let provider =
-                columns::remote_table(&pool, TableReference::bare(name.as_str()), &columns);
-            (name, provider)
+        .map(|((schema, table), columns)| {
+            let reference = TableReference::partial(schema.as_str(), table.as_str());
+            let provider = columns::remote_table(&pool, reference, &columns);
+            (SourceTable::new(source_id, &schema, &table), provider)
         })
         .collect())
 }

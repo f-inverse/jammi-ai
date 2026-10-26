@@ -18,19 +18,16 @@
 //! ([`DerivedTable`]) that every statement Postgres receives names in its
 //! place, so Postgres filters, sorts and aggregates the values as read: a
 //! federated query takes it from the table's AST analyzer, a scan that is
-//! not federated in the scan's own statement ([`DerivedScan`]).
+//! not federated in the scan's own statement ([`super::scan::PostgresScan`]).
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
-use async_trait::async_trait;
-use datafusion::catalog::{Session, TableProvider};
+use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::{
     Ident, ObjectName, Statement, TableAlias, TableFactor, VisitMut, VisitorMut,
 };
@@ -39,9 +36,9 @@ use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect as PostgresUnparserDialect;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers::sql::sql_provider_datafusion::{SqlExec, SqlTable};
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 
+use super::scan::{PostgresExecutor, PostgresScan};
 use crate::federation::remote::{self, Reads, Remote};
 
 /// Digits of a `numeric` that holds every `money` value: an `int8` has 19.
@@ -263,40 +260,27 @@ pub(super) fn schema(columns: &[Column]) -> SchemaRef {
 /// the driver's scan and executor over the engine's schema, through a
 /// derived table when any column is read through an expression.
 pub(super) fn remote_table(
-    pool: &Arc<PostgresConnectionPool>,
+    pool: &Arc<DynPostgresConnectionPool>,
     table: TableReference,
     columns: &[Column],
 ) -> Arc<dyn TableProvider> {
-    let pool: Arc<DynPostgresConnectionPool> = Arc::clone(pool) as _;
-    let schema = schema(columns);
     let sql_table = Arc::new(
-        SqlTable::new_with_schema("postgres", &pool, schema, table.clone())
+        SqlTable::new_with_schema("postgres", pool, schema(columns), table.clone())
             .with_dialect(Arc::new(PostgresUnparserDialect {})),
     );
-    match DerivedTable::of(&table, columns) {
-        None => remote::table_provider(
-            Remote::Postgres,
-            table,
-            Arc::clone(&sql_table) as _,
-            sql_table,
-            None,
-        ),
-        Some(derived) => {
-            let scan = Arc::new(DerivedScan {
-                sql_table: Arc::clone(&sql_table),
-                pool,
-                derived: derived.clone(),
-            });
-            let reads: Reads = Arc::new(move |statement| derived.rewrite(statement));
-            remote::table_provider(Remote::Postgres, table, scan, sql_table, Some(reads))
-        }
-    }
+    let derived = DerivedTable::of(&table, columns);
+    let reads = derived.clone().map(|derived| -> Reads {
+        Arc::new(move |statement| derived.rewrite(statement))
+    });
+    let executor = Arc::new(PostgresExecutor::new(Arc::clone(&sql_table), Arc::clone(pool)));
+    let scan = Arc::new(PostgresScan::new(sql_table, Arc::clone(pool), derived));
+    remote::table_provider(Remote::Postgres, table, scan, executor, reads)
 }
 
 /// The derived table a table with columns read through an expression is
 /// read through.
 #[derive(Debug, Clone)]
-struct DerivedTable {
+pub(super) struct DerivedTable {
     /// The table as the statements Postgres receives name it.
     table: TableReference,
     /// Every column of the table in order, and the SQL that reads it when it
@@ -323,7 +307,7 @@ impl DerivedTable {
 
     /// `statement` with every reference to the table replaced by the derived
     /// table that reads its columns.
-    fn rewrite(&self, mut statement: Statement) -> DataFusionResult<Statement> {
+    pub(super) fn rewrite(&self, mut statement: Statement) -> DataFusionResult<Statement> {
         match statement.visit(&mut ReplaceTable { derived: self }) {
             ControlFlow::Continue(()) => Ok(statement),
             ControlFlow::Break(error) => Err(error),
@@ -424,67 +408,6 @@ fn names(name: &ObjectName) -> Option<TableReference> {
             table.as_str(),
         )),
         _ => None,
-    }
-}
-
-/// The table scanned where a query is not federated: the driver's scan of
-/// it, its statement reading through the derived table.
-struct DerivedScan<T: 'static, P: 'static> {
-    sql_table: Arc<SqlTable<T, P>>,
-    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
-    derived: DerivedTable,
-}
-
-impl<T, P> std::fmt::Debug for DerivedScan<T, P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DerivedScan")
-            .field("derived", &self.derived)
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl<T: 'static, P: 'static> TableProvider for DerivedScan<T, P> {
-    fn schema(&self) -> SchemaRef {
-        self.sql_table.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.sql_table.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sql = self.sql_table.scan_to_sql(projection, filters, limit)?;
-        let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, &sql).map_err(|e| {
-            DataFusionError::Plan(format!("reading the columns of `{}`: {e}", self.derived.table))
-        })?;
-        let (Some(statement), None) = (statements.pop(), statements.pop()) else {
-            return Err(DataFusionError::Plan(format!(
-                "reading the columns of `{}`: `{sql}` is not one statement",
-                self.derived.table
-            )));
-        };
-        let sql = self.derived.rewrite(statement)?.to_string();
-        Ok(Arc::new(SqlExec::new(
-            projection,
-            &self.schema(),
-            Arc::clone(&self.pool),
-            sql,
-            Arc::new(PostgresUnparserDialect {}),
-        )?))
     }
 }
 

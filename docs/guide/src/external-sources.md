@@ -33,6 +33,11 @@ connecting role may use, each under its own schema: `pg_data.public.articles`,
 grants; the system schemas are never served. A MySQL source serves the tables of the
 database its URL names under `public`: `mysql_data.public.assignees`.
 
+A query over a Postgres source whose database has stopped answering fails at once — an
+`Unavailable` error (gRPC `UNAVAILABLE`, the retryable class) naming the database's address
+and why it was not reached — and answers again, with no re-registration, once the database
+does.
+
 ## Postgres column types
 
 Every column of every type reads as the value it holds, and no column's type keeps its

@@ -218,6 +218,13 @@ The dependency audit is green again on the live advisory database, and database 
   schema and table, rendering its quoted reference — in place of a name callers wrote under
   `public` by hand; `JammiSession::source_tables` lists them `public` first, and a verb that
   names a source reads the first.
+- **A query over a stopped Postgres database fails at once, naming it.** The driver's pool
+  retried a refused connect for its whole 30 s timeout, then advised enlarging the pool
+  (#742). A connect the pool has not answered within 250 ms now probes the database's address:
+  a refusal, an unresolved host or no answer fails the query at once as `Unavailable`, naming
+  the address and the cause; a reachable database leaves the query waiting on a busy pool.
+  Every Postgres read runs through one path that keeps that error typed, where the driver's
+  flattened it to text.
 
 - **A filter on a database column holds when the query also joins a file.** The engine ran such a
   filter above the federated scan, and physical filter pushdown handed it to that scan, which took

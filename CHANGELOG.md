@@ -16,6 +16,14 @@ workspace ships every publishable crate at the same
   dependency, linked into no binary). The two pyo3 exceptions name their real gate, arrow 59,
   in place of a release freeze.
 
+- **A Postgres `money` column reads as the amount it holds.** The driver passed `money`'s binary
+  form through as its value, an `int8` count of the currency's minor unit, so `12.34` read as
+  `1234` and `SUM` was 100 times too large; a filter on the column was refused by Postgres, which
+  has no operator between `money` and a number. A table with a `money` column is now read through
+  a derived table that converts the column to `numeric` in Postgres, so it is a
+  `Decimal128(19, s)` that Postgres filters and aggregates, `s` being the database's money scale.
+  Tables without one are read as before.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

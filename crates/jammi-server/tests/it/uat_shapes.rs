@@ -158,7 +158,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
 
     let store = SessionStore::new();
 
-    // gRPC + Flight SQL chain on one port — the OSS server's shape. Assembled at
+    // gRPC + Flight SQL chain on one port — the server's shape. Assembled at
     // the loopback ephemeral address and bound eagerly through the chain seam, so
     // the listener is held live with no release-then-rebind window.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

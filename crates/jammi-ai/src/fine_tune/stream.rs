@@ -130,7 +130,7 @@ impl StreamConfig {
         std::num::NonZeroUsize::new(prefetch)
             .map(|prefetch| Self { prefetch })
             .ok_or_else(|| {
-                JammiError::FineTune("StreamConfig::new: prefetch must be >= 1, got 0".into())
+                JammiError::Internal("StreamConfig::new: prefetch must be >= 1, got 0".into())
             })
     }
 
@@ -283,10 +283,6 @@ fn chunk_byte_size(chunk: &TextChunk) -> usize {
             negatives,
         } => blob_bytes(anchors) + blob_bytes(positives) + blob_bytes(negatives),
         TextChunk::Classification { texts, labels } => text_bytes(texts) + labels.len() * 4,
-        TextChunk::Ner {
-            texts,
-            entities_json,
-        } => text_bytes(texts) + text_bytes(entities_json),
         TextChunk::Regression { texts, targets } => text_bytes(texts) + targets.len() * 4,
     }
 }
@@ -879,7 +875,7 @@ pub(crate) async fn validate_window(
         let null_count = read_aggregate(batch.column(0).as_ref(), "null_count")?;
         let nan_count = read_aggregate(batch.column(1).as_ref(), "nan_count")?;
         if null_count > 0.0 {
-            return Err(JammiError::FineTune(format!(
+            return Err(decode::column_error(format!(
                 "TrainingSetStream pre-pass: the training window [{}, {}) contains {null_count} \
                  null '{target_col}' value(s); a null target cannot be coerced (it would corrupt \
                  the scaler) — remove or fill the row(s) before streaming",
@@ -887,7 +883,7 @@ pub(crate) async fn validate_window(
             )));
         }
         if nan_count > 0.0 {
-            return Err(JammiError::FineTune(format!(
+            return Err(decode::column_error(format!(
                 "TrainingSetStream pre-pass: the training window [{}, {}) contains {nan_count} \
                  NaN '{target_col}' value(s); a NaN target cannot be used (it would corrupt the \
                  scaler) — remove or fix the row(s) before streaming",
@@ -933,9 +929,9 @@ pub async fn build_label_vocabulary(
         }
         let label_col = batch
             .column_by_name("label")
-            .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+            .ok_or_else(|| decode::column_error("Missing/invalid 'label' column"))?;
         let label_vals = decode::extract_string_column(label_col.as_ref())
-            .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+            .ok_or_else(|| decode::column_error("Missing/invalid 'label' column"))?;
         labels.extend(label_vals);
     }
     Ok(LabelVocabulary::from_labels(

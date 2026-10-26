@@ -33,6 +33,7 @@ _UNSET = dict(
     warmup_fraction=None,
     gradient_accumulation_steps=None,
     triplet_margin=None,
+    encoder=None,
     target_modules=None,
     early_stopping_metric=None,
     backbone_dtype=None,
@@ -335,3 +336,35 @@ def test_graph_fine_tune_carries_fine_tunes_training_knobs() -> None:
     assert cfg == expected
     with pytest.raises(ValueError, match="for graph fine-tune"):
         _capture_graph_request(embedding_loss="cosent")
+
+
+def test_encoder_unset_leaves_the_arm_unset() -> None:
+    """Neither `encoder` nor `target_modules` leaves the oneof unset, which the
+    engine reads as an adapted encoder at the architecture's default sites."""
+    assert _build().WhichOneof("encoder") is None
+
+
+def test_target_modules_adapt_the_encoder_at_those_sites() -> None:
+    config = _build(target_modules=["query", "value"])
+    assert config.WhichOneof("encoder") == "adapted"
+    assert list(config.adapted.target_modules) == ["query", "value"]
+
+
+def test_adapted_without_sites_names_the_arm() -> None:
+    config = _build(encoder="adapted")
+    assert config.WhichOneof("encoder") == "adapted"
+    assert list(config.adapted.target_modules) == []
+
+
+def test_frozen_encoder_crosses_the_wire() -> None:
+    assert _build(encoder="frozen").WhichOneof("encoder") == "frozen"
+
+
+def test_frozen_encoder_refuses_sites() -> None:
+    with pytest.raises(ValueError, match="frozen"):
+        _build(encoder="frozen", target_modules=["query"])
+
+
+def test_unknown_encoder_rejected() -> None:
+    with pytest.raises(ValueError, match="encoder"):
+        _build(encoder="partial")

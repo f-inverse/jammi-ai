@@ -264,7 +264,7 @@ impl BuildingVersion {
         if outcome.errored.is_empty() {
             Ok(())
         } else {
-            Err(JammiError::Other(format!(
+            Err(JammiError::Internal(format!(
                 "abort: {} object delete(s) failed for '{}' version {}: {:?}",
                 outcome.errored.len(),
                 self.table_name,

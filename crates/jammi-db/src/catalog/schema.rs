@@ -2209,3 +2209,18 @@ pub(super) const MIGRATION_047_DROP_COMPUTE_CLUSTER_STATE: &str = r#"
 DROP TABLE compute_executors;
 DROP TABLE compute_jobs;
 "#;
+
+/// Migration 048: an eval run records the source holding its ground truth —
+/// the relevance judgments, labels or outcomes it scored against — under the
+/// name the eval verbs give that argument.
+pub(super) const MIGRATION_048_EVAL_RUNS_GROUND_TRUTH: &str = r#"
+ALTER TABLE eval_runs RENAME COLUMN golden_source TO ground_truth;
+"#;
+
+/// A job's progress counts in the unit its phase names — rows while it
+/// assembles or computes, optimizer steps while it trains — so its two counts
+/// are `progress_done` of `progress_total`.
+pub(super) const MIGRATION_049_JOB_PROGRESS_COUNTS: &str = r#"
+ALTER TABLE jobs RENAME COLUMN progress_rows_done TO progress_done;
+ALTER TABLE jobs RENAME COLUMN progress_rows_total TO progress_total;
+"#;

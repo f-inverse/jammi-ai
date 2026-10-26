@@ -11,25 +11,25 @@ distribution, and *any* sample size. No retraining: a calibration pass and an
 empirical quantile. Deterministic given the calibration set, which is the audit
 property.
 
-The serving primitive lives in the open engine because a calibrated set is a
-serving output — it must work with no license. The *operationalization* of the
-guarantee — rolling coverage monitoring, coverage-SLA gating, and managed
-recalibration under drift — is a governed concern provided by the
-[Jammi platform](./introduction.md), built on this same primitive.
+A calibrated set is a serving output, so the engine serves it. Operating the
+guarantee over time — monitoring coverage on a rolling window, gating on a
+coverage target, recalibrating under drift — is policy a deployment builds on
+this primitive and the coverage functions below.
 
 ## The one assumption
 
 The guarantee holds **if and only if** the calibration and serving data are
-exchangeable. Under distribution drift it degrades silently. Two levers correct
-for *known* structure:
+exchangeable. Under distribution drift it degrades silently. Two calibration
+schemes correct for *known* structure (see [Calibration under known
+structure](#calibration-under-known-structure)):
 
-- **Weighted conformal** applies importance weights for a known covariate shift.
-- **Mondrian conformal** keeps a per-cohort quantile keyed on a group column,
-  the principled approximation to conditional coverage (full per-input coverage
-  is provably impossible distribution-free).
+- **Mondrian conformal** keeps a per-cohort quantile, the principled
+  approximation to conditional coverage (full per-input coverage is provably
+  impossible distribution-free).
+- **Weighted conformal** applies likelihood ratios for a known covariate shift.
 
-The primitive *applies* the weights and the grouping; *detecting* drift and
-*choosing* the cohorts is governance, not a serving output.
+The engine *applies* the cohorts and the weights; *detecting* drift and
+*choosing* the cohorts or estimating the weights are the caller's.
 
 ## The three-way split
 
@@ -52,10 +52,10 @@ emits.
 # extern crate jammi_db;
 # extern crate jammi_ai;
 # fn ex() -> jammi_db::error::Result<()> {
-use jammi_ai::predict::{ClassScore, ConformalModel};
+use jammi_ai::predict::{Calibration, ClassScore, ConformalModel, TestPoint};
 
 // Held-out calibration: per-class probabilities + the realised class index.
-let calibration: Vec<Vec<f64>> = vec![
+let probabilities: Vec<Vec<f64>> = vec![
     vec![0.7, 0.2, 0.1],
     vec![0.1, 0.8, 0.1],
     // ... one row per calibration example
@@ -63,11 +63,17 @@ let calibration: Vec<Vec<f64>> = vec![
 let true_labels: Vec<usize> = vec![0, 1 /* ... */];
 
 // Calibrate at 90% nominal coverage with the adaptive APS score.
-let model = ConformalModel::classification(&calibration, &true_labels, ClassScore::Aps, 0.1)?;
+let model = ConformalModel::classification(
+    &probabilities,
+    &true_labels,
+    ClassScore::Aps,
+    &Calibration::Marginal,
+    0.1,
+)?;
 
 // Serving: emit the prediction set for a new row of class probabilities.
-let probabilities = vec![0.45, 0.4, 0.15];
-let prediction_set = model.predict_set(&probabilities, None)?; // e.g. [0, 1]
+let row = vec![0.45, 0.4, 0.15];
+let prediction_set = model.predict_set(&row, TestPoint::Exchangeable)?; // e.g. [0, 1]
 # let _ = prediction_set;
 # Ok(()) }
 ```
@@ -87,33 +93,33 @@ sets = db.conformalize(
 
 ## Regression: prediction intervals
 
-- **Absolute residual** — nonconformity `|y − ŷ|`; a constant-width interval
-  `[ŷ − q̂, ŷ + q̂]`. Distribution-free but uninformative under
-  heteroscedasticity.
-- **CQR** (Conformalized Quantile Regression) — nonconformity
-  `max(q_lo − y, y − q_hi)` over a predictor's lower/upper quantile estimates;
-  an *adaptive*-width interval whose width tracks local uncertainty.
+What the regressor estimates decides its score:
+
+- **Point estimates** (`Estimates::Points`) — absolute residual `|y − ŷ|`; a
+  constant-width interval `[ŷ − q̂, ŷ + q̂]`. Distribution-free but
+  uninformative under heteroscedasticity.
+- **Quantile bands** (`Estimates::Bands`) — CQR (Conformalized Quantile
+  Regression), `max(q_lo − y, y − q_hi)` over the lower/upper quantile
+  estimates; an *adaptive*-width interval whose width tracks local uncertainty.
 
 ```rust,no_run
 # extern crate jammi_ai;
 # extern crate jammi_db;
 # fn ex() -> jammi_db::error::Result<()> {
-use jammi_ai::predict::{ConformalModel, IntervalScore};
+use jammi_ai::predict::{Calibration, ConformalModel, Estimate, Estimates, TestPoint};
 
 // Absolute-residual conformal over held-out (prediction, observation) pairs.
 let predictions = vec![1.0, 2.0, 3.0 /* ... */];
 let observed = vec![1.2, 1.7, 3.1 /* ... */];
 let model = ConformalModel::regression(
-    &predictions,
-    &[],   // lower quantiles (CQR only)
-    &[],   // upper quantiles (CQR only)
+    Estimates::Points(&predictions),
     &observed,
-    IntervalScore::AbsoluteResidual,
+    &Calibration::Marginal,
     0.1,
 )?;
 
 // Serving: a 90% interval around a new point estimate.
-let (lower, upper) = model.predict_interval(2.5, 0.0, 0.0, None)?;
+let (lower, upper) = model.predict_interval(Estimate::Point(2.5), TestPoint::Exchangeable)?;
 # let _ = (lower, upper);
 # Ok(()) }
 ```
@@ -138,6 +144,61 @@ intervals = db.conformalize_cqr(
     test_lower=[2.0],
     test_upper=[3.0],
     alpha=0.1,
+)
+```
+
+## Calibration under known structure
+
+A `Calibration` says how the calibration rows pool into the threshold a serving
+row is held to, and a serving row brings what its scheme reads (`TestPoint`):
+
+| Scheme | Calibration rows carry | A serving row brings | Threshold |
+|---|---|---|---|
+| `Marginal` | nothing | nothing (`Exchangeable`) | one `⌈(n+1)(1 − α)⌉`-th score |
+| `Mondrian { groups }` | a cohort each | its cohort (`Group`) | its cohort's own quantile; the pooled one for a cohort unseen at calibration |
+| `Weighted { weights }` | a likelihood ratio `dP_test/dP_cal` each | its own ratio (`Weight`) | the weighted quantile with the row's mass at `+∞` |
+
+The weighted threshold (Tibshirani et al. 2019) places mass
+`w_i / (Σw + w_test)` on each calibration score and `w_test / (Σw + w_test)` at
+`+∞`, and takes the smallest score whose cumulative weight reaches
+`(1 − α)(Σw + w_test)`. A row the calibration era under-represents carries a
+large ratio, holds more mass back at `+∞`, and gets a wider set; with every
+ratio one this is exactly the marginal threshold.
+
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate jammi_db;
+# fn ex(probabilities: Vec<Vec<f64>>, true_labels: Vec<usize>) -> jammi_db::error::Result<()> {
+use jammi_ai::predict::{Calibration, ClassScore, ConformalModel, TestPoint};
+
+// One cohort per calibration row: each cohort gets its own threshold.
+let groups: Vec<String> = probabilities
+    .iter()
+    .enumerate()
+    .map(|(i, _)| if i % 2 == 0 { "web" } else { "mobile" }.to_string())
+    .collect();
+let model = ConformalModel::classification(
+    &probabilities,
+    &true_labels,
+    ClassScore::Aps,
+    &Calibration::Mondrian { groups },
+    0.1,
+)?;
+let set = model.predict_set(&[0.45, 0.4, 0.15], TestPoint::Group("web"))?;
+# let _ = set;
+# Ok(()) }
+```
+
+The Python verbs take the scheme as keyword pairs — `groups` with
+`test_groups`, or `weights` with `test_weights`, one entry per calibration row
+and per test row — on `conformalize`, `conformalize_interval`, and
+`conformalize_cqr` alike:
+
+```python
+intervals = db.conformalize_interval(
+    predictions=cal_pred, observed=cal_y, test_predictions=test_pred, alpha=0.1,
+    weights=cal_ratio,         # dP_test/dP_cal at each calibration row
+    test_weights=test_ratio,   # ... and at each test row
 )
 ```
 
@@ -186,8 +247,8 @@ let _contrib = contribution(&[
 ## Verifying coverage
 
 The realised coverage and mean set size of a labelled batch are pure functions
-in `jammi-numerics` — the same functions the platform's coverage monitor calls
-on a rolling window:
+in `jammi-numerics` — the functions a coverage monitor calls on a rolling
+window:
 
 ```rust,no_run
 # extern crate jammi_numerics;
@@ -202,10 +263,10 @@ let efficiency = mean_set_size(&sizes)?;  // smaller is sharper
 # Ok(()) }
 ```
 
-## What lives in the platform, not here
+## What the engine leaves to the deployment
 
-This is the serving primitive only. The governed layer — a rolling
-realised-vs-nominal **coverage monitor** with drift detection and online
-adaptation, a **coverage-SLA gate**, and **managed recalibration** under shift —
-is provided by the Jammi platform. It consumes this primitive and the OSS
-coverage function; it is not part of the open engine.
+This is the serving primitive. A rolling realised-vs-nominal **coverage
+monitor** with drift detection, a **coverage gate**, and **recalibration**
+under shift are policies over it: each decides *when* to act, which the engine
+does not. A deployment builds them from `conformalize*` and the coverage
+functions above.

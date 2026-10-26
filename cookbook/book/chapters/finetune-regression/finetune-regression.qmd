@@ -6,7 +6,8 @@ title: "Regression fine-tuning on a high-offset target"
 `infer(task="regression")` · **Background:** heteroscedastic regression — the
 mean–variance Gaussian head [@nix1994], β-NLL [@seitzer2022], CRPS as a training
 score [@gneiting2007], pinball / quantile regression [@koenker1978] · **Checked:**
-measurement (held-out RMSE in years, nominal interval coverage).
+measurement (held-out RMSE in years against the predict-the-mean baseline,
+interval coverage).
 
 A paper's publication **year** is a hard target for a regression head: it sits
 near 2018 — a large *offset* — with a spread of only a few years. A head that
@@ -16,11 +17,13 @@ The engine avoids that by construction: it trains the regression head against
 the target **standardized** with the training data's own mean and standard
 deviation, so the objective the optimizer sees is an `O(1)` residual whatever the
 target's offset or scale, and it **de-standardizes** at serving, so predictions
-come back in years. This chapter measures the consequence on two questions:
+come back in years. This chapter measures the consequence on three questions:
 
 1. **Does the high-offset target fit, with a real served spread?**
-2. **Which objective wins on it** — `beta_nll` (the default), `gaussian_nll`,
-   `crps`, or `pinball`?
+2. **Does the fit beat the baseline every regression must beat** — predicting
+   the held-out mean for every paper?
+3. **How honest is each objective's band** — `beta_nll` (the default),
+   `gaussian_nll`, `crps`, or `pinball`?
 
 ```{python}
 import tempfile
@@ -34,10 +37,12 @@ from jammi_cookbook import datasets, encoders, scale
 from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
-# The run's budget: a small run needs a larger step to leave its initial output.
+# The fine-tune adapts the encoder's attention and trains the head with it, so the
+# step is LoRA-sized: a head-sized step (5e-2) carries the loss past a finite value
+# and the engine refuses the run.
 BUDGET = {
-    scale.Scale.SMALL: {"epochs": 20, "learning_rate": 5e-2},
-    scale.Scale.FULL: {"epochs": 3, "learning_rate": 3e-2},
+    scale.Scale.SMALL: {"epochs": 10, "learning_rate": 3e-3},
+    scale.Scale.FULL: {"epochs": 3, "learning_rate": 1e-3},
 }[SCALE]
 QUANTILES = [0.05, 0.5, 0.95]  # a 90% central interval and the median
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -75,7 +80,8 @@ print(f"train {len(training)} / held out {len(held_out)}; held-out year std {spr
 
 ## Each objective, fitted and measured
 
-Each run is the same short LoRA fine-tune; only `regression_loss` changes. The
+Each run is the same short LoRA fine-tune — the encoder's attention adapted, the
+regression head trained with it — and only `regression_loss` changes. The
 Gaussian objectives serve `predicted_mean` and `predicted_std`; `pinball` serves
 one `quantile_{level}` column per requested level. Every number below is read
 off the de-standardized serve output, in years.
@@ -108,13 +114,15 @@ def measure(served: pa.Table, loss: str) -> dict:
         "rmse": float(np.sqrt(np.mean((point - years) ** 2))),
         "coverage": float(np.mean((years >= low) & (years <= high))),
         "width": float(np.mean(high - low)),
+        # The scale the band implies: its width over 2 × 1.645.
+        "sigma": float(np.mean(high - low)) / (2 * 1.6449),
     }
 
 
 results = {loss: measure(fit(loss), loss) for loss in ("beta_nll", "gaussian_nll", "crps", "pinball")}
-print(f"{'objective':<14}{'rmse(y)':>9}{'cov@90':>9}{'90% width(y)':>14}")
+print(f"{'objective':<14}{'rmse(y)':>9}{'σ(y)':>8}{'cov@90':>9}{'90% width(y)':>14}")
 for loss, r in results.items():
-    print(f"{loss:<14}{r['rmse']:>9.3f}{r['coverage']:>9.3f}{r['width']:>14.2f}")
+    print(f"{loss:<14}{r['rmse']:>9.3f}{r['sigma']:>8.2f}{r['coverage']:>9.3f}{r['width']:>14.2f}")
 print(f"{'(predict the mean)':<14}{spread:>9.3f}")
 ```
 
@@ -122,44 +130,40 @@ print(f"{'(predict the mean)':<14}{spread:>9.3f}")
 gaussian = [results[loss] for loss in ("beta_nll", "gaussian_nll", "crps")]
 claim("the Gaussian heads serve a spread, not a collapsed point",
       all(r["width"] > 0.1 * spread for r in gaussian))
-if SCALE is scale.Scale.FULL:
-    claim("every objective lands on the mean baseline",
-          all(abs(r["rmse"] - spread) < 0.02 for r in results.values()),
-          f"baseline {spread:.3f} years")
-    claim("the Gaussian heads' σ sits below the held-out error, so their 90% bands under-cover",
-          all(r["width"] / (2 * 1.6449) < r["rmse"] and r["coverage"] < 0.9 for r in gaussian))
-    claim("the pinball levels have not separated as far as the Gaussian bands",
-          results["pinball"]["width"] < min(r["width"] for r in gaussian))
+claim("no objective beats predicting the held-out mean",
+      all(r["rmse"] > 0.95 * spread for r in results.values()),
+      f"baseline {spread:.3f} years")
 ```
 
 ## Reading the table
 
 The last row is the baseline every regression must beat: predicting the
 held-out mean for every paper has an RMSE equal to the held-out standard
-deviation. At `full` scale every objective lands on that line — a publication
-year is only weakly predictable from a title and abstract. What separates the objectives is how
-honest each is about that.
+deviation. Every objective lands on that line. The head fits — its predictions
+come back in years, with a real spread — but a paper's publication year is
+barely written in its title and abstract, so there is nothing for it to learn
+beyond the mean. That is the first number to read after any regression
+fine-tune: a model that does not beat the baseline has learned the target's
+location, not the target.
 
-A 90% interval should contain about 90% of the held-out years. The Gaussian
-heads serve a real spread — their bands are a sizeable fraction of the target's
-own, which is what fitting a high-offset target *without* collapse looks like —
-but not enough of one: each head's served $\sigma$ (the band's width over
-$2 \times 1.645$) sits below its held-out RMSE, so the band under-covers. The
-heads fit their scale on the training papers and are over-confident on papers
-they have not seen, which is the general case, and the reason split-conformal
-calibration exists: calibrate the band's width on held-out residuals and the
-coverage is guaranteed (the conformal chapter's CQR does exactly this to a
-served $\pm\sigma$ band). Coverage also moves in steps here, because a
-publication year is an integer: with the centre near one value for every
-paper, coverage changes only when a band edge crosses a whole year.
+What still separates the objectives is how honest each band is about that
+error. A 90% interval should contain about 90% of the held-out years, and a
+Gaussian band gets there when the scale it implies, its σ, is about as large as
+the error the head makes; the table puts the two side by side. The target blurs
+the comparison: a publication year is an integer, and with every centre near the
+same value, coverage moves only when a band edge crosses a whole year. A band
+whose σ sits a little below its RMSE can still cover, and the same objective on
+more papers can fall short. The heads fit their scale on the training papers,
+so nothing guarantees which side they land on for papers they have not seen.
+Split-conformal calibration exists to make it a guarantee: calibrate the band's
+width on held-out residuals (the conformal chapter's CQR does exactly this to a
+served ±σ band).
 
 The `pinball` head reaches its band differently. Every quantile level starts at
 the same output, and the pinball loss moves each by a bounded, sign-driven
 gradient — `q` or `1 − q` per row, whatever the size of the miss — so the levels
 separate only as fast as the optimiser's steps carry them. A Gaussian head
-needs only its mean and one scale to move. At this budget the pinball levels
-are still close together — the narrowest band in the table, well short of 90% —
-and at a smaller learning rate they barely leave their shared starting output.
+needs only its mean and one scale to move.
 
 ```{python}
 db.close()

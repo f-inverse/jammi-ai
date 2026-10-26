@@ -107,15 +107,17 @@ pub fn training_spec_from_proto(req: pb::SubmitJobRequest) -> Result<TrainingSpe
             // the single-rank job the caller did not ask for. The wire's `0`
             // (unset) and `1` are both the single rank and pass.
             if world_size > 1 {
-                let message = format!(
-                    "world_size = {world_size} is not supported for a context_predictor job \
-                     (the episodic meta-training loop runs on a single rank); submit it \
-                     without a rank count or with world_size = 1"
-                );
-                let engine_err = JammiError::Config(message.clone());
+                let engine_err = JammiError::InvalidArgument {
+                    argument: "world_size".into(),
+                    reason: format!(
+                        "{world_size} ranks: the episodic meta-training loop of a \
+                         context_predictor job runs on a single rank; submit it without a \
+                         rank count or with world_size = 1"
+                    ),
+                };
                 return Err(jammi_wire::attach_error_detail(
-                    tonic::Code::InvalidArgument,
-                    message,
+                    jammi_wire::status_code(&engine_err),
+                    engine_err.to_string(),
                     &engine_err,
                 ));
             }
@@ -954,7 +956,7 @@ mod tests {
         );
         let engine_err = jammi_wire::error_from_status(&status);
         assert!(
-            matches!(engine_err, JammiError::Config(_)),
+            matches!(engine_err, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
             "the refusal must reconstruct as the typed engine error, not the lossy \
              fallback: {engine_err:?}"
         );

@@ -6,8 +6,8 @@ The book's thesis, made explicit: **one Jammi recipe is one equation in the
 monograph and one line in the GNN/conformal canon.** The verticals carried short
 bridge notes; this chapter writes the full bridge — four signature chapters that
 each take one operation and show it is the *same object at three altitudes*, then
-run it live; the Neptune-contrast framing; and the **verified
-citation map** that pins every recipe to its sources.
+run it live; and the **verified citation map** that pins every recipe to its
+sources.
 
 Every signature below runs its call live and claims what it measured. A finding
 only the published data shows is claimed at `full` scale, over the data it is
@@ -24,7 +24,7 @@ from jammi_cookbook.claims import claim
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 arxiv = datasets.arxiv(db, SCALE)
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 embeddings = keystone.embed(db, arxiv, SCALE)
 ```
 
@@ -57,7 +57,7 @@ same-subject retrieval precision.
 ```{python}
 propagated = keystone.propagate(db, arxiv, embeddings)
 compared = db.eval_compare(
-    embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
+    embedding_tables=[embeddings, propagated], source=arxiv.papers, ground_truth=truth, k=10
 )
 raw, prop = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
 print(f"precision@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {prop - raw:+.3f})")
@@ -131,7 +131,7 @@ tuned = keystone.fine_tune_on_graph(
     epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
 )
 ft_compared = db.eval_compare(
-    embedding_tables=[embeddings, tuned], source=arxiv.papers, golden_source=golden, k=10
+    embedding_tables=[embeddings, tuned], source=arxiv.papers, ground_truth=truth, k=10
 )
 ft = ft_compared["per_table"][1]["embedding_eval"]["aggregate"]["precision_at_k"]
 print(f"precision@10 base → declared-edge fine-tune: {raw:.3f} → {ft:.3f}")
@@ -139,9 +139,9 @@ if SCALE is scale.Scale.FULL:
     claim("the declared-edge fine-tune lifts same-subject precision@10", ft > raw)
 ```
 
-## Signature 4 — A prediction is a context-conditioned posterior (the moat)
+## Signature 4 — A prediction is a context-conditioned posterior
 
-The tier with **no monograph and no Neptune analogue** — the non-redundant core.
+The tier the monograph has no chapter for.
 
 - **The Neural-Process family.** The context predictor is a CNP/ANP
   [@garnelo2018cnp; @kim2019anp] — and the amortized-tabular-prediction line
@@ -157,7 +157,7 @@ The tier with **no monograph and no Neptune analogue** — the non-redundant cor
   `conformalize` / `conformalize_interval`.
 
 This is the crux the [tier-04 chapter](../predict/predict.qmd) works in full.
-The signature here is the moat's worked example: the predictor fits a real
+The signature's worked example: the predictor fits a real
 posterior, and under the time-split the regression interval under-covers — the
 test era's residuals run past anything the calibration era holds, so weighted
 conformal cannot repair it — while the classification set holds its coverage,
@@ -187,31 +187,6 @@ if SCALE is scale.Scale.FULL:
     claim("the time split breaks the interval's coverage, at the scale it is about",
           reg_cov < 0.80, f"coverage {reg_cov:.3f}")
 ```
-
-## The Neptune-contrast framing
-
-The book's organizing conceit. Amazon Neptune is **Database / Analytics / ML**;
-this cookbook is **Construct / Analyze / Learn / Predict & Quantify** — the same
-"unified yet separate" spine, re-expressed as runnable Jammi computation, **plus a
-fourth tier Neptune structurally lacks**: calibrated, provenance-stamped,
-context-conditioned prediction.
-
-Stated plainly:
-
-- **Tiers 01–03 are roughly Neptune-parity (commodity).** Neptune *loads* a graph
-  and runs `CALL neptune.algo.*` (pageRank / degree / wcc) over it; Jammi
-  *constructs* the similarity graph from text **and** registers the declared graph
-  beside it, then propagates and learns over it. Same operations, expressed as
-  substrate computation. Neptune uses **Air Routes** for its queries/algorithms —
-  so does this cookbook's on-ramp.
-- **Tier 04 + bring-your-own-graph is the non-redundant core.** A graph-conditioned
-  prediction with an honest, audited coverage guarantee has **no Neptune analogue**.
-  Neptune switches datasets when it reaches ML — and so do we, to **ogbn-arxiv**,
-  for a credible learn/predict tier; the Air Routes on-ramp stops at tier 02 (its
-  label is near-deterministic from lat/lon, too thin for a learn tier).
-
-(Neptune is a public product named here only as a *contrast*; it is a competitor's
-product, not a Jammi consumer — the engine names no consumer.)
 
 ## The verified citation map
 

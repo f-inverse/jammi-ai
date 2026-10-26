@@ -1,7 +1,7 @@
 # Mutable companion tables
 
 End-to-end create / insert / select / drop on a Jammi mutable table —
-the OSS primitive for state that needs to live alongside read-only result
+the primitive for state that needs to live alongside read-only result
 tables.
 
 **When to use this pattern.** You need a writable table that sits in the

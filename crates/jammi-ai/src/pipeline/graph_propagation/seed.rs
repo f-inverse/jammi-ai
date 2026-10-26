@@ -70,24 +70,29 @@ pub struct SeedSpec {
 }
 
 impl SeedSpec {
-    /// Refuses ([`JammiError::Config`]) zero `dimensions`, a `sparsity` that is
+    /// Refuses ([`JammiError::InvalidArgument`]) zero `dimensions`, a `sparsity` that is
     /// not a finite number `≥ 1` (at `s = 1` the projection is dense `±1`), and
     /// a non-finite `beta`.
     pub fn new(seed: u64, dimensions: usize, sparsity: f64, beta: f64) -> Result<Self> {
         if dimensions == 0 {
-            return Err(JammiError::Config(
-                "a structural seed needs at least one dimension".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "dimensions".into(),
+                reason: "a structural seed needs at least one dimension".into(),
+            });
         }
         if !(sparsity.is_finite() && sparsity >= 1.0) {
-            return Err(JammiError::Config(format!(
-                "a structural seed's sparsity must be a finite number >= 1, got {sparsity}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "sparsity".into(),
+                reason: format!(
+                    "a structural seed's sparsity must be a finite number >= 1, got {sparsity}"
+                ),
+            });
         }
         if !beta.is_finite() {
-            return Err(JammiError::Config(format!(
-                "a structural seed's degree exponent must be finite, got {beta}"
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "beta".into(),
+                reason: format!("a structural seed's degree exponent must be finite, got {beta}"),
+            });
         }
         Ok(Self {
             seed,
@@ -195,7 +200,7 @@ mod tests {
             SeedSpec::new(0, 8, f64::INFINITY, 0.0),
             SeedSpec::new(0, 8, 3.0, f64::NAN),
         ] {
-            assert!(matches!(bad, Err(JammiError::Config(_))));
+            assert!(matches!(bad, Err(JammiError::InvalidArgument { .. })));
         }
     }
 }

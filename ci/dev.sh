@@ -30,8 +30,9 @@
 #                          first, the way ci.yml's image lanes build a leg —
 #                          for a tree whose image `ci.yml` has not built yet
 #   --gc                   remove every jammi-dev-* container, network and
-#                          volume that is not one of the kept caches, and every
-#                          dangling image; print what remains
+#                          volume that is not one of the kept caches, every
+#                          target artifact no build has written for a week,
+#                          and every dangling image; print what remains
 #   JAMMI_CI_IMAGE         image to use (default: this tree's CI image, by
 #                          content — the one its workflows run in;
 #                          `ci/scripts/ci_image.py refs`)
@@ -89,7 +90,19 @@ if [ -n "$gc" ]; then
   docker ps -a --format '{{.Names}}' --filter name='^jammi-dev-' | orphaned | each rm -fv
   docker network ls --format '{{.Name}}' --filter name='^jammi-dev-' | orphaned | each network rm
   docker volume ls -q --filter name='^jammi-dev-' | { grep -Ev "$kept" || true; } \
-    | { grep -Fxv -f <(docker ps --format '{{.Mounts}}' | tr ',' '\n') || true; } | each volume rm
+    | { grep -Fxv -f <(docker ps --no-trunc --format '{{.Mounts}}' | tr ',' '\n') || true; } \
+    | each volume rm
+  # The target cache keeps a week of builds. Cargo never deletes an artifact a
+  # newer build superseded, so the volume otherwise grows with every version
+  # bump, lockfile change and feature mix; sccache refills what this drops. A
+  # live run is building in it, so it is left alone while one is.
+  if [ -n "$(docker ps -q --filter name='^jammi-dev-')" ]; then
+    echo "ci/dev.sh: a live run is using jammi-dev-target; its stale artifacts are kept" >&2
+  elif docker image inspect "$image" >/dev/null 2>&1; then
+    docker run --rm -v jammi-dev-target:/cache/target "$image" sh -c \
+      'find /cache/target -mindepth 1 -type f -mtime +7 -delete \
+       && find /cache/target -mindepth 1 -type d -empty -delete'
+  fi
   docker image prune -f >/dev/null
   docker system df
   exit 0

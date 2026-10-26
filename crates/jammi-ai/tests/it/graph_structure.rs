@@ -522,7 +522,10 @@ async fn invalid_requests_are_typed_refusals() {
         ("a sparsity below one", request().with_sparsity(0.5)),
     ] {
         let err = refuse(request).await;
-        assert!(matches!(err, JammiError::Config(_)), "{label}: {err}");
+        assert!(
+            matches!(err, JammiError::InvalidArgument { .. }),
+            "{label}: {err}"
+        );
     }
 
     let err = refuse(request().with_key_column("customer")).await;
@@ -575,7 +578,7 @@ async fn an_empty_graph_is_a_typed_refusal() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, JammiError::Config(_)),
+        matches!(err, JammiError::InvalidArgument { .. }),
         "no node to embed: {err}"
     );
 }

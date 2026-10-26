@@ -733,11 +733,14 @@ async fn f3_a_label_seen_only_in_the_validation_suffix_is_still_counted() {
         ModelTask::Classification,
     )
     .unwrap();
-    let eager_num_classes = match eager.format() {
-        jammi_ai::fine_tune::data::TrainingFormat::Classification { num_classes } => num_classes,
-        other => panic!("expected Classification, got {other:?}"),
-    };
-    assert_eq!(vocab.num_classes(), eager_num_classes);
+    assert_eq!(
+        eager.format(),
+        Some(jammi_ai::fine_tune::data::TrainingFormat::Classification)
+    );
+    let eager_labels = eager
+        .class_labels()
+        .expect("a classification loader names its classes");
+    assert_eq!(vocab.labels(), eager_labels);
 }
 
 /// P3: the streamed read completes under a session pool sized at the 64 MiB
@@ -923,7 +926,7 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
 
     // Sample the pool concurrently with the job's own future: the reservation
     // must be held (already grown to at least a row's worth of the padded
@@ -1062,7 +1065,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.expect(
         "a Streamed W=1 regression run over a table whose eager size exceeds the pool must \
          complete: the writer plans its sort at one output partition and the per-rank \
@@ -1157,7 +1160,7 @@ async fn f4_a_validation_window_not_a_multiple_of_batch_size_completes() {
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.expect(
         "a validation window of 5 rows at batch_size 3 (ceil = 2 chunks, one partial) must \
          complete — a wrong chunk-count assertion inside evaluate_streamed would fail this run",
@@ -1305,7 +1308,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
     // sticky-bound session's blocking-thread `open_streamed_source` call
     // would "accidentally" resolve the right tenant even without this
     // commit's fix.
-    // `TrainingJob::wait` polls `Catalog::get_job`, which ALSO scopes on
+    // `JobHandle::wait` polls `Catalog::get_job`, which ALSO scopes on
     // `current_tenant()` (`jobs_repo.rs::get_job`) — outside this scope the
     // session carries no sticky tenant at all, so the wait must run INSIDE
     // the same task-local scope as the submit, exactly like the gRPC
@@ -1343,7 +1346,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
                 .await
                 .unwrap();
             let result = job.wait().await;
-            (job.job_id.clone(), result)
+            (job.job_id().to_string(), result)
         })
         .await;
 

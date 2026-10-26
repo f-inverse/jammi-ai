@@ -13,7 +13,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::ResultTableKind;
-use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::catalog::status::{JobStatus, ResultTableStatus};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
@@ -128,7 +128,7 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.unwrap();
 
     // The pinned adapter prints below must be produced by the
@@ -191,25 +191,25 @@ async fn run_parity_fixture(session: &Arc<InferenceSession>) -> BTreeMap<String,
 /// does not compile here, which is the point: it must be measured, not guessed.
 #[cfg(target_arch = "x86_64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:9cf8a5b1ceb712a7"),
-    ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:48dbcc8330661413"),
-    ("checkpoint_2.safetensors", "1184:e74ad321104e04cd"),
-    ("checkpoint_3.safetensors", "1184:a03cc747ccf863d7"),
-    ("checkpoint_4.safetensors", "1184:9cf8a5b1ceb712a7"),
-    ("checkpoint_best.safetensors", "1184:9cf8a5b1ceb712a7"),
-    ("manifest.json", "788:0f58fbd7e7d09f38"),
+    ("adapter.safetensors", "2376:37827de05fe5f103"),
+    ("adapter_config.json", "303:e2986857744cd7c7"),
+    ("checkpoint_1.safetensors", "2376:84df83a384b20b19"),
+    ("checkpoint_2.safetensors", "2376:fa56ec8498ef7566"),
+    ("checkpoint_3.safetensors", "2376:73b633c955c4b7ef"),
+    ("checkpoint_4.safetensors", "2376:37827de05fe5f103"),
+    ("checkpoint_best.safetensors", "2376:37827de05fe5f103"),
+    ("manifest.json", "788:313c2f6ef2df755f"),
 ];
 #[cfg(target_arch = "aarch64")]
 const PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1184:5406ba859233d205"),
-    ("adapter_config.json", "143:1feeeb6239c3fd30"),
-    ("checkpoint_1.safetensors", "1184:fdee6c194f461948"),
-    ("checkpoint_2.safetensors", "1184:164dc509698202fd"),
-    ("checkpoint_3.safetensors", "1184:ed0bcf37523d6e03"),
-    ("checkpoint_4.safetensors", "1184:5406ba859233d205"),
-    ("checkpoint_best.safetensors", "1184:5406ba859233d205"),
-    ("manifest.json", "788:a58029cc6cc6ef94"),
+    ("adapter.safetensors", "2376:499902d6a3551edb"),
+    ("adapter_config.json", "303:e2986857744cd7c7"),
+    ("checkpoint_1.safetensors", "2376:8b904dc8aa917d4e"),
+    ("checkpoint_2.safetensors", "2376:03524c2aa45b2580"),
+    ("checkpoint_3.safetensors", "2376:ce4b267c2d753f98"),
+    ("checkpoint_4.safetensors", "2376:499902d6a3551edb"),
+    ("checkpoint_best.safetensors", "2376:499902d6a3551edb"),
+    ("manifest.json", "788:f0897ab2f05dbf74"),
 ];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -249,23 +249,23 @@ async fn refactor_parity() {
 /// host.
 #[cfg(target_arch = "x86_64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:ab17f8201a9c7603"),
-    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
-    ("checkpoint_1.safetensors", "1888:d739276311b186e0"),
-    ("checkpoint_2.safetensors", "1888:2db5d9cd5ad33788"),
-    ("checkpoint_3.safetensors", "1888:ab17f8201a9c7603"),
-    ("checkpoint_best.safetensors", "1888:ab17f8201a9c7603"),
-    ("manifest.json", "676:7497755381d07072"),
+    ("adapter.safetensors", "4264:8f856bb3dee1f5f1"),
+    ("adapter_config.json", "547:e76f7cd4b469b714"),
+    ("checkpoint_1.safetensors", "4264:3a2c0370b141d43f"),
+    ("checkpoint_2.safetensors", "4264:cb5f18056fd4de2a"),
+    ("checkpoint_3.safetensors", "4264:8f856bb3dee1f5f1"),
+    ("checkpoint_best.safetensors", "4264:8f856bb3dee1f5f1"),
+    ("manifest.json", "676:582436807e4b28a1"),
 ];
 #[cfg(target_arch = "aarch64")]
 const REGRESSION_PARITY_ADAPTER_PRINTS: &[(&str, &str)] = &[
-    ("adapter.safetensors", "1888:247d938373b8756d"),
-    ("adapter_config.json", "284:6d66bd5b8594e1fa"),
-    ("checkpoint_1.safetensors", "1888:6ca7a223b9045945"),
-    ("checkpoint_2.safetensors", "1888:d84d3efd599e933d"),
-    ("checkpoint_3.safetensors", "1888:247d938373b8756d"),
-    ("checkpoint_best.safetensors", "1888:247d938373b8756d"),
-    ("manifest.json", "676:56ce2564022c6625"),
+    ("adapter.safetensors", "4264:530b261a27430136"),
+    ("adapter_config.json", "547:e76f7cd4b469b714"),
+    ("checkpoint_1.safetensors", "4264:8d60b854b6f15e7a"),
+    ("checkpoint_2.safetensors", "4264:42362ef295f1360a"),
+    ("checkpoint_3.safetensors", "4264:530b261a27430136"),
+    ("checkpoint_best.safetensors", "4264:530b261a27430136"),
+    ("manifest.json", "676:4f34e471302363dc"),
 ];
 
 fn regression_parity_columns() -> Vec<String> {
@@ -298,7 +298,7 @@ async fn run_regression_parity_fixture(
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait().await.unwrap();
 
     // The target scaler and the pinned prints below must
@@ -363,19 +363,19 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
     // CI hermetic lane, the other from an Apple Silicon host.
     #[cfg(target_arch = "x86_64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:fa6bd33abdb851b5"),
-        ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:fa6bd33abdb851b5"),
-        ("checkpoint_best.safetensors", "1184:fa6bd33abdb851b5"),
-        ("manifest.json", "452:d47c82d1dbae175e"),
+        ("adapter.safetensors", "2376:2e7751e7972933cd"),
+        ("adapter_config.json", "303:e2986857744cd7c7"),
+        ("checkpoint_1.safetensors", "2376:2e7751e7972933cd"),
+        ("checkpoint_best.safetensors", "2376:2e7751e7972933cd"),
+        ("manifest.json", "452:8a82b0b0471a2ff2"),
     ];
     #[cfg(target_arch = "aarch64")]
     const GRADCACHE_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:06234c2bf6312b14"),
-        ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:06234c2bf6312b14"),
-        ("checkpoint_best.safetensors", "1184:06234c2bf6312b14"),
-        ("manifest.json", "452:ba02b892c5f53429"),
+        ("adapter.safetensors", "2376:e9ada7d35cfbe200"),
+        ("adapter_config.json", "303:e2986857744cd7c7"),
+        ("checkpoint_1.safetensors", "2376:e9ada7d35cfbe200"),
+        ("checkpoint_best.safetensors", "2376:e9ada7d35cfbe200"),
+        ("manifest.json", "452:85c9a04dda2d93d3"),
     ];
 
     let dir = TempDir::new().unwrap();
@@ -402,7 +402,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
         )
         .await
         .unwrap();
-    let job_id = job.job_id.clone();
+    let job_id = job.job_id().to_string();
     job.wait()
         .await
         .expect("a W=1 GradCache run over the eager loader must complete");
@@ -486,25 +486,25 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
     // runs.
     #[cfg(target_arch = "x86_64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:442a2a1013d43364"),
-        ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:d6efb625ea7bc057"),
-        ("checkpoint_2.safetensors", "1184:13630d62b8b2ca78"),
-        ("checkpoint_3.safetensors", "1184:c0f5a2deff6bf5b7"),
-        ("checkpoint_4.safetensors", "1184:442a2a1013d43364"),
-        ("checkpoint_best.safetensors", "1184:442a2a1013d43364"),
-        ("manifest.json", "788:fb18b2979128597b"),
+        ("adapter.safetensors", "2376:be3b3d44338e18be"),
+        ("adapter_config.json", "303:e2986857744cd7c7"),
+        ("checkpoint_1.safetensors", "2376:aa2b75d222fc7d05"),
+        ("checkpoint_2.safetensors", "2376:90718cbfe098539c"),
+        ("checkpoint_3.safetensors", "2376:9d674b198dc9519b"),
+        ("checkpoint_4.safetensors", "2376:be3b3d44338e18be"),
+        ("checkpoint_best.safetensors", "2376:be3b3d44338e18be"),
+        ("manifest.json", "788:77700786dbe62898"),
     ];
     #[cfg(target_arch = "aarch64")]
     const MINING_ADAPTER_PRINTS: &[(&str, &str)] = &[
-        ("adapter.safetensors", "1184:ee37dbdc4de182fc"),
-        ("adapter_config.json", "143:1feeeb6239c3fd30"),
-        ("checkpoint_1.safetensors", "1184:f73470d7bd26a6d3"),
-        ("checkpoint_2.safetensors", "1184:ed090f96d9512427"),
-        ("checkpoint_3.safetensors", "1184:a87606f52162f0de"),
-        ("checkpoint_4.safetensors", "1184:ee37dbdc4de182fc"),
-        ("checkpoint_best.safetensors", "1184:ee37dbdc4de182fc"),
-        ("manifest.json", "788:8cc7fb24393325ce"),
+        ("adapter.safetensors", "2376:5c65bc800769db4b"),
+        ("adapter_config.json", "303:e2986857744cd7c7"),
+        ("checkpoint_1.safetensors", "2376:1cdbc5d48ffb8fea"),
+        ("checkpoint_2.safetensors", "2376:3fae0a863b2c3701"),
+        ("checkpoint_3.safetensors", "2376:95202af69726a016"),
+        ("checkpoint_4.safetensors", "2376:5c65bc800769db4b"),
+        ("checkpoint_best.safetensors", "2376:5c65bc800769db4b"),
+        ("manifest.json", "788:0b06e90013857afa"),
     ];
 
     async fn run(dir: &TempDir, mine: bool) -> (Option<&'static str>, BTreeMap<String, String>) {
@@ -536,7 +536,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
             )
             .await
             .unwrap();
-        let job_id = job.job_id.clone();
+        let job_id = job.job_id().to_string();
         job.wait()
             .await
             .expect("a W=1 mining-config run must complete");
@@ -717,7 +717,7 @@ async fn two_jobs_over_one_plain_source_materialise_two_training_sets() {
             .await
             .unwrap();
         job.wait().await.unwrap();
-        model_ids.push(job.model_id().to_string());
+        model_ids.push(job.output_model_id().unwrap().to_string());
     }
     assert_ne!(
         model_ids[0], model_ids[1],
@@ -825,7 +825,7 @@ async fn empty_projection_is_refused_through_the_job_path() {
         .await
         .unwrap();
     let outcome = job.wait().await;
-    let record = session.catalog().get_job(&job.job_id).await.unwrap();
+    let record = session.catalog().get_job(job.job_id()).await.unwrap();
     println!("empty-training-set job outcome = {outcome:?}");
     println!(
         "empty-training-set job status = {:?} error = {:?}",
@@ -833,7 +833,8 @@ async fn empty_projection_is_refused_through_the_job_path() {
     );
 
     assert_eq!(
-        record.status, "failed",
+        record.status,
+        JobStatus::Failed,
         "a zero-row projection must fail the job, never train on nothing"
     );
     let error = record.error.clone().unwrap_or_default();

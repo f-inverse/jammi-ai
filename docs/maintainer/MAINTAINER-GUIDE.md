@@ -1629,13 +1629,13 @@ and the served Hybrid arm is reachable via the serve-source reconstruction.
 The conformal wrap is `ConformalContextPredictor`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) = a calibrated `ConformalModel`
 (split-conformal) + the served `DistributionForm`.
-`ConformalContextPredictor::interval(prediction, group)` turns one served
+`ConformalContextPredictor::interval(prediction, at)` turns one served
 distribution into a coverage-guaranteed `[lower, upper]`: a Gaussian head wraps with
 **AbsoluteResidual** centred on the predictive mean; a quantile head wraps with
 **CQR** over its served quantile bounds. It is constructed by
 `InferenceSession::calibrate_context_predictor_conformal` on a **held-out**
-calibration set, with `ConformalLevers` (`Marginal`/`Mondrian`/`Weighted`) — the
-engine *applies* the chosen lever, never *chooses* one.
+calibration set, with a `Calibration` (`Marginal`/`Mondrian`/`Weighted`) — the
+engine *applies* the chosen scheme, never *chooses* one.
 
 **Wiring status — DORMANT.** `ConformalContextPredictor`,
 `calibrate_context_predictor_conformal`, and `.interval(...)` have **no non-test
@@ -1819,7 +1819,7 @@ attest:
    transport-neutral manifest mirrors), a `MaterializationEnv` with an **empty model
    set** (the join runs no model), and a read-time `InputAnchor::unpinned_at_instant`
    for **both** relations. **Honesty invariant:** a registered source exposes no
-   as-of/version surface in open-core, so each input is recorded `UnpinnedAtInstant`
+   as-of/version surface, so each input is recorded `UnpinnedAtInstant`
    (the read instant only) rather than a fabricated pin — which is exactly why the
    cookbook's clean as-of training set verifies as `MatchWithUnpinnedInputs`, not
    `Match`.
@@ -1924,7 +1924,7 @@ report. Read-only, like its sibling: it never acts on a verdict.
 verdict mapped to the proto oneof via `match_verdict_to_proto`,
 `crates/jammi-wire/src/catalog.rs`) and Python `Database::verify_materialization`
 (`crates/jammi-python/src/database.rs`). The chapter freezes the full four-verdict matrix
-as committed golden contracts.
+as committed ground truth contracts.
 
 > **Invariant (belongs in §5):** the `definition_hash` is not bit-reproducible when a
 > producer's inputs include non-bit-reproducible content (e.g. CPU embeddings) — the
@@ -2011,7 +2011,7 @@ decides whether a hit is even *possible*:
 
 - **`infer`** (`crates/jammi-ai/src/session.rs`, `InferenceSession::infer`) and
   **`EmbeddingPipeline::run`** (`crates/jammi-ai/src/pipeline/embedding.rs`) anchor their
-  sole input — a *raw source* — as `UnpinnedAtInstant`, because an open-core source has no
+  sole input — a *raw source* — as `UnpinnedAtInstant`, because a raw source has no
   version surface. So a `Use` request is **honestly always a miss** (`probe_cache`
   short-circuits any unpinned anchor) and the outcome is always `Computed`. **The probe
   still runs** so the surface is uniform and the off-ness is provable, not hidden. This is
@@ -2250,7 +2250,7 @@ CachePolicy::Use { … probe_cache_record(&def_hash, &inputs) … return Reused 
 calls the producer with `CachePolicy::Bypass` and the matching `*_from_manifest`
 reverse-mappers. Anchor immutable result-table inputs as `ResultDigest` (cacheable) and raw
 sources as `UnpinnedAtInstant` (honestly never a hit). Do **not** add a scheduler or a
-staleness→recompute loop — that is the platform's, not the engine's
+staleness→recompute loop — when to recompute is the caller's policy, not the engine's
 (`crates/jammi-ai/src/pipeline/recompute.rs`).
 
 ### 2.5 Encoders (`jammi-encoders`)
@@ -2559,7 +2559,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   only shape-affecting fields; **run-time-only fields (`lora_dropout`, `init_mode`) are
   deliberately not persisted**. Higher-level `SavedAdapter`
   (`crates/jammi-ai/src/fine_tune/target.rs`) is the on-disk discriminator between
-  `ProjectionHead` and `EncoderAdapters` targets.
+  `FrozenEncoder` and `AdaptedEncoder` targets.
 - **Adapter identity: `model_type` + `tower`, one meaning each** —
   `crates/jammi-lora/src/adapter.rs` (the `AdapterConfig` struct and the `Tower` enum).
   `model_type` is the base ARCHITECTURE id as the shared predicate spells it:
@@ -2586,9 +2586,12 @@ staleness→recompute loop — that is the platform's, not the engine's
 
   See §5's "site-name strings are a persistence ABI" gotcha before renaming any of them.
 - **`TrainingTarget`** — `crates/jammi-ai/src/fine_tune/target.rs` (the `TrainingTarget`
-  enum): `ProjectionHead { head: LoraModel }` or `EncoderAdapters(...)`. Uniform trainer
-  surface (`trainable_params`, `set_training`, `named_trainable_weights`, `load_weights`,
-  dropout positions, `saved_adapter`).
+  enum): `FrozenEncoder { head: LoraModel }` or `AdaptedEncoder(...)` (LoRA inside the
+  encoder, and the task's head when it has one). Uniform trainer surface
+  (`trainable_params`, `set_training`, `named_trainable_weights`, `load_weights`, dropout
+  positions, `saved_adapter`). A head's layers are `HeadLayer`s, named by the
+  `HeadOutput` they serve; the trainer builds them and serving's `ServedHead` rebuilds
+  them from that one definition.
 - **`TrainingFormat::MediaTriplet` — one media shape, keyed by TASK** —
   `crates/jammi-ai/src/fine_tune/data.rs` (the `TrainingFormat` enum): `anchor`,
   `positive`, `negative` columns carrying encoded binary blobs — audio clips
@@ -2772,11 +2775,11 @@ model's output is bit-identical across the mode toggle. Outside its own domain
 a seam falls back to the eager composition, counted — a domain miss is one
 code path in every mode, never a second one.
 
-**The eval doctrine: parity/golden lanes.** `jammi-encoders` carries two
+**The eval doctrine: parity/ground truth lanes.** `jammi-encoders` carries two
 hermetic oracle suites in the default `cargo test` — `tests/parity.rs`, whose
 oracle is `candle-transformers` over the committed `tiny_bert` fixture, and
 `tests/golden_parity.rs`, whose oracle is a committed PyTorch dump
-(`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary) —
+(`tests/fixtures/htsat_clap_tiny/truths.safetensors`, a tracked binary) —
 never a network call or a torch install. `jammi-kernels/tests/cuda_parity.rs`
 is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
 device 0 exists, and fails naming the device when it cannot be opened;
@@ -3383,12 +3386,12 @@ describing a removed surface.
   advertised (`as_wire`) == mounted.** Whether a process *runs* the job claim loop it
   accepts is the separate `[worker] enabled` runtime key (§3.5,
   `docs/guide/src/operability.md`), never a tier and never a build feature.
-- **`OssServer` / `serve_grpc_chain`** — `crates/jammi-server/src/runtime.rs` (the
-  `OssServer` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
+- **`Server` / `serve_grpc_chain`** — `crates/jammi-server/src/runtime.rs` (the
+  `Server` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
   and tests. Mounts Flight SQL + `CatalogService` + `JobService` always; engine-backed
   services when `engine.is_some()`; tier-gated `Eval`/`Trigger`. `ChainParts::worker`
   spawns the embedded `JobWorker` claim loop
-  iff `[worker] enabled`. **`OssServer::new` calls `InferenceSession::open` (not
+  iff `[worker] enabled`. **`Server::new` calls `InferenceSession::open` (not
   `new`)** so the `annotate` UDTF is registered for Flight SQL.
 - **Session/tenant boundary** — `crates/jammi-server/src/grpc/session.rs`:
   `SESSION_HEADER`, `SessionStore` (in-process `HashMap<SessionId, Option<TenantId>>`),
@@ -3406,7 +3409,7 @@ describing a removed surface.
   Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
   metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
-  (`runtime.rs`'s `build_grpc_chain` — the OSS binary's shipped default,
+  (`runtime.rs`'s `build_grpc_chain` — the binary's shipped default,
   `None` — and `:1020`'s `assemble_grpc_chain` exhaustive destructure;
   `flight.rs`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
@@ -3427,7 +3430,7 @@ Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
 with one bidi RPC, `RunRank(stream RankControl) returns (stream RankEvent)`.
 Handler: `crates/jammi-server/src/grpc/gang.rs`, `GangServer::run_rank`.
 Mounted beside `PeerServiceServer` on the internal `[server] peer_bind`
-listener only (`crates/jammi-server/src/runtime.rs`, `OssServer::bind`) —
+listener only (`crates/jammi-server/src/runtime.rs`, `Server::bind`) —
 never on the public listener, never wrapped by `TenantResolverLayer`; the
 public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
 (`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
@@ -3669,7 +3672,7 @@ ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
 duration_secs` (`LeaseIntervals::lease()`) is the held session's park bound
 and, doubled, `fresh_instance`'s liveness margin; `[lease] heartbeat_secs`
 (`LeaseIntervals::heartbeat()`) is the re-verification cadence and the
-longest a `ClaimProbe` is waited on — both read once at `OssServer::bind`
+longest a `ClaimProbe` is waited on — both read once at `Server::bind`
 and passed into `GangServer::new`.
 
 ### 2.8b Gang membership substrate (`instances.peer_addr`/`result_root`)
@@ -3945,7 +3948,7 @@ folding byte-for-byte what `Local` folds — are
 **The decode cap on every listener.** `[server.limits] max_message_bytes`
 bounds every listener's inbound decode: the public chain's services in
 `assemble_grpc_chain` and the `peer_bind` listener's `PeerService` and
-`GangService` in `OssServer::bind` (`crates/jammi-server/src/runtime.rs`)
+`GangService` in `Server::bind` (`crates/jammi-server/src/runtime.rs`)
 carry the same per-service `max_decoding_message_size`, and the
 coordinator's client is the third site. Stated in `encoded_len()` terms and
 pinned (`crates/jammi-server/tests/it/gang_rounds.rs`): a frame of exactly
@@ -3997,7 +4000,7 @@ complete. Rank 0 alone persists the acceleration report. **Every rank's model is
 with its own dropout seed** (`run_fine_tune_blocking`): `RankContext::dropout_seed(config.seed)`
 — rank 0 (and the single rank) is the identity, so W=1 is byte-unchanged — goes to the
 `_for_rank` head builders (`fine_tune/lora.rs`) and to `LoraBuildConfig::dropout_seed` for an
-encoder-adapters target, while the A/B init seed stays `config.seed` on every rank: the ranks
+adapted-encoder target, while the A/B init seed stays `config.seed` on every rank: the ranks
 start from byte-identical adapter weights and draw distinct masks (DESIGN.md §4). The
 `test-hooks` record `training_test_hooks::rank_targets_for` captures each rank's dropout seed,
 its head layers' `dropout_run_seed`s and a pre-step weight digest, and the fan-out oracle
@@ -4021,7 +4024,7 @@ than `world − 1` is `ShortListed`, never a smaller gang: no substitution);
 (5) dispatch — per assigned member, `Catalog::peer_addr_of(instance_id)`
 then the installed `MemberDialer` (`HostAdmission::member_dialer`, the
 engine's one transport seam; `jammi-server` installs `gang_rounds::GangDialer`
-over `dial_member` beside the gang listener in `OssServer::bind`) with the
+over `dial_member` beside the gang listener in `Server::bind`) with the
 `Assign { job_id, attempt, rank, world, coordinator_instance_id }`; a member
 that does not admit (`Unavailable` for a busy slot, a job-row refusal, a
 transport error) ends THIS attempt (every session admitted so far is ended)
@@ -4641,18 +4644,18 @@ uses the **provenanced** form, not the bare `predict_with_context_predictor`. (d
 error, never a silent identity de-standardisation.
 
 **Where `predict/conformal.rs` feeds — and its wiring status.**
-`crates/jammi-ai/src/predict/conformal.rs` (`ConformalModel`; `ConformalModel::regression` /
-`_mondrian` / `_weighted`; `predict_interval`; `IntervalScore::AbsoluteResidual|Cqr`) is the
+`crates/jammi-ai/src/predict/conformal.rs` (`ConformalModel::classification` / `regression`
+under a `Calibration`; `predict_set` / `predict_interval` at a `TestPoint`; `Estimates::Points`
+⇒ absolute residual, `Estimates::Bands` ⇒ CQR) is the
 distribution-free coverage primitive. It is **not on the `Predict` data-flow above** — the gRPC
 handler returns the raw distribution and the response proto has no interval field. The
 served-predictor conformal bridge is a *separate* surface: `ConformalContextPredictor`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) + its calibrator
 `InferenceSession::calibrate_context_predictor_conformal`, which re-runs
 `predict_with_context_predictor` over a held-out `(target_key, observed_y)` calibration set,
-picks the `IntervalScore` from the head form — `Gaussian ⇒ AbsoluteResidual`, `Quantile ⇒ Cqr` —
-and feeds `ConformalModel::regression{,_mondrian,_weighted}` under the caller-chosen
-`ConformalLevers`. Serving an interval is then `ConformalContextPredictor::interval(dist,
-group)`.
+picks the `Estimates` from the head form — `Gaussian ⇒ Points`, `Quantile ⇒ Bands` — and
+feeds `ConformalModel::regression` under the caller-chosen `Calibration`. Serving an interval
+is then `ConformalContextPredictor::interval(dist, at)`.
 
 - **`calibrate_context_predictor_conformal` / `ConformalContextPredictor::interval`: DORMANT**
   from every runtime serving path. Their only callers are integration tests
@@ -4662,13 +4665,14 @@ group)`.
   `ServedContextPredictor`; it does not — the wrap exists but is unwired into any served verb.
 - **`ConformalModel` (the primitive): CALLER-DRIVEN.** Its only *runtime-reachable* callers are
   the `jammi-python` embed utilities `conformalize` (classification, via
-  `ConformalModel::classification`) / `conformalize_interval` (`ConformalModel::regression` +
-  `AbsoluteResidual`) / `conformalize_cqr` (`ConformalModel::regression` + `Cqr`)
-  (`crates/jammi-python/src/database.rs`), each constructing a `ConformalModel` per call from
+  `ConformalModel::classification`) / `conformalize_interval` (`ConformalModel::regression` over
+  `Estimates::Points`) / `conformalize_cqr` (over `Estimates::Bands`)
+  (`crates/jammi-python/src/conformal.rs`), each constructing a `ConformalModel` per call from
   caller-supplied calibration arrays and returning a set (`conformalize`) or intervals (the other
-  two). These are standalone PyO3 methods, not part of the `Predict` (context-predictor) path, and
-  have **no gRPC peer** — the conformal primitive is exposed only embedded, for the caller to
-  invoke directly. Its *other* in-crate caller is the DORMANT
+  two). These are `jammi_native` module functions — they hold no session — not part of the
+  `Predict` (context-predictor) path, and have **no gRPC peer**: the remote transport computes
+  the same verbs client-side in `clients/python/jammi/_conformal.py`, which
+  `test_numeric_verbs_compute_identically_across_wheels` holds equal to these. Its *other* in-crate caller is the DORMANT
   `calibrate_context_predictor_conformal` bridge above, which is test-only. (`evidence/conformal.rs`
   references the primitive only in rustdoc, not a call.)
 
@@ -4993,7 +4997,7 @@ default in `crates/jammi-db/src/index/sidecar.rs`.)
    compiler forces a match arm in every method, including `modality`, `forward_input`,
    `probe_input` and `dtype`.
 4. Tests: `crates/jammi-encoders/tests/it/foo.rs` + register in
-   `crates/jammi-encoders/tests/it/main.rs`; add a golden/parity fixture if one exists.
+   `crates/jammi-encoders/tests/it/main.rs`; add a ground truth/parity fixture if one exists.
 5. Wire into the parent crate (same PR): an `EncoderFamily` variant plus its
    `from_config` / `from_adapter_model_type` / `adapter_model_type` / `has_tower` /
    `towers` arms in `crates/jammi-ai/src/model/arch.rs` (§2.7) — that module, not a
@@ -5065,7 +5069,7 @@ auto-available to every encoder.)
 ### 4.9 Workspace / build / release
 
 - **New crate:** `crates/<name>/Cargo.toml` with `version.workspace = true`; add to `members`
-  (and `default-members` if a shippable OSS crate); `[workspace.dependencies]` entry pinned to
+  (and `default-members` if a shippable crate); `[workspace.dependencies]` entry pinned to
   the exact version + `path`; insert into the publish topological order in
   `ci/scripts/publish_crates.sh` after every dep; if it ships to PyPI/npm, add its manifest to
   `ci/scripts/check_lockstep_versions.py`.
@@ -5363,8 +5367,8 @@ ci/scripts/run_guards.py --base origin/main` runs the guards a change can affect
 
 **CI guard contracts:**
 - **`ci/scripts/check_dep_direction.py`** BFS-walks the normal-dependency closure of
-  `default-members`; flags any crate whose source is non-crates.io (git/private registry) or
-  prefixed `jammi-enterprise`. dev/build deps are not walked.
+  `default-members`; flags any crate whose source is not crates.io (git, a path outside the
+  workspace, a private registry). dev/build deps are not walked.
 - **Candle-free boundary** (the `client substrate boundary` and `CLI boundary` guards): isolated per-package build of
   `jammi-wire`/`jammi-admin`/`jammi-client`, grep the compiler-artifact stream for
   `candle*|hf-hub|symphonia|tokenizers`; plus `jammi-cli` carries no `jammi-ai` edge. (On the isolated

@@ -830,6 +830,62 @@ impl_from_sql_primitive!(f64);
 impl_from_sql_primitive!(f32);
 impl_from_sql_primitive!(Vec<u8>);
 
+/// A catalog vocabulary stored as its `Display` spelling in a TEXT column and
+/// decoded through its `FromStr`, so a row is typed the moment it is read.
+macro_rules! impl_from_sql_text {
+    ($t:ty) => {
+        impl FromSqlValue for $t {
+            fn from_sqlite_row(
+                row: &sqlx::sqlite::SqliteRow,
+                name: &str,
+            ) -> Result<Self, BackendError> {
+                parse_text(String::from_sqlite_row(row, name)?, name)
+            }
+            fn from_postgres_row(
+                row: &sqlx::postgres::PgRow,
+                name: &str,
+            ) -> Result<Self, BackendError> {
+                parse_text(String::from_postgres_row(row, name)?, name)
+            }
+            fn from_sqlite_row_opt(
+                row: &sqlx::sqlite::SqliteRow,
+                name: &str,
+            ) -> Result<Option<Self>, BackendError> {
+                String::from_sqlite_row_opt(row, name)?
+                    .map(|text| parse_text(text, name))
+                    .transpose()
+            }
+            fn from_postgres_row_opt(
+                row: &sqlx::postgres::PgRow,
+                name: &str,
+            ) -> Result<Option<Self>, BackendError> {
+                String::from_postgres_row_opt(row, name)?
+                    .map(|text| parse_text(text, name))
+                    .transpose()
+            }
+        }
+    };
+}
+
+fn parse_text<T>(text: String, column: &str) -> Result<T, BackendError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    text.parse()
+        .map_err(|e: T::Err| BackendError::TypeConversion {
+            column: column.to_string(),
+            detail: e.to_string(),
+        })
+}
+
+impl_from_sql_text!(super::status::JobStatus);
+impl_from_sql_text!(super::status::JobKind);
+impl_from_sql_text!(super::status::JobKinds);
+impl_from_sql_text!(super::status::JobPhase);
+impl_from_sql_text!(super::status::JobExecution);
+impl_from_sql_text!(super::jobs_repo::WorkerState);
+
 impl FromSqlValue for uuid::Uuid {
     fn from_sqlite_row(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Self, BackendError> {
         use sqlx::Row as _;
@@ -983,6 +1039,28 @@ pub enum BackendError {
     },
     #[error("sqlx backend error: {0}")]
     Sqlx(#[source] std::sync::Arc<sqlx::Error>),
+}
+
+impl BackendError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]).
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::Unavailable(_) => ErrorClass::Unavailable,
+            // The backend asked for the transaction to run again: a retry
+            // from a fresh read can succeed.
+            Self::Retry(_) => ErrorClass::Aborted,
+            // The state refuses the write: a row the write collides with, or
+            // a live writer it must wait for.
+            Self::Constraint { .. } | Self::Busy(_) => ErrorClass::FailedPrecondition,
+            Self::TenantMismatch { .. } => ErrorClass::PermissionDenied,
+            Self::Execution(_)
+            | Self::Migration(_)
+            | Self::TypeConversion { .. }
+            | Self::DomainViolation { .. }
+            | Self::Sqlx(_) => ErrorClass::Internal,
+        }
+    }
 }
 
 /// Ceiling on the post-`close` drain. Reaching it means a connection never

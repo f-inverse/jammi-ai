@@ -20,7 +20,7 @@ use jammi_ai::pipeline::context_predictor::{
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::{SubmitJobParams, WorldSizeFact};
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 
 /// A REAL `TrainingSpec::FineTune`, naming `world_size = 2` under `common`
 /// (the shape `TrainingCommon` actually persists) — never a hand-written
@@ -119,7 +119,7 @@ async fn parity_over(kind: BackendKind) {
     catalog
         .submit_job(SubmitJobParams {
             job_id: &world_two_id,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: &world_two_json,
             model_ref: None,
@@ -130,7 +130,7 @@ async fn parity_over(kind: BackendKind) {
         .await
         .unwrap();
     catalog
-        .claim_next(&coord, &["fine_tune"], Duration::from_secs(30))
+        .claim_next(&coord, &[JobKind::FineTune], Duration::from_secs(30))
         .await
         .unwrap()
         .expect("must claim the queued job");
@@ -156,7 +156,7 @@ async fn parity_over(kind: BackendKind) {
     catalog
         .submit_job(SubmitJobParams {
             job_id: &world_absent_id,
-            kind: "context_predictor",
+            kind: JobKind::ContextPredictor,
             execution: JobExecution::Queued,
             spec: &absent_json,
             model_ref: None,
@@ -167,7 +167,11 @@ async fn parity_over(kind: BackendKind) {
         .await
         .unwrap();
     catalog
-        .claim_next(&coord, &["context_predictor"], Duration::from_secs(30))
+        .claim_next(
+            &coord,
+            &[JobKind::ContextPredictor],
+            Duration::from_secs(30),
+        )
         .await
         .unwrap()
         .expect("must claim the queued job");

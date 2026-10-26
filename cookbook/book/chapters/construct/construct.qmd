@@ -118,19 +118,22 @@ precision\@10 — ask with a paper's title, count how many of the ten papers
 retrieved share its subject. The relevance target is the subject label, never
 the embedding similarity, so it is a fair baseline that tiers 02–03 must *beat*.
 The engine measures it: `eval_embeddings` encodes each query with the model
-that produced the table, searches the table, and scores against the golden.
+that produced the table, searches the table, and scores against the ground truth.
 
 ```{python}
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 report = db.eval_embeddings(
-    source=arxiv.papers, embedding_table=embeddings, golden_source=golden, k=10
+    source=arxiv.papers, embedding_table=embeddings, ground_truth=truth, k=10
 )
 precision = report["aggregate"]["precision_at_k"]
 print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")
 ```
 
 
-## Bridge note (deepened in the bridge chapters)
+## Bridge note
+
+[The theory behind each step](../bridge/bridge.qmd) takes this chapter's operation
+further.
 
 > **An edge is a self-`search`.** The derived neighbor graph is self-kNN:
 > kNN-graph construction (monograph Part I) expressed as the engine retrieving,
@@ -143,14 +146,14 @@ print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")
 # Air Routes — the on-ramp
 
 The keystone above runs on ogbn-arxiv. The book *opens*, though, on **Air
-Routes** — Neptune's own teaching dataset: 3,504 airports, a declared `route`
+Routes** — Kelvin R. Lawrence's sample graph from *Practical Gremlin*: 3,504
+airports, a declared `route`
 graph (airport↔airport) and a `contains` hierarchy (continent→airport). The
 same recipe runs here unchanged.
 
-> **Neptune-contrast.** Neptune *loads* a given graph and runs
-> `CALL neptune.algo.*` over it. Jammi *constructs* the similarity graph from
-> the airport text **and** *registers* the declared `route`/`contains` graphs
-> beside it — the two-graphs contrast in miniature.
+The engine *constructs* the similarity graph from the airport text **and**
+*registers* the declared `route`/`contains` graphs beside it — the two-graphs
+contrast in miniature.
 
 ```{python}
 air = datasets.air_routes(db)
@@ -328,11 +331,9 @@ claim("a discriminator-less source is globally readable: A reads every one of it
 db.close()
 ```
 
-> **Neptune-contrast.** Multi-tenant isolation on a property graph is a
-> deployment-and-governance concern Neptune leaves to IAM/VPC around the
-> database. Here, two layers are *substrate* properties: `set_tenant` scopes
-> catalog listing, and a `tenant_id` discriminator column row-filters a shared
-> source. But the engine does not authenticate — a discriminator-less source
-> any tenant can name is global by design, so cross-tenant data isolation is a
-> property you *opt into* (a discriminator column) or *gate above* (an
-> interceptor), not a blanket guarantee.
+Two isolation layers are properties of the engine itself: `set_tenant` scopes
+catalog listing, and a `tenant_id` discriminator column row-filters a shared
+source. But the engine does not authenticate — a discriminator-less source any
+tenant can name is global by design, so cross-tenant data isolation is a property
+you *opt into* (a discriminator column) or *gate above* (an interceptor), not a
+blanket guarantee.

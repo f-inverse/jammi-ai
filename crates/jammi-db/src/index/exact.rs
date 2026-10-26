@@ -218,15 +218,15 @@ pub async fn exact_vector_search(
         // family the scan can produce.
         let row_ids_col = batch
             .column_by_name("_row_id")
-            .ok_or_else(|| JammiError::Other("Missing _row_id in exact search".into()))?;
+            .ok_or_else(|| JammiError::Internal("Missing _row_id in exact search".into()))?;
         let row_ids_utf8 = cast(row_ids_col, &DataType::Utf8).map_err(|e| {
-            JammiError::Other(format!("_row_id column could not be cast to Utf8: {e}"))
+            JammiError::Internal(format!("_row_id column could not be cast to Utf8: {e}"))
         })?;
         let row_ids = row_ids_utf8
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                JammiError::Other("_row_id column is not a Utf8-castable string type".into())
+                JammiError::Internal("_row_id column is not a Utf8-castable string type".into())
             })?;
 
         vectors.clear();

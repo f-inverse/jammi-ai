@@ -17,7 +17,7 @@ use jammi_db::catalog::lease_keeper::LeaseTarget;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, JobAttempt, Producer, ResultTableCas, ResultTableKind,
 };
-use jammi_db::catalog::status::{JobExecution, JobStatus};
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{LeaseConfig, StoragePrecision};
 use jammi_db::error::JammiError;
@@ -29,7 +29,7 @@ use crate::common::{keeper_for_backend, queue_session, unique_suffix, BASE_MODEL
 fn compute_job(job_id: &str, execution: JobExecution) -> SubmitJobParams<'_> {
     SubmitJobParams {
         job_id,
-        kind: "embedding",
+        kind: JobKind::Embedding,
         execution,
         spec: "{}",
         model_ref: None,
@@ -118,7 +118,7 @@ async fn released_building_table_is_claimable_by_the_successor_at_once(backend: 
         .await
         .unwrap();
     let q = catalog
-        .claim_next("me", &["embedding"], lease)
+        .claim_next("me", &[JobKind::Embedding], lease)
         .await
         .unwrap()
         .expect("queued job claimed");
@@ -216,7 +216,7 @@ async fn released_building_table_is_claimable_by_the_successor_at_once(backend: 
     assert_eq!(ready.status, "ready");
     assert!(ready.lease_expires_at.is_none());
     let job = catalog.get_job("sw-q").await.unwrap();
-    assert_eq!(job.status, JobStatus::Running.to_string());
+    assert_eq!(job.status, JobStatus::Running);
     assert!(job.lease_expires_at.is_none());
     assert_eq!(job.releases, 1);
     assert!(
@@ -293,7 +293,7 @@ async fn a_released_building_lease_is_never_re_armed_by_the_keeper(backend: Back
         .await
         .unwrap();
     let q = catalog
-        .claim_next("me", &["embedding"], Duration::from_secs(3))
+        .claim_next("me", &[JobKind::Embedding], Duration::from_secs(3))
         .await
         .unwrap()
         .expect("queued job claimed");
@@ -396,7 +396,7 @@ async fn the_sweep_writes_a_null_lease_the_backend_reads_back(backend: BackendKi
         .await
         .unwrap();
     let q = catalog
-        .claim_next("me", &["embedding"], Duration::from_secs(3600))
+        .claim_next("me", &[JobKind::Embedding], Duration::from_secs(3600))
         .await
         .unwrap()
         .unwrap();

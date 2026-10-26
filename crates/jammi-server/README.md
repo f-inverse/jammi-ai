@@ -1,31 +1,40 @@
 # jammi-server
 
-The OSS server binary for [Jammi AI](https://github.com/f-inverse/jammi-ai).
+The server binary for [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
 ## What it is
 
-`jammi-server` is the substrate-level service for Jammi: a single-process binary that exposes Jammi's data sources, mutable tables, trigger streams, and vector search over Arrow Flight SQL and typed gRPC. It is the runnable artifact behind `docker pull ghcr.io/f-inverse/jammi-ai-server`.
-
-The OSS server is **single-tenant**. The deployer's network is the authentication boundary — run one server per tenant, or front the binary with a reverse proxy that enforces tenancy at the HTTP layer.
+`jammi-server` serves the Jammi engine over the network: Arrow Flight SQL for
+queries, typed gRPC for every other verb, and an HTTP side channel for health and
+metrics. It is the runnable artifact behind `docker pull
+ghcr.io/f-inverse/jammi-ai-server`, and the same binary serves every deployment
+shape — one process, a multi-tenant server, or a disaggregated fleet over a
+shared Postgres catalog — chosen by configuration (see [Reference
+Topologies](https://f-inverse.github.io/jammi-ai/reference-topologies.html)).
 
 ## What it exposes
 
 | Surface | Port | Wire format |
 |---|---|---|
 | Arrow Flight SQL | `8081` | gRPC (HTTP/2) |
-| `jammi.v1.session.SessionService` | `8081` | gRPC + gRPC-Web |
-| `jammi.v1.trigger.TriggerService` | `8081` | gRPC + gRPC-Web |
-| `/healthz` | `8080` | HTTP/1.1 JSON |
-| `/readyz` | `8080` | HTTP/1.1 JSON |
+| `CatalogService`, `EmbeddingService`, `InferenceService`, `PipelineService`, `AuditService`, `JobService` | `8081` | gRPC + gRPC-Web |
+| `EvalService` (eval tier), `TriggerService` (event tier) | `8081` | gRPC + gRPC-Web |
+| `PeerService`, `GangService` | `[server] peer_bind` | gRPC, replica-to-replica only |
+| `/healthz`, `/readyz` | `8080` | HTTP/1.1 JSON |
 | `/metrics` | `8080` | Prometheus text |
 
-The gRPC chain and Flight SQL share one Tonic server so a client binding a tenant via `SessionService.SetTenant` (with a `jammi-session-id` header) sees the same scoping applied to its Flight SQL queries.
+The gRPC services and Flight SQL share one listener, so a client that binds its
+tenant with `CatalogService.SetTenant` (under a `jammi-session-id` header) sees
+the same scope on its Flight SQL queries.
 
-## What it is NOT
+## Tenancy and authentication
 
-- Not multi-tenant. No tenant column on OSS-exclusive tables; no auth on the wire.
-- Not clustered. Single-instance only; no leader election, no replication.
-- Not authenticated. The OSS server speaks unauthenticated gRPC. Run it behind your own boundary.
+The server authenticates no one. By default a client declares its session's
+tenant cooperatively, so the deployer's network is the trust boundary; a
+deployment that must prove who the caller is fronts the server with an
+authenticating proxy, or composes its own `TenantResolver` through
+`jammi_server::runtime::assemble_grpc_chain` (see [Bring your own
+auth](https://f-inverse.github.io/jammi-ai/multi-tenant.html#bring-your-own-auth)).
 
 ## Quickstart (Docker)
 
@@ -77,7 +86,7 @@ See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html
 1. Mount a persistent volume at `/var/lib/jammi` (or `chown 65532:65532` your bind mount — the distroless image runs as the nonroot user).
 2. Provide a config file at `/etc/jammi/jammi.toml`. The sample at `examples/jammi.toml` is the starting point.
 3. Point your load balancer's readiness check at `/readyz`. The probe pings the catalog backend; a 503 means traffic should be drained from this instance.
-4. Scrape `/metrics` from Prometheus. The OSS server emits gRPC request counts, Flight SQL query counts, eval invocation counts, and a search-latency histogram.
+4. Scrape `/metrics` from Prometheus: gRPC request counts, Flight SQL query counts, eval invocation counts, a search-latency histogram, and the job-queue and worker gauges.
 
 ## License
 

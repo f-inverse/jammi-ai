@@ -16,7 +16,10 @@ import threading
 import time
 from typing import Mapping
 
-from . import connect
+import grpc
+from google.protobuf import empty_pb2
+
+from ._generated.jammi.v1 import catalog_pb2_grpc
 
 
 class LiveServer:
@@ -100,17 +103,21 @@ class LiveServer:
                 f"bind?):\n{''.join(self._log)}"
             ) from None
         # Bound is not yet serving — the banner prints before `serve()` — so
-        # still poll a real client handshake before handing the server out.
+        # poll the server's own handshake rpc before handing the server out. A
+        # bare channel, not a `jammi` session: the probe is this helper's, and
+        # a caller's session journal never sees it.
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"jammi-server exited early:\n{''.join(self._log)}")
-            try:
-                with connect(self.endpoint) as handshake:
-                    handshake.get_server_info()
-                return self
-            except Exception:
-                time.sleep(0.25)
+            with grpc.insecure_channel(f"127.0.0.1:{self.port}") as channel:
+                try:
+                    catalog_pb2_grpc.CatalogServiceStub(channel).GetServerInfo(
+                        empty_pb2.Empty(), timeout=1
+                    )
+                    return self
+                except grpc.RpcError:
+                    time.sleep(0.25)
         self.proc.terminate()
         raise RuntimeError("jammi-server did not become ready within 30s")
 

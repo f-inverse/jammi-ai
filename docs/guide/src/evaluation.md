@@ -2,13 +2,13 @@
 
 > **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Evaluation & Provenance Channels](https://f-inverse.github.io/jammi-ai/cookbook/chapters/eval-channels/eval-channels.html).
 
-Measure embedding quality and classification accuracy against golden datasets. Results are recorded in the catalog for tracking over time.
+Measure embedding quality and classification accuracy against ground-truth datasets. Results are recorded in the catalog for tracking over time.
 
-## Prepare a golden dataset
+## Prepare a ground-truth dataset
 
-A golden dataset is any registered source with the right columns. No special format required.
+A ground-truth dataset is any registered source with the right columns. No special format required.
 
-### Retrieval golden set
+### Retrieval ground truth
 
 ```csv
 query_id,query_text,relevant_id
@@ -27,7 +27,7 @@ q2,machine learning for science,2
 Register it as a source:
 
 ```python
-db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
+db.add_source("truth", path="/data/relevance.csv", format="csv")
 ```
 
 ## Evaluate embedding quality
@@ -43,7 +43,7 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 let report = session.eval_embeddings(jammi_ai::EmbeddingEvalRequest {
     source_id: "patents".into(),
     embedding_table: None,                              // use latest embedding table
-    golden_source: "golden.public.golden_relevance".into(), // golden dataset
+    ground_truth: "truth.public.relevance".into(), // ground-truth dataset
     k: 10,                                              // k for recall@k, precision@k
     cohorts: Default::default(),                        // no cohort tags
     method: jammi_ai::SearchMethod::default(),          // through the table's ANN index
@@ -61,7 +61,7 @@ println!("nDCG:         {}", report.aggregate.ndcg);
 ```python
 metrics = db.eval_embeddings(
     source="patents",
-    golden_source="golden.public.golden_relevance",
+    ground_truth="truth.public.relevance",
     k=10,
 )
 
@@ -74,7 +74,7 @@ print(f"nDCG:         {agg['ndcg']:.3f}")
 
 ### Per-query drill-down
 
-The report also carries a `per_query` array — one record per golden-set query, ordered by `query_id`. This is what sample-based statistical rules (Welch's t, Mann-Whitney U) consume at gate time.
+The report also carries a `per_query` array — one record per ground-truth query, ordered by `query_id`. This is what sample-based statistical rules (Welch's t, Mann-Whitney U) consume at gate time.
 
 ```rust,no_run
 # extern crate jammi_db;
@@ -85,7 +85,7 @@ The report also carries a `per_query` array — one record per golden-set query,
 # let report = session.eval_embeddings(jammi_ai::EmbeddingEvalRequest {
 #     source_id: "patents".into(),
 #     embedding_table: None,
-#     golden_source: "golden.public.golden_relevance".into(),
+#     ground_truth: "truth.public.relevance".into(),
 #     k: 10,
 #     cohorts: Default::default(),
 #     method: jammi_ai::SearchMethod::default(),
@@ -128,7 +128,7 @@ compare embeddings; rank through the index to measure the system.
 ```python
 metrics = db.eval_embeddings(
     source="patents",
-    golden_source="golden.public.golden_relevance",
+    ground_truth="truth.public.relevance",
     k=10,
     exact=True,
 )
@@ -151,7 +151,7 @@ Compare a base model against a fine-tuned model:
 let comparison = session.eval_compare(jammi_ai::CompareEvalRequest {
     embedding_tables: vec![base_table.clone(), finetuned_table.clone()],
     source_id: "patents".into(),
-    golden_source: "golden.public.golden_relevance".into(),
+    ground_truth: "truth.public.relevance".into(),
     k: 10,
     method: jammi_ai::SearchMethod::default(),
 }).await?;
@@ -176,7 +176,7 @@ for entry in comparison.per_table.iter().skip(1) {
 comparison = db.eval_compare(
     embedding_tables=[base_table, finetuned_table],
     source="patents",
-    golden_source="golden.public.golden_relevance",
+    ground_truth="truth.public.relevance",
     k=10,
 )
 # `per_table[0]` is the baseline (`delta` is None); subsequent entries
@@ -206,7 +206,7 @@ let report = session.eval_inference(
     "test_data",
     &["text".into()],
     EvalTask::Classification,
-    "golden.public.labels",
+    "truth.public.labels",
     "category",
 ).await?;
 
@@ -231,7 +231,7 @@ metrics = db.eval_inference(
     source="test_data",
     columns=["text"],
     task="classification",
-    golden_source="golden.public.labels",
+    ground_truth="truth.public.labels",
     label_column="category",
 )
 
@@ -256,18 +256,18 @@ Every evaluation is recorded automatically:
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let runs = session.catalog().list_eval_runs().await?;
 for run in &runs {
-    println!("{}: {} on {} (k={:?})", run.eval_run_id, run.eval_type, run.golden_source, run.k);
+    println!("{}: {} on {} (k={:?})", run.eval_run_id, run.eval_type, run.ground_truth, run.k);
 }
 # Ok(()) }
 ```
 
 ## Schema validation
 
-Golden datasets are validated before evaluation starts. Missing or wrong-type columns produce clear errors:
+Ground-truth datasets are validated before evaluation starts. Missing or wrong-type columns produce clear errors:
 
 ```text
-Eval error: Golden dataset missing required column 'query_text'
-Eval error: Golden dataset column 'query_id' has type Boolean, expected Utf8
+Eval error: Ground-truth dataset missing required column 'query_text'
+Eval error: Ground-truth dataset column 'query_id' has type Boolean, expected Utf8
 ```
 
 Integer ID columns (Int32, Int64) are accepted where Utf8 is expected.

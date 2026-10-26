@@ -29,7 +29,7 @@ use jammi_datafusion::ModelTask;
 const GGUF_WEIGHTS_FILENAME: &str = arch::GGUF_WEIGHTS_FILENAME;
 
 /// The unforgeable prefix every trained-output model id carries — mirrors
-/// [`crate::fine_tune::training_job::fine_tuned_model_id`]'s
+/// [`crate::fine_tune::spec::fine_tuned_model_id`]'s
 /// `"jammi:fine-tuned:{job_id}"` format string verbatim (that function is the
 /// one and only minter; this is a reader-side recognizer, not a second
 /// source of truth for the format).

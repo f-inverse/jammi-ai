@@ -665,18 +665,28 @@ fn worker_kinds_toml_all_forms_parse_like_services() {
     let comma: JammiConfig = toml::from_str("[worker]\nkinds = \"fine_tune,embedding\"\n").unwrap();
     assert_eq!(
         comma.worker.kinds,
-        WorkerKinds::Only(vec!["fine_tune".to_string(), "embedding".to_string()])
+        WorkerKinds::Only(vec![JobKind::FineTune, JobKind::Embedding])
     );
 
     let array: JammiConfig =
         toml::from_str("[worker]\nkinds = [\"fine_tune\", \"embedding\"]\n").unwrap();
     assert_eq!(
         array.worker.kinds,
-        WorkerKinds::Only(vec!["fine_tune".to_string(), "embedding".to_string()])
+        WorkerKinds::Only(vec![JobKind::FineTune, JobKind::Embedding])
     );
 
     let empty: JammiConfig = toml::from_str("[worker]\nkinds = []\n").unwrap();
     assert_eq!(empty.worker.kinds, WorkerKinds::Only(Vec::new()));
+}
+
+#[test]
+fn worker_kinds_refuse_an_unknown_kind_at_load() {
+    let err = toml::from_str::<JammiConfig>("[worker]\nkinds = \"fine_tune,finetune\"\n")
+        .expect_err("an unknown kind is refused when the config loads");
+    assert!(
+        err.to_string().contains("unknown job kind 'finetune'"),
+        "{err}"
+    );
 }
 
 // ── `[distributed] max_world_size` ─────────────────────────────────────────

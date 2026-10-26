@@ -19,8 +19,8 @@
 //!   `Vec<RecordBatch>` out. The fluent [`crate::query::QueryBuilder`] is an
 //!   internal mechanism the session drives — never the return type.
 //! * **Fine-tune** returns a job **id**; status is polled by id through
-//!   [`Session::fine_tune_status`]. The in-process `TrainingJob` handle never
-//!   escapes.
+//!   [`Session::fine_tune_status`]. The engine's [`crate::jobs::JobHandle`]
+//!   never escapes.
 //! * **Audit** is four flat methods rather than a borrow-scoped handle.
 //! * **Subscribe** returns a `Pin<Box<dyn Stream>>`, the transport-neutral
 //!   streaming shape.
@@ -40,6 +40,7 @@ use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
+use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
@@ -363,13 +364,16 @@ impl Session {
             (Modality::Audio, QueryInput::Bytes(bytes)) => {
                 self.engine.encode_audio_query(model_id, &bytes).await
             }
-            (modality, _) => Err(jammi_db::error::JammiError::Inference(format!(
-                "encode_query: {modality:?} requires {} input",
-                match modality {
-                    Modality::Text => "text",
-                    Modality::Image | Modality::Audio => "bytes",
-                }
-            ))),
+            (modality, _) => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "query".into(),
+                reason: format!(
+                    "encode_query: {modality:?} requires {} input",
+                    match modality {
+                        Modality::Text => "text",
+                        Modality::Image | Modality::Audio => "bytes",
+                    }
+                ),
+            }),
         }
     }
 
@@ -697,7 +701,7 @@ impl Session {
             .engine
             .fine_tune(source, base_model, columns, method, task, config)
             .await?;
-        Ok(FineTuneJobId(job.job_id))
+        Ok(FineTuneJobId(job.job_id().to_string()))
     }
 
     /// Submit a column-source fine-tune from the flattened request shape, and
@@ -712,18 +716,18 @@ impl Session {
     /// that builds no request.
     pub async fn submit_fine_tune(&self, request: FineTuneRequest) -> Result<FineTuneJobId> {
         let job = self.engine.submit_fine_tune(request).await?;
-        Ok(FineTuneJobId(job.job_id))
+        Ok(FineTuneJobId(job.job_id().to_string()))
     }
 
-    /// Current status string for a fine-tune job, looked up by id.
-    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
+    /// The current status of a fine-tune job, looked up by id.
+    pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<JobStatus> {
         let record = self.engine.catalog().get_job(&id.0).await?;
         Ok(record.status)
     }
 
     // --- eval ------------------------------------------------------------
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     pub async fn eval_embeddings(
         &self,
         request: EmbeddingEvalRequest,
@@ -736,14 +740,14 @@ impl Session {
         self.engine.eval_per_query(eval_run_id).await
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         self.engine
@@ -752,7 +756,7 @@ impl Session {
                 source_id,
                 columns,
                 task,
-                golden_source,
+                ground_truth,
                 label_column,
             )
             .await
@@ -991,10 +995,13 @@ impl Session {
 pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
     match columns {
         [single] => Ok(single.as_str()),
-        _ => Err(jammi_db::error::JammiError::Inference(format!(
-            "{modality} embeddings take exactly one content column, got {}",
-            columns.len()
-        ))),
+        _ => Err(jammi_db::error::JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: format!(
+                "{modality} embeddings take exactly one content column, got {}",
+                columns.len()
+            ),
+        }),
     }
 }
 

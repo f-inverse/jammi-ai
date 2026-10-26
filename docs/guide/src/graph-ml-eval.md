@@ -68,18 +68,18 @@ treatment = db.generate_embeddings(
 ```
 
 > **Leakage contract (read before you build anything).** The graph and any
-> graph-supervised training must use the **train split only**. The golden set
+> graph-supervised training must use the **train split only**. The ground truth
 > — the `(query, judgments)` pairs you evaluate against — is **held out** and
 > must never feed graph construction or training-pair selection. A
 > structure-aware representation that has seen the eval rows will "win" by
 > memorizing them, and the verdict is worthless. Split first, then build.
 
-## 3 — compare on a held-out golden set
+## 3 — compare on a held-out ground truth
 
 Run `eval_compare` with the baseline table **first**; every subsequent table
 carries its `delta` against that baseline. Rank **exactly**: the question is
 whether the representation improved, so neither table's index approximation may
-move the verdict. The golden set is a registered
+move the verdict. The ground truth is a registered
 source of `(query_id, query_text, relevant_id[, relevance_grade])` rows — see
 [Evaluate and Compare Models](./evaluation.md) for its schema.
 
@@ -93,7 +93,7 @@ let comparison = session
     .eval_compare(jammi_ai::CompareEvalRequest {
         embedding_tables: vec![baseline_table, treatment_table], // baseline FIRST
         source_id: "patents".into(),
-        golden_source: "golden.public.golden_relevance".into(), // held-out golden set
+        ground_truth: "truth.public.relevance".into(), // held-out ground truth
         k: 10,                                                  // k for recall@k / precision@k
         method: jammi_ai::SearchMethod::Exact,                  // the embeddings, not the index
     })
@@ -126,7 +126,7 @@ for entry in comparison.per_table.iter().skip(1) {
 comparison = db.eval_compare(
     embedding_tables=[baseline_table, treatment_table],  # baseline FIRST
     source="patents",
-    golden_source="golden.public.golden_relevance",
+    ground_truth="truth.public.relevance",
     k=10,
     exact=True,  # the embeddings, not the index
 )
@@ -170,7 +170,7 @@ one explicitly when you report a result.
 ### Strict held-out split (the leakage contract)
 
 The graph and any graph-supervised training use the **train split only**; the
-golden set is held out and never feeds construction. This is the single most
+ground truth is held out and never feeds construction. This is the single most
 important contract — restated here because it is the one that silently
 invalidates a result. If you cannot point to the split boundary, you do not
 have a clean number.
@@ -185,7 +185,7 @@ Pick the metric from the **judgment type**, not by habit:
 | **Binary** (relevant / not) | **recall@k**, **MRR** | No grade to exploit; presence and first-hit rank are the right targets. |
 
 `eval_compare` always computes all four metrics, but read the one that matches
-your golden set. Using recall on graded judgments throws away signal you paid a
+your ground truth. Using recall on graded judgments throws away signal you paid a
 human to produce.
 
 ### ≥3 seeds for trained treatments
@@ -240,7 +240,7 @@ let report = session
     .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
         source_id: "patents".into(),
         embedding_table: Some(treatment_table.into()),
-        golden_source: "golden.public.golden_relevance".into(),
+        ground_truth: "truth.public.relevance".into(),
         k: 10,
         cohorts,
         method: jammi_ai::SearchMethod::Exact,
@@ -261,7 +261,7 @@ cohorts = {"q1": {"family": "A"}, "q2": {"family": "B"}}  # one entry per query_
 report = db.eval_embeddings(
     source="patents",
     embedding_table=treatment_table,
-    golden_source="golden.public.golden_relevance",
+    ground_truth="truth.public.relevance",
     k=10,
     cohorts=cohorts,
 )
@@ -279,12 +279,12 @@ cohorts go noisy; report `n` so a reader does not over-read them.
   not add others.
 - **Online drift monitoring.** This is an *offline* held-out harness, not a
   production-drift monitor.
-- **The golden set itself.** Constructing relevance judgments is the expensive
+- **The ground truth itself.** Constructing relevance judgments is the expensive
   human step — budget for it. The eval is cheap; the labels are not.
 
 ## See also
 
-- [Evaluate and Compare Models](./evaluation.md) — the golden-set schema, the
+- [Evaluate and Compare Models](./evaluation.md) — the ground truth schema, the
   metric definitions, and the full `eval_compare` / `eval_embeddings` API.
 - [Fine-Tune for Your Domain](./fine-tuning.md) — producing a trained treatment
   table to evaluate with this recipe.

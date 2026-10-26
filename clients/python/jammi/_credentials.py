@@ -24,6 +24,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import grpc
 
+from .errors import InvalidArgument
+
 # A gRPC channel-arguments list (`[(name, value), ...]`): the tuning knobs — the
 # receive-message cap among them — a channel is opened with. Threaded through
 # every `open_channel` so the caller sets them once at `open_remote`.
@@ -108,7 +110,7 @@ class BearerCredentials(ChannelCredentials):
     def __post_init__(self) -> None:
         stripped = self.token.strip()
         if not stripped:
-            raise ValueError("BearerCredentials requires a non-empty token")
+            raise InvalidArgument("BearerCredentials requires a non-empty token")
         object.__setattr__(self, "token", stripped)
 
     def open_channel(

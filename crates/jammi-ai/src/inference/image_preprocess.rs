@@ -92,8 +92,9 @@ where
         .par_iter()
         .zip(row_ids.par_iter())
         .map(|(item, &row)| {
-            image::load_from_memory(item.as_ref()).map_err(|e| {
-                JammiError::Inference(format!("Failed to decode image at row {row}: {e}"))
+            image::load_from_memory(item.as_ref()).map_err(|e| JammiError::InvalidArgument {
+                argument: "content".into(),
+                reason: format!("Failed to decode image at row {row}: {e}"),
             })
         })
         .collect())
@@ -199,9 +200,10 @@ pub fn preprocess_image_batch_indexed(
         ));
     }
     if target_size == 0 {
-        return Err(JammiError::Inference(
-            "Image target_size must be positive, got 0".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "model".into(),
+            reason: "Image target_size must be positive, got 0".into(),
+        });
     }
     // `preprocess_one_image` divides by `std[c]`; a zero or non-finite
     // component silently produces inf/NaN pixels rather than failing, so the
@@ -210,16 +212,19 @@ pub fn preprocess_image_batch_indexed(
     // future config-driven source.
     for c in 0..3 {
         if !std[c].is_finite() || std[c] == 0.0 {
-            return Err(JammiError::Inference(format!(
-                "Image preprocess std[{c}] must be finite and non-zero, got {}",
-                std[c]
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Image preprocess std[{c}] must be finite and non-zero, got {}",
+                    std[c]
+                ),
+            });
         }
         if !mean[c].is_finite() {
-            return Err(JammiError::Inference(format!(
-                "Image preprocess mean[{c}] must be finite, got {}",
-                mean[c]
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!("Image preprocess mean[{c}] must be finite, got {}", mean[c]),
+            });
         }
     }
     // A typed error, not a `debug_assert!`: in a release build the

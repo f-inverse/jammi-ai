@@ -1,4 +1,4 @@
-//! `jammi-server` — OSS server binary.
+//! `jammi-server` — the server binary.
 //!
 //! Three subcommands: `serve` (parses a single optional `--config` flag,
 //! loads the workspace [`JammiConfig`], initialises tracing per the
@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use jammi_db::config::JammiConfig;
-use jammi_server::runtime::{validate_audit_master_key, OssServer, ShutdownOutcome};
+use jammi_server::runtime::{validate_audit_master_key, Server, ShutdownOutcome};
 use jammi_server::telemetry::init_tracing;
 
-/// CLI for the OSS `jammi-server`.
+/// CLI for `jammi-server`.
 ///
 /// `serve` is the implicit default subcommand: a bare `jammi-server` or
 /// `jammi-server --config X` (no subcommand keyword) serves, identically to
@@ -32,7 +32,7 @@ use jammi_server::telemetry::init_tracing;
 #[command(
     name = "jammi-server",
     version,
-    about = "OSS Jammi server: Arrow Flight SQL, CatalogService, TriggerService, and /healthz /readyz /metrics",
+    about = "Jammi server: Arrow Flight SQL, CatalogService, TriggerService, and /healthz /readyz /metrics",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -153,10 +153,10 @@ async fn serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let server = match OssServer::new(config).await {
+    let server = match Server::new(config).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "failed to construct OSS server");
+            tracing::error!(error = %e, "failed to construct the server");
             return ExitCode::FAILURE;
         }
     };
@@ -172,7 +172,7 @@ async fn serve(args: ServeArgs) -> ExitCode {
     let bound = match server.bind().await {
         Ok(b) => b,
         Err(e) => {
-            tracing::error!(error = %e, "failed to bind OSS server listeners");
+            tracing::error!(error = %e, "failed to bind server listeners");
             return ExitCode::FAILURE;
         }
     };
@@ -184,7 +184,7 @@ async fn serve(args: ServeArgs) -> ExitCode {
 
     match bound.serve().await {
         Ok(ShutdownOutcome::Drained { worker_joined }) => {
-            tracing::info!(worker_joined, "OSS server drained; exiting");
+            tracing::info!(worker_joined, "server drained; exiting");
             ExitCode::SUCCESS
         }
         Ok(ShutdownOutcome::Released) => {
@@ -194,7 +194,7 @@ async fn serve(args: ServeArgs) -> ExitCode {
             // already handed back, its next epoch boundary bails without a
             // bundle, and the previous epoch's `_resume` manifest stays
             // authoritative, so nothing that thread could still do is needed.
-            tracing::info!("OSS server released its leases; exiting now");
+            tracing::info!("server released its leases; exiting now");
             std::process::exit(0)
         }
         Ok(ShutdownOutcome::ReleaseDegraded) => {
@@ -217,13 +217,13 @@ async fn serve(args: ServeArgs) -> ExitCode {
             // release). The release-side error itself was already logged
             // where it happened (`runtime::release_outcome`).
             tracing::warn!(
-                "OSS server RELEASE could not confirm every lease was handed back; \
+                "server RELEASE could not confirm every lease was handed back; \
                  exiting now regardless (exit code 3)"
             );
             std::process::exit(3)
         }
         Err(e) => {
-            tracing::error!(error = %e, "OSS server exited with error");
+            tracing::error!(error = %e, "server exited with error");
             ExitCode::FAILURE
         }
     }

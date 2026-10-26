@@ -33,7 +33,7 @@ TENANTS = (str(uuid.uuid4()), str(uuid.uuid4()))
 
 ## The evaluation, written once
 
-Four evaluations and one provenance sequence, over a `Session` of either kind:
+Four evaluations, a search and one provenance sequence, over a `Session` of either kind:
 
 - **`eval_embeddings`** scores the papers' raw embeddings on same-subject
   retrieval, with each query tagged by its **cohort** — the time-split era its
@@ -45,6 +45,7 @@ Four evaluations and one provenance sequence, over a `Session` of either kind:
   classification (accuracy / F1 against a label set) and NER (entity-span
   precision / recall against character-offset gold spans), with a sentiment
   classifier and an entity tagger from the Hugging Face Hub;
+- a **search** whose records carry their provenance;
 - the **channel sequence** registers two provenance channels under one tenant,
   appends columns, and reads the registry from both tenants and from no tenant.
 
@@ -53,17 +54,21 @@ def evaluate(db) -> dict:
     arxiv = datasets.arxiv(db, SCALE)
     raw = keystone.embed(db, arxiv, SCALE)
     propagated = keystone.propagate(db, arxiv, raw)
-    golden = keystone.subject_golden(db, arxiv)
+    truth = keystone.subject_relevance(db, arxiv)
     era = {pid: name for name, ids in arxiv.split.items() for pid in ids}
-    queries = db.sql(f"SELECT DISTINCT query_id FROM {golden}").column(0).to_pylist()
+    relevant = db.sql(
+        f"SELECT query_id, COUNT(*) AS relevant FROM {truth} GROUP BY query_id ORDER BY query_id"
+    ).to_pylist()
+    queries = [row["query_id"] for row in relevant]
 
     retrieval = db.eval_embeddings(
-        source=arxiv.papers, golden_source=golden, embedding_table=raw, k=10,
+        source=arxiv.papers, ground_truth=truth, embedding_table=raw, k=10,
         cohorts={q: {"era": era[q]} for q in queries},
     )
     per_query = db.eval_per_query(retrieval["eval_run_id"])
+    hits = db.search(arxiv.papers, row_key=queries[0], k=3, embedding_table=raw)
     compared = db.eval_compare(
-        embedding_tables=[raw, propagated], source=arxiv.papers, golden_source=golden, k=10,
+        embedding_tables=[raw, propagated], source=arxiv.papers, ground_truth=truth, k=10,
     )
 
     db.add_source("reviews", url=fixtures.url("tiny_reviews.parquet"), format="parquet")
@@ -71,14 +76,14 @@ def evaluate(db) -> dict:
     classification = db.eval_inference(
         model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", source="reviews",
         columns=["text"], task="classification",
-        golden_source="labels.public.tiny_review_labels", label_column="label",
+        ground_truth="labels.public.tiny_review_labels", label_column="label",
     )
     db.add_source("ner_corpus", url=fixtures.url("tiny_ner_corpus.parquet"), format="parquet")
     db.add_source("ner_gold", url=fixtures.url("tiny_ner_gold.csv"), format="csv")
     ner = db.eval_inference(
         model="dslim/bert-base-NER", source="ner_corpus",
         columns=["text"], task="ner",
-        golden_source="ner_gold.public.tiny_ner_gold", label_column="label",
+        ground_truth="ner_gold.public.tiny_ner_gold", label_column="label",
     )
 
     a, b = TENANTS
@@ -96,6 +101,8 @@ def evaluate(db) -> dict:
         a_channels = db.list_channels()
 
     return {
+        "relevant": relevant,
+        "records": hits.select(["_row_id", "retrieved_by", "similarity"]).to_pylist(),
         "retrieval": retrieval, "per_query": per_query, "compared": compared,
         "classification": classification, "ner": ner,
         "channels": {"a": a_channels, "b_before": seen_by_b, "b": b_channels,
@@ -122,9 +129,12 @@ print(f"evaluated in process and at {server.endpoint}")
 
 ## The reports
 
-Retrieval quality of the raw embeddings, overall and by cohort. The engine
+Retrieval quality of the raw embeddings, overall and by cohort. Each query's
+relevant set is every paper of its subject, far more than the ten a search
+returns, so recall\@10 has a ceiling: a perfect ranking recalls at most ten of
+a query's relevant papers. Precision\@10 is the figure to read. The engine
 never interprets a cohort tag; it carries each query's tags on its per-query
-record, so a slice is a group-by over those records. The golden asks its first
+record, so a slice is a group-by over those records. The ground truth asks its first
 200 papers by id, so which eras those queries fall in is a property of the
 scale's paper set — the slice reports the eras the queries carry:
 
@@ -133,6 +143,9 @@ from collections import defaultdict
 
 agg = local["retrieval"]["aggregate"]
 print("  ".join(f"{m} {agg[m]:.3f}" for m in ("precision_at_k", "recall_at_k", "mrr", "ndcg")))
+sizes = [row["relevant"] for row in local["relevant"]]
+ceiling = sum(min(10, n) / n for n in sizes) / len(sizes)
+print(f"relevant papers per query: {min(sizes)}–{max(sizes)}; recall@10 ceiling {ceiling:.3f}")
 by_era = defaultdict(list)
 for record in local["retrieval"]["per_query"]:
     by_era[record["cohorts"]["era"]].append(record["metrics"]["precision"])
@@ -170,6 +183,8 @@ baseline = local["compared"]["per_table"][0]["embedding_eval"]["aggregate"]["pre
 propagated = treated["embedding_eval"]["aggregate"]["precision_at_k"]
 claim("the report is persisted one row per query",
       len(local["per_query"]) == len(local["retrieval"]["per_query"]))
+claim("recall@10 stays under the ceiling the relevant sets set",
+      agg["recall_at_k"] <= ceiling + 1e-9, f"{agg['recall_at_k']:.3f} ≤ {ceiling:.3f}")
 claim("the comparison's delta is the propagated table's precision@10 less the raw table's",
       abs(delta["absolute"] - (propagated - baseline)) < 1e-9,
       f"{propagated:.3f} − {baseline:.3f}")
@@ -200,7 +215,7 @@ def canonical(value):
         return {k: canonical(v) for k, v in value.items() if k not in MINTED}
     if isinstance(value, list):
         rows = [canonical(v) for v in value]
-        key = next((k for k in ("query_id", "record_id", "channel_id") if rows and
+        key = next((k for k in ("query_id", "record_id", "_row_id", "channel_id") if rows and
                     isinstance(rows[0], dict) and k in rows[0]), None)
         return sorted(rows, key=lambda r: r[key]) if key else rows
     return value
@@ -263,6 +278,31 @@ different columns, no collision with A's. A session bound to no tenant sees only
 the global channels every engine seeds, one per way the engine itself produces
 evidence: `vector` (similarity search), `inference` (a model's output), and
 `bm25` (lexical scoring).
+
+A record carries its provenance. Each row a search returns names, in
+`retrieved_by`, the channels that found it, and carries the columns each of
+them declares; `annotated_by` names the channels that added to it after
+retrieval. A vector search's records name `vector` and carry its one column,
+`similarity`:
+
+```{python}
+vector = next(c for c in channels["unbound"] if c["channel_id"] == "vector")
+print(f"vector declares: {[c['name'] for c in vector['columns']]}")
+for record in local["records"]:
+    print(f"  paper {record['_row_id']}: retrieved_by {record['retrieved_by']}  "
+          f"similarity {record['similarity']:.3f}")
+```
+
+```{python}
+claim("each record names the channel that found it and carries the columns it declares",
+      all(r["retrieved_by"] == ["vector"] and r["similarity"] is not None
+          for r in local["records"])
+      and [c["name"] for c in vector["columns"]] == ["similarity"])
+```
+
+A registered channel's columns join a record the same way, from the process
+that produced it — `merge_channels` in the engine's Rust API — while the
+registry is what every client reads back.
 
 ## Bridge note
 

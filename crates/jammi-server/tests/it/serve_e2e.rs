@@ -1,4 +1,4 @@
-//! End-to-end test for `OssServer::run` — boot the full binary in
+//! End-to-end test for `Server::run` — boot the full binary in
 //! process with a temporary SQLite config, drive a gRPC call, an
 //! `EmbeddingService/Search`, and a Flight SQL roundtrip against
 //! `:flight_listen`, hit the HTTP side-channel on `:health_listen`, and
@@ -23,7 +23,7 @@ use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality, SearchRequest};
 use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::EvalEmbeddingsRequest;
-use jammi_server::runtime::OssServer;
+use jammi_server::runtime::Server;
 use jammi_test_utils::{fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
@@ -47,9 +47,9 @@ fn tiny_bert_model_id() -> String {
     format!("local:{}", fixture("tiny_bert").display())
 }
 
-/// Canonical golden-set source name for the `golden_relevance.csv` fixture,
+/// Canonical ground truth source name for the `relevance.csv` fixture,
 /// matching the form the eval engine resolves (`<source>.public.<table>`).
-const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
+const GROUND_TRUTH: &str = "truth_rel.public.relevance";
 
 /// Build a minimal 16-bit PCM mono WAV (16 kHz) holding a sine tone at
 /// `freq`. Mirrors the embedding-suite corpus generator so the Search path
@@ -141,8 +141,8 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
     // bound handle. The listeners are held live from bind through serve, so
     // neither port is released for a concurrent test process to steal — and the
     // reported ports are the real ones the kernel assigned, not a config `:0`.
-    let server = OssServer::new(cfg).await.expect("OssServer::new");
-    let bound = server.bind().await.expect("OssServer::bind");
+    let server = Server::new(cfg).await.expect("Server::new");
+    let bound = server.bind().await.expect("Server::bind");
     let server_health_addr = bound.health_addr();
     let server_flight_addr = bound.flight_addr();
 
@@ -269,7 +269,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
     );
 
     // Drive a real EvalService RPC. Register the patents text corpus + the
-    // golden relevance set, embed `abstract` with the local tiny_bert encoder,
+    // relevance judgments, embed `abstract` with the local tiny_bert encoder,
     // then run `EvalEmbeddings` over that table — mirroring `grpc_eval.rs`. This
     // is the only metric whose live path rides `/jammi.v1.eval.EvalService/*`,
     // so a wrong prefix in the layer makes the delta below stay zero.
@@ -287,16 +287,16 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
         .expect("add patents source");
     catalog
         .add_source(AddSourceRequest {
-            source_id: "golden_rel".into(),
+            source_id: "truth_rel".into(),
             source_kind: SourceKind::File as i32,
             connection: Some(SourceConnection {
-                url: format!("file://{}", fixture("golden_relevance.csv").display()),
+                url: format!("file://{}", fixture("relevance.csv").display()),
                 format: FileFormat::Csv as i32,
                 tenant_column: None,
             }),
         })
         .await
-        .expect("add golden source");
+        .expect("add ground-truth source");
     let eval_table = embedding
         .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "patents".into(),
@@ -322,7 +322,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
         .eval_embeddings(EvalEmbeddingsRequest {
             source_id: "patents".into(),
             embedding_table: eval_table,
-            golden_source: GOLDEN_SOURCE.into(),
+            ground_truth: GROUND_TRUTH.into(),
             k: 10,
             cohorts: std::collections::HashMap::new(),
             tenant_id: String::new(),

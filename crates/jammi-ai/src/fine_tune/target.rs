@@ -1,17 +1,18 @@
-//! Closed-enum dispatch over the two ways jammi-ai trains and persists a
-//! LoRA adapter:
+//! What a fine-tune trains, and what it persists: an encoder that trains
+//! frozen or with LoRA inside it, and a head over its pooled output when the
+//! task needs one.
 //!
-//! - [`TrainingTarget::ProjectionHead`] — LoRA wraps a projection head added
-//!   on top of a frozen base model's pooled embedding output. The base model
-//!   produces embeddings via its own (frozen) forward; the head shifts them.
-//!   Works with any [`crate::model::LoadedModel`] backbone.
-//! - [`TrainingTarget::EncoderAdapters`] — LoRA is injected into the encoder's
-//!   internal attention/FFN linears via [`jammi_encoders::AnyEncoder`].
-//!   Requires a jammi-encoders-supported architecture (BERT family).
+//! - [`TrainingTarget::FrozenEncoder`] — the base model's own forward produces
+//!   the pooled output, unchanged, and a LoRA head over it carries the whole
+//!   adaptation. Works with any [`crate::model::LoadedModel`] backbone.
+//! - [`TrainingTarget::AdaptedEncoder`] — LoRA inside the encoder's linears
+//!   ([`jammi_encoders::AnyEncoder`]), and a head over its pooled output for a
+//!   classification or regression task.
 //!
-//! The two variants share no on-disk discriminator at the safetensors level —
-//! the persisted [`SavedAdapter`] enum (serde-tagged via `adapter_type`) is
-//! the type-level switch.
+//! A head is an ordered list of [`jammi_lora::LoraLinear`] layers applied, in
+//! order, to the pooled output — by training and by serving alike. The
+//! persisted [`SavedAdapter`] records the encoder's adapters and the head
+//! together with what the head's output means ([`HeadOutput`]).
 
 use std::collections::HashMap;
 
@@ -26,49 +27,109 @@ use super::regression_loss::TargetScaler;
 
 /// What a [`crate::fine_tune::trainer::TrainingLoop`] is training.
 ///
-/// The `EncoderAdapters` variant payload is boxed because [`AnyEncoder`] is
+/// The `AdaptedEncoder` payload is boxed because [`AnyEncoder`] is
 /// substantially larger than a [`LoraModel`] — keeping the variants on a
 /// similar size footprint is what `clippy::large_enum_variant` is asking
-/// for and is the right thing here, not a band-aid.
+/// for.
 pub enum TrainingTarget {
-    /// LoRA wraps a projection head sitting on top of a frozen base model's
-    /// pooled output. The head is one or two [`jammi_lora::LoraLinear`]
-    /// layers: a single `projection` layer for embedding fine-tunes, or a
-    /// `projection` + `classifier` pair for classification / NER.
-    ProjectionHead { head: LoraModel },
-    /// LoRA is injected into the encoder's internal attention/FFN linears.
-    EncoderAdapters(Box<EncoderAdaptersTarget>),
+    /// The encoder trains frozen; `head` carries the adaptation: a
+    /// `projection` layer for an embedding task, or a `projection` and a
+    /// task layer (`classifier`, `distribution`) for a classification or
+    /// regression task.
+    FrozenEncoder { head: LoraModel },
+    /// LoRA inside the encoder's linears, and the task's head when it has one.
+    AdaptedEncoder(Box<AdaptedEncoderTarget>),
 }
 
-/// Payload of [`TrainingTarget::EncoderAdapters`].
-pub struct EncoderAdaptersTarget {
+/// Payload of [`TrainingTarget::AdaptedEncoder`].
+pub struct AdaptedEncoderTarget {
     /// The LoRA-injected encoder used both during training and as the
     /// blueprint inference must rebuild from the saved tensors.
     pub encoder: AnyEncoder,
     /// Metadata persisted alongside the trained A/B weights so inference
     /// can rebuild the encoder with the adapter installed.
     pub adapter_cfg: AdapterConfig,
+    /// The task's head over the adapted encoder's pooled output — the same
+    /// layers a frozen encoder's head of that task carries; `None` for an
+    /// embedding task, whose output is the pooled encoder itself.
+    pub head: Option<LoraModel>,
+}
+
+/// The A/B tensors of every head layer, keyed `{layer}.lora_a` /
+/// `{layer}.lora_b`, on the CPU for serialisation.
+fn head_weights(head: &LoraModel) -> Result<HashMap<String, Tensor>> {
+    let mut out = HashMap::new();
+    for (name, layer) in &head.layers {
+        for (suffix, tensor) in [("lora_a", &layer.lora_a), ("lora_b", &layer.lora_b)] {
+            out.insert(
+                format!("{name}.{suffix}"),
+                tensor.to_device(&Device::Cpu).map_err(|e| {
+                    JammiError::FineTune(format!("Move {name}.{suffix} to CPU: {e}"))
+                })?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Each head layer's dropout-stream position, keyed `{layer}.dropout`; a
+/// layer with no dropout contributes no entry.
+fn head_dropout_positions(head: &LoraModel) -> Result<HashMap<String, u64>> {
+    let mut out = HashMap::new();
+    for (name, layer) in &head.layers {
+        if let Some(pos) = layer
+            .dropout_position()
+            .map_err(|e| JammiError::FineTune(format!("dropout position: {e}")))?
+        {
+            out.insert(format!("{name}.dropout"), pos);
+        }
+    }
+    Ok(out)
 }
 
 impl TrainingTarget {
-    /// References to every trainable tensor in this target.
-    pub fn trainable_params(&self) -> Vec<&Tensor> {
+    /// The head over the pooled output, when this target trains one.
+    pub fn head(&self) -> Option<&LoraModel> {
         match self {
-            Self::ProjectionHead { head } => head.trainable_params(),
-            Self::EncoderAdapters(state) => state.encoder.trainable_params(),
+            Self::FrozenEncoder { head } => Some(head),
+            Self::AdaptedEncoder(state) => state.head.as_ref(),
         }
     }
 
-    /// Toggle training mode. Used to disable LoRA dropout during validation
-    /// passes; no-op for variants whose layers don't use dropout.
-    pub fn set_training(&mut self, training: bool) {
+    fn head_mut(&mut self) -> Option<&mut LoraModel> {
         match self {
-            Self::ProjectionHead { head } => {
-                for (_, layer) in head.layers.iter_mut() {
-                    layer.set_training(training);
-                }
+            Self::FrozenEncoder { head } => Some(head),
+            Self::AdaptedEncoder(state) => state.head.as_mut(),
+        }
+    }
+
+    /// References to every trainable tensor in this target: the encoder's
+    /// adapters, then the head's layers.
+    pub fn trainable_params(&self) -> Vec<&Tensor> {
+        let encoder = match self {
+            Self::FrozenEncoder { .. } => Vec::new(),
+            Self::AdaptedEncoder(state) => state.encoder.trainable_params(),
+        };
+        encoder
+            .into_iter()
+            .chain(
+                self.head()
+                    .into_iter()
+                    .flat_map(LoraModel::trainable_params),
+            )
+            .collect()
+    }
+
+    /// Toggle training mode. Used to disable LoRA dropout during validation
+    /// passes.
+    pub fn set_training(&mut self, training: bool) {
+        if let Self::AdaptedEncoder(state) = self {
+            state.encoder.set_training(training);
+        }
+        if let Some(head) = self.head_mut() {
+            for (_, layer) in head.layers.iter_mut() {
+                layer.set_training(training);
             }
-            Self::EncoderAdapters(state) => state.encoder.set_training(training),
         }
     }
 
@@ -76,44 +137,32 @@ impl TrainingTarget {
     /// `jammi_lora::LoraLinear::set_dropout`: `false` keeps the tape but draws
     /// no mask, the forward a gradient cache's two encodes of one row need.
     pub fn set_dropout(&mut self, enabled: bool) {
-        match self {
-            Self::ProjectionHead { head } => {
-                for (_, layer) in head.layers.iter_mut() {
-                    layer.set_dropout(enabled);
-                }
+        if let Self::AdaptedEncoder(state) = self {
+            state.encoder.set_dropout(enabled);
+        }
+        if let Some(head) = self.head_mut() {
+            for (_, layer) in head.layers.iter_mut() {
+                layer.set_dropout(enabled);
             }
-            Self::EncoderAdapters(state) => state.encoder.set_dropout(enabled),
         }
     }
 
     /// Collect all trainable A/B tensors as a CPU-side `HashMap` ready for
-    /// safetensors serialisation. Keys follow the convention each variant
-    /// uses to label its trainable sites.
+    /// safetensors serialisation: the encoder's adapters under their
+    /// checkpoint paths (`layer.{n}.query.lora_a`, …), the head's under its
+    /// layer names (`projection.lora_a`, …) — two disjoint key spaces.
     pub fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>> {
-        match self {
-            Self::ProjectionHead { head } => {
-                let mut out = HashMap::new();
-                for (name, layer) in &head.layers {
-                    out.insert(
-                        format!("{name}.lora_a"),
-                        layer.lora_a.to_device(&Device::Cpu).map_err(|e| {
-                            JammiError::FineTune(format!("Move lora_a to CPU: {e}"))
-                        })?,
-                    );
-                    out.insert(
-                        format!("{name}.lora_b"),
-                        layer.lora_b.to_device(&Device::Cpu).map_err(|e| {
-                            JammiError::FineTune(format!("Move lora_b to CPU: {e}"))
-                        })?,
-                    );
-                }
-                Ok(out)
-            }
-            Self::EncoderAdapters(state) => state
+        let mut out = match self {
+            Self::FrozenEncoder { .. } => HashMap::new(),
+            Self::AdaptedEncoder(state) => state
                 .encoder
                 .named_trainable_weights()
-                .map_err(|e| JammiError::FineTune(format!("Encoder trainable weights: {e}"))),
+                .map_err(|e| JammiError::FineTune(format!("Encoder trainable weights: {e}")))?,
+        };
+        if let Some(head) = self.head() {
+            out.extend(head_weights(head)?);
         }
+        Ok(out)
     }
 
     /// Apply a previously-saved `HashMap<key, tensor>` back into the target's
@@ -122,23 +171,23 @@ impl TrainingTarget {
     /// again after a restore still moves the weights the sites read. Used to
     /// restore the best checkpoint at end of training.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
-        match self {
-            Self::ProjectionHead { head } => {
-                for (name, layer) in head.layers.iter_mut() {
-                    layer
-                        .load_weights(
-                            weights.get(&format!("{name}.lora_a")),
-                            weights.get(&format!("{name}.lora_b")),
-                        )
-                        .map_err(|e| JammiError::FineTune(format!("Head load weights: {e}")))?;
-                }
-                Ok(())
-            }
-            Self::EncoderAdapters(state) => state
+        if let Self::AdaptedEncoder(state) = self {
+            state
                 .encoder
                 .load_weights(weights)
-                .map_err(|e| JammiError::FineTune(format!("Encoder load weights: {e}"))),
+                .map_err(|e| JammiError::FineTune(format!("Encoder load weights: {e}")))?;
         }
+        if let Some(head) = self.head_mut() {
+            for (name, layer) in head.layers.iter_mut() {
+                layer
+                    .load_weights(
+                        weights.get(&format!("{name}.lora_a")),
+                        weights.get(&format!("{name}.lora_b")),
+                    )
+                    .map_err(|e| JammiError::FineTune(format!("Head load weights: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     /// Per-layer dropout-stream positions keyed `{name}.dropout`, the resume
@@ -147,24 +196,17 @@ impl TrainingTarget {
     /// forwards draw the same masks the uninterrupted run drew. Layers without
     /// dropout (`lora_dropout == 0`) contribute no entry.
     pub fn dropout_positions(&self) -> Result<HashMap<String, u64>> {
-        match self {
-            Self::ProjectionHead { head } => {
-                let mut out = HashMap::new();
-                for (name, layer) in &head.layers {
-                    if let Some(pos) = layer
-                        .dropout_position()
-                        .map_err(|e| JammiError::FineTune(format!("dropout position: {e}")))?
-                    {
-                        out.insert(format!("{name}.dropout"), pos);
-                    }
-                }
-                Ok(out)
-            }
-            Self::EncoderAdapters(state) => state
+        let mut out = match self {
+            Self::FrozenEncoder { .. } => HashMap::new(),
+            Self::AdaptedEncoder(state) => state
                 .encoder
                 .dropout_positions()
-                .map_err(|e| JammiError::FineTune(format!("Encoder dropout positions: {e}"))),
+                .map_err(|e| JammiError::FineTune(format!("Encoder dropout positions: {e}")))?,
+        };
+        if let Some(head) = self.head() {
+            out.extend(head_dropout_positions(head)?);
         }
+        Ok(out)
     }
 
     /// `layer_id` — the Philox
@@ -200,117 +242,214 @@ impl TrainingTarget {
     /// stream at the origin (the from-scratch position), which is correct for a
     /// layer that had no dropout when the checkpoint was taken.
     pub fn restore_dropout_positions(&self, positions: &HashMap<String, u64>) -> Result<()> {
-        match self {
-            Self::ProjectionHead { head } => {
-                for (name, layer) in &head.layers {
-                    if let Some(pos) = positions.get(&format!("{name}.dropout")) {
-                        layer.restore_dropout_position(*pos).map_err(|e| {
-                            JammiError::FineTune(format!("restore dropout position: {e}"))
-                        })?;
-                    }
-                }
-                Ok(())
-            }
-            Self::EncoderAdapters(state) => state
+        if let Self::AdaptedEncoder(state) = self {
+            state
                 .encoder
                 .restore_dropout_positions(positions)
                 .map_err(|e| {
                     JammiError::FineTune(format!("Encoder restore dropout positions: {e}"))
-                }),
+                })?;
         }
+        if let Some(head) = self.head() {
+            for (name, layer) in &head.layers {
+                if let Some(pos) = positions.get(&format!("{name}.dropout")) {
+                    layer.restore_dropout_position(*pos).map_err(|e| {
+                        JammiError::FineTune(format!("restore dropout position: {e}"))
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Build the persisted metadata for this target.
-    ///
-    /// `target_scaler` and `regression_form` are the regression head's persisted
-    /// de-standardisation state, present together only for a
-    /// `ModelTask::Regression` projection head. The scaler is the affine the
-    /// head's raw output carries; the form is the authoritative gaussian-vs-quantile
-    /// signal the serving de-standardisation dispatches on (a 2-level quantile head
-    /// is also width 2, so head width cannot stand in for it). Both are the one
-    /// transform shared by training and serving, so they are persisted with the head.
+    /// Build the persisted metadata for this target. `output` is what the
+    /// head's output means — the label vocabulary of a classifier, the
+    /// de-standardising scaler and form of a distribution head — which the
+    /// trainer knows once the data is read; it is recorded with the head and
+    /// unused by a target that trains none. Refused when the trained head's
+    /// layers are not the ones `output` names: serving rebuilds the head from
+    /// `output` alone ([`HeadOutput::layers`]).
     pub(crate) fn saved_adapter(
         &self,
         config: &super::FineTuneConfig,
-        target_scaler: Option<TargetScaler>,
-        regression_form: Option<jammi_datafusion::inference::adapter::DistributionForm>,
-    ) -> SavedAdapter {
-        match self {
-            Self::ProjectionHead { head } => SavedAdapter::ProjectionHead(ProjectionHeadConfig {
+        output: HeadOutput,
+    ) -> Result<SavedAdapter> {
+        let head_config = |head: &LoraModel, output: HeadOutput| {
+            let trained: Vec<&str> = head.layers.iter().map(|(name, _)| name.as_str()).collect();
+            let named: Vec<&str> = output.layers().iter().map(|layer| layer.name()).collect();
+            if trained != named {
+                return Err(JammiError::FineTune(format!(
+                    "the trained head's layers {trained:?} are not the {named:?} its output \
+                     ({output:?}) is served through"
+                )));
+            }
+            Ok(HeadConfig {
                 lora_rank: config.lora_rank,
                 lora_alpha: config.lora_alpha,
                 use_rslora: config.use_rslora,
-                head_layers: head.layers.iter().map(|(name, _)| name.clone()).collect(),
-                target_scaler,
-                regression_form,
-            }),
-            Self::EncoderAdapters(state) => {
-                SavedAdapter::EncoderAdapters(Box::new(state.adapter_cfg.clone()))
-            }
+                output,
+            })
+        };
+        Ok(match self {
+            Self::FrozenEncoder { head } => SavedAdapter::Frozen {
+                head: head_config(head, output)?,
+            },
+            Self::AdaptedEncoder(state) => SavedAdapter::Adapted {
+                adapters: Box::new(state.adapter_cfg.clone()),
+                head: state
+                    .head
+                    .as_ref()
+                    .map(|head| head_config(head, output))
+                    .transpose()?,
+            },
+        })
+    }
+}
+
+/// Persisted metadata serialised into `adapter_config.json`: the encoder's
+/// adapters when it trained them, and the head over its pooled output when
+/// the task trained one. The `encoder` JSON field tags which.
+///
+/// `Adapted` boxes its adapters because [`AdapterConfig`] is substantially
+/// larger than [`HeadConfig`], and unboxed it would inflate every
+/// `SavedAdapter` value to the larger size regardless of variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "encoder", rename_all = "snake_case")]
+pub enum SavedAdapter {
+    /// The encoder trained frozen; the head carries the adaptation.
+    Frozen {
+        /// The head over the frozen encoder's pooled output.
+        head: HeadConfig,
+    },
+    /// LoRA inside the encoder, and the task's head when it trained one.
+    Adapted {
+        /// The encoder's LoRA adapters.
+        adapters: Box<AdapterConfig>,
+        /// The task's head over the adapted encoder's pooled output; `None`
+        /// for an embedding task.
+        head: Option<HeadConfig>,
+    },
+}
+
+impl SavedAdapter {
+    /// The head over the pooled output, when the adapter carries one.
+    pub fn head(&self) -> Option<&HeadConfig> {
+        match self {
+            Self::Frozen { head } => Some(head),
+            Self::Adapted { head, .. } => head.as_ref(),
+        }
+    }
+
+    /// The encoder's adapters, when it trained them.
+    pub fn adapters(&self) -> Option<&AdapterConfig> {
+        match self {
+            Self::Frozen { .. } => None,
+            Self::Adapted { adapters, .. } => Some(adapters),
         }
     }
 }
 
-/// Persisted metadata serialised into `adapter_config.json` for both adapter
-/// flavours jammi-ai produces. The `adapter_type` JSON field tags which
-/// variant a saved adapter is.
-///
-/// `EncoderAdapters` boxes its payload because [`AdapterConfig`] is
-/// substantially larger than [`ProjectionHeadConfig`] (multiple `Vec`s,
-/// a `HashMap`, and a string), and unboxed it would inflate every
-/// `SavedAdapter` value to the larger size regardless of variant.
+/// A persisted head: the LoRA scaling its layers trained at, and what its
+/// output means — which names its layers ([`HeadOutput::layers`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "adapter_type", rename_all = "snake_case")]
-pub enum SavedAdapter {
-    /// Adapter is a projection head on top of a frozen base model. The
-    /// `adapter.safetensors` keys are `{head_layer}.lora_a` /
-    /// `{head_layer}.lora_b` for every entry in `head_layers`.
-    ProjectionHead(ProjectionHeadConfig),
-    /// Adapter is a set of LoRA A/B tensors injected into an encoder's
-    /// attention/FFN linears.
-    EncoderAdapters(Box<AdapterConfig>),
-}
-
-/// Metadata for a projection-head adapter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectionHeadConfig {
+#[serde(deny_unknown_fields)]
+pub struct HeadConfig {
     /// LoRA rank used at training time.
     pub lora_rank: usize,
     /// LoRA scaling factor used at training time.
     pub lora_alpha: f64,
     /// Whether training scaled the adapter with rSLoRA (`alpha / sqrt(rank)`)
-    /// instead of the vanilla `alpha / rank` — see
-    /// `jammi_lora::lora_scaling`. No `skip_serializing_if`: absence must
-    /// mean "legacy adapter, predates this field", which is read as `false`
-    /// (vanilla scaling) by `#[serde(default)]`, never conflated with an
-    /// adapter that explicitly opted out. Every adapter this engine writes
-    /// from here on carries the key, present or not. A legacy adapter that
-    /// was actually trained with rSLoRA cannot be repaired retroactively —
-    /// the bit was never recorded — and must be retrained.
-    #[serde(default)]
+    /// instead of the vanilla `alpha / rank` — see `jammi_lora::lora_scaling`.
     pub use_rslora: bool,
-    /// Names of the head layers, in order. Each name keys two safetensors
-    /// tensors: `{name}.lora_a` and `{name}.lora_b`. Typical shapes:
-    /// - embeddings: `["projection"]`
-    /// - classification: `["projection", "classifier"]`
-    /// - NER: `["projection", "token_classifier"]`
-    pub head_layers: Vec<String>,
-    /// De-standardising affine for a regression head: `Some(μ_y, σ_y)` for a
-    /// `ModelTask::Regression` head, `None` for every other projection head.
-    /// Serving rebuilds it so the reloaded head emits the same raw, outcome-unit
-    /// distribution parameters the trained head did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) target_scaler: Option<TargetScaler>,
-    /// Predictive distribution form of a regression head: `Gaussian` or
-    /// `Quantile { levels }`, set from the configured regression objective and
-    /// present exactly when [`Self::target_scaler`] is. Serving dispatches the
-    /// de-standardisation on this form (Gaussian de-standardises only the mean
-    /// column; quantile de-standardises every column), so a 2-level quantile head
-    /// — also width 2 — is de-standardised as a quantile head, not a Gaussian one.
-    /// `None`/absent for every non-regression head; existing non-regression
-    /// adapter configs round-trip unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) regression_form: Option<jammi_datafusion::inference::adapter::DistributionForm>,
+    /// What the head's output means.
+    pub output: HeadOutput,
+}
+
+/// What a head's output means, and so which layers it applies and how
+/// serving turns its output into a result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HeadOutput {
+    /// An embedding: the head's output is the served vector.
+    Embedding,
+    /// Class scores over `labels`, in class-index order — the vocabulary the
+    /// training rows' labels sorted into.
+    Classes {
+        /// The class names, indexed as the head's output columns are.
+        labels: Vec<String>,
+    },
+    /// A predictive distribution's raw parameters, in standardized space:
+    /// serving de-standardises them with `scaler` under `form`.
+    Distribution {
+        /// The de-standardising affine of the training targets.
+        scaler: TargetScaler,
+        /// Gaussian or quantile: the authoritative signal the
+        /// de-standardisation dispatches on (a 2-level quantile head is also
+        /// width 2, so head width cannot stand in for it).
+        form: jammi_datafusion::inference::adapter::DistributionForm,
+    },
+}
+
+impl HeadOutput {
+    /// The head's layers, in the order they apply to the pooled output: the
+    /// `projection`, then the task layer an output other than the embedding
+    /// itself needs.
+    pub fn layers(&self) -> &'static [HeadLayer] {
+        match self {
+            Self::Embedding => &[HeadLayer::Projection],
+            Self::Classes { .. } => &[HeadLayer::Projection, HeadLayer::Classifier],
+            Self::Distribution { .. } => &[HeadLayer::Projection, HeadLayer::Distribution],
+        }
+    }
+}
+
+/// One layer of a head. Its [`Self::name`] keys its two safetensors tensors
+/// (`{name}.lora_a`, `{name}.lora_b`) and its [`Self::base`] is the frozen
+/// map its LoRA delta adds to — one definition the trainer builds and
+/// serving rebuilds from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadLayer {
+    /// `hidden → hidden` over the pooled output, starting as the identity.
+    Projection,
+    /// `hidden → classes`, starting at zero.
+    Classifier,
+    /// `hidden → distribution parameters`, starting at zero.
+    Distribution,
+}
+
+impl HeadLayer {
+    /// The layer's name — its safetensors key prefix.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Projection => "projection",
+            Self::Classifier => "classifier",
+            Self::Distribution => "distribution",
+        }
+    }
+
+    /// The frozen `input → out` map the layer's LoRA delta adds to: the
+    /// identity for the projection, so an untrained head serves the pooled
+    /// output unchanged; zeros for a task layer, whose whole map is learned
+    /// and starts at zero. The projection's `out` must equal its `input`.
+    pub fn base(
+        self,
+        out: usize,
+        input: usize,
+        device: &Device,
+    ) -> candle_core::Result<candle_nn::Linear> {
+        let weight = match self {
+            Self::Projection if out == input => {
+                Tensor::eye(input, candle_core::DType::F32, device)?
+            }
+            Self::Projection => candle_core::bail!(
+                "a projection maps the pooled output to itself; {input} → {out} is not one"
+            ),
+            Self::Classifier | Self::Distribution => {
+                Tensor::zeros((out, input), candle_core::DType::F32, device)?
+            }
+        };
+        Ok(candle_nn::Linear::new(weight, None))
+    }
 }
 
 /// The closed set of **offset-bearing** distribution heads — the heads whose
@@ -335,7 +474,7 @@ pub struct ProjectionHeadConfig {
 ///
 /// The heads this enum deliberately *excludes* are offset-**invariant** by
 /// construction: CoSENT / MNRL / Triplet score cosine angles, Classification-CE
-/// / NER-CE score a softmax over class indices — none carry a continuous offset,
+/// scores a softmax over class indices — none carry a continuous offset,
 /// so none needs (or gets) a [`TargetScaler`]. Adding one of them to this enum
 /// would be a category error; the union is exactly the four distributional
 /// heads.
@@ -428,7 +567,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::regression_loss::TargetScaler;
-    use super::{ProjectionHeadConfig, SavedAdapter, StandardizableHead};
+    use super::{HeadConfig, HeadLayer, HeadOutput, SavedAdapter, StandardizableHead};
     use crate::pipeline::context_predictor::{GaussianObjective, PredictiveHead};
     use jammi_datafusion::inference::adapter::DistributionForm;
 
@@ -522,24 +661,29 @@ mod tests {
         }
     }
 
-    /// Persist a regression `ProjectionHeadConfig` (scaler + form) through the
-    /// real `save_adapter` writer, reload it through the real `load_adapter`
-    /// reader, and return the reloaded `(scaler, form)`. This is the exact
-    /// persistence path `forward_regression` reads on serve.
+    /// A head config with `output`, at the rank and alpha the tests persist.
+    fn head(output: HeadOutput, use_rslora: bool) -> HeadConfig {
+        HeadConfig {
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            use_rslora,
+            output,
+        }
+    }
+
+    /// Persist a regression head (scaler + form) through the real
+    /// `save_adapter` writer, reload it through the real `load_adapter` reader,
+    /// and return the reloaded `(scaler, form)`. This is the exact persistence
+    /// path regression serving reads.
     fn round_trip_regression_head(
         scaler: TargetScaler,
         form: DistributionForm,
         head_width: usize,
         device: &Device,
     ) -> (TargetScaler, DistributionForm) {
-        let saved = SavedAdapter::ProjectionHead(ProjectionHeadConfig {
-            lora_rank: 4,
-            lora_alpha: 8.0,
-            use_rslora: false,
-            head_layers: vec!["projection".into(), "distribution".into()],
-            target_scaler: Some(scaler),
-            regression_form: Some(form),
-        });
+        let saved = SavedAdapter::Frozen {
+            head: head(HeadOutput::Distribution { scaler, form }, false),
+        };
 
         // A two-tensor weights map so `save_adapter` writes a valid safetensors;
         // the `lora_b` rows match the head width so the persisted head is coherent.
@@ -558,14 +702,9 @@ mod tests {
         let (reloaded, _tensors): (SavedAdapter, _) =
             jammi_lora::load_adapter(dir.path(), device).unwrap();
 
-        match reloaded {
-            SavedAdapter::ProjectionHead(cfg) => (
-                cfg.target_scaler
-                    .expect("the reloaded regression head must carry its persisted target scaler"),
-                cfg.regression_form
-                    .expect("the reloaded regression head must carry its persisted form"),
-            ),
-            SavedAdapter::EncoderAdapters(_) => panic!("round-trip changed the adapter variant"),
+        match reloaded.head().map(|head| head.output.clone()) {
+            Some(HeadOutput::Distribution { scaler, form }) => (scaler, form),
+            other => panic!("the reloaded regression head lost its distribution output: {other:?}"),
         }
     }
 
@@ -586,7 +725,7 @@ mod tests {
     /// save → reload round-trip through the adapter directory, so a served head
     /// emits the target offset rather than the zero-init z-space value.
     ///
-    /// Build a `ProjectionHeadConfig` carrying a non-trivial `TargetScaler`
+    /// Build a head config carrying a non-trivial `TargetScaler`
     /// (μ_y ≈ 2017 — the calendar-year shape) and the Gaussian form, persist and
     /// reload it through the real adapter writer/reader, then de-standardise a
     /// ZERO z-space head through the reloaded form exactly as `forward_regression`
@@ -693,73 +832,66 @@ mod tests {
         }
     }
 
-    // ── `use_rslora` is a persisted, non-vacuous field ─────────────────────────
+    // ── `use_rslora` is a persisted, required field ─────────────────────────────
 
-    /// A checked-in `adapter_config.json` literally lacking the `use_rslora`
-    /// key must deserialize with `use_rslora == false` (vanilla `alpha/rank`
-    /// scaling, the only scaling that key's absence can honestly mean)
-    /// rather than failing to parse or defaulting to some other value. An
-    /// adapter trained with rSLoRA whose config lacks the key cannot be
-    /// repaired from this file alone (the bit is not recorded) and must be
-    /// retrained.
+    /// `use_rslora` decides the scale serving applies to every head layer, so a
+    /// config that does not record it cannot be served faithfully: it is
+    /// refused at load, never read as either value.
     #[test]
-    fn legacy_adapter_config_without_use_rslora_key_defaults_false() {
-        let json =
-            include_str!("../../tests/fixtures/adapters/adapter_config_legacy_no_rslora.json");
-        // The fixture must genuinely lack the key — otherwise this test would
-        // pass vacuously regardless of `#[serde(default)]` wiring.
-        assert!(
-            !json.contains("use_rslora"),
-            "fixture must not carry the key; if it does this test no longer probes the \
-             legacy (absent-key) path"
-        );
-        let saved: SavedAdapter = serde_json::from_str(json)
-            .expect("a legacy config missing use_rslora must still deserialize");
-        match saved {
-            SavedAdapter::ProjectionHead(cfg) => {
-                assert!(
-                    !cfg.use_rslora,
-                    "a legacy config's absent use_rslora key must read as false"
-                );
-                assert_eq!(cfg.lora_rank, 16, "legacy rank must round-trip unchanged");
-                assert_eq!(
-                    cfg.lora_alpha, 32.0,
-                    "legacy alpha must round-trip unchanged"
-                );
-            }
-            SavedAdapter::EncoderAdapters(_) => {
-                panic!("fixture must deserialize as a ProjectionHead adapter")
-            }
-        }
+    fn a_head_config_without_use_rslora_is_refused() {
+        let json = r#"{"encoder":"frozen","head":{"lora_rank":16,"lora_alpha":32.0,
+            "output":{"kind":"embedding"}}}"#;
+        let err = serde_json::from_str::<SavedAdapter>(json).unwrap_err();
+        assert!(err.to_string().contains("use_rslora"), "{err}");
     }
 
-    /// `use_rslora` is a real, finite, non-vacuous field —
-    /// every freshly-serialized config carries the key explicitly (no
-    /// `skip_serializing_if`, unlike `target_scaler`/`regression_form`), and
-    /// round-trips both `true` and `false` distinctly through JSON.
+    /// Every serialized head config carries `use_rslora` explicitly and
+    /// round-trips `true` and `false` distinctly.
     #[test]
     fn use_rslora_is_always_serialized_and_round_trips_both_values() {
         for use_rslora in [true, false] {
-            let cfg = ProjectionHeadConfig {
-                lora_rank: 16,
-                lora_alpha: 32.0,
-                use_rslora,
-                head_layers: vec!["projection".into()],
-                target_scaler: None,
-                regression_form: None,
-            };
+            let cfg = head(HeadOutput::Embedding, use_rslora);
             let json = serde_json::to_string(&cfg).unwrap();
-            assert!(
-                json.contains("\"use_rslora\""),
-                "every serialized config must carry the use_rslora key explicitly \
-                 (no skip_serializing_if), got: {json}"
-            );
-            let reloaded: ProjectionHeadConfig = serde_json::from_str(&json).unwrap();
-            assert_eq!(
-                reloaded.use_rslora, use_rslora,
-                "use_rslora must round-trip through JSON unchanged (finite, non-vacuous \
-                 field — true and false are distinguishable after a round trip)"
-            );
+            assert!(json.contains("\"use_rslora\""), "{json}");
+            let reloaded: HeadConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(reloaded.use_rslora, use_rslora);
         }
+    }
+
+    /// An adapted encoder's classification head persists beside its adapters,
+    /// with the class names serving labels its outputs by — the shape a
+    /// classification fine-tune is served from.
+    #[test]
+    fn an_adapted_encoder_persists_its_classification_head_and_labels() {
+        let adapters: jammi_lora::AdapterConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "bert",
+            "target_modules": ["query", "value"],
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "use_rslora": false
+        }))
+        .unwrap();
+        let saved = SavedAdapter::Adapted {
+            adapters: Box::new(adapters),
+            head: Some(head(
+                HeadOutput::Classes {
+                    labels: vec!["cs.AI".into(), "cs.LG".into()],
+                },
+                false,
+            )),
+        };
+        let reloaded: SavedAdapter =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(reloaded.adapters().is_some());
+        let head = reloaded.head().expect("the classification head persists");
+        assert_eq!(
+            head.output.layers(),
+            [HeadLayer::Projection, HeadLayer::Classifier]
+        );
+        assert!(
+            matches!(&head.output, HeadOutput::Classes { labels } if labels == &["cs.AI", "cs.LG"]),
+            "{:?}",
+            head.output
+        );
     }
 }

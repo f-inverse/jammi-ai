@@ -27,14 +27,14 @@ use jammi_db::catalog::jobs_repo::{
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, JobAttempt, Producer, ResultTableKind,
 };
-use jammi_db::catalog::status::{JobExecution, JobStatus};
+use jammi_db::catalog::status::{JobExecution, JobKind, JobKinds, JobPhase, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::StoragePrecision;
 use tempfile::tempdir;
 use test_case::test_case;
 
-const KIND: &str = "fine_tune";
-const KINDS: &[&str] = &[KIND];
+const KIND: JobKind = JobKind::FineTune;
+const KINDS: &[JobKind] = &[KIND];
 
 /// A minimal queued job over the `q-base` model with the given id.
 fn job_params(job_id: &str) -> SubmitJobParams<'_> {
@@ -166,7 +166,7 @@ async fn two_worker_claim_exclusivity_grants_one_winner(backend: BackendKind) {
     );
     let claimed = &winners[0];
     assert_eq!(claimed.job_id, "q-1");
-    assert_eq!(claimed.status, JobStatus::Running.to_string());
+    assert_eq!(claimed.status, JobStatus::Running);
     assert!(
         matches!(claimed.claimed_by.as_deref(), Some("worker-a" | "worker-b")),
         "claimed_by must name the winning worker, got {:?}",
@@ -222,7 +222,7 @@ async fn inline_rows_are_never_returned_by_claim_next(backend: BackendKind) {
         .unwrap()
         .expect("claim_by_id claims the inline row directly");
     assert_eq!(by_id.job_id, "in-1");
-    assert_eq!(by_id.status, JobStatus::Running.to_string());
+    assert_eq!(by_id.status, JobStatus::Running);
 }
 
 /// Claims hand out the oldest queued job first (FIFO by `created_at`).
@@ -331,7 +331,7 @@ async fn claim_skips_a_held_job_without_erroring(backend: BackendKind) {
     assert_eq!(released.job_id, "held");
     assert_eq!(
         released.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "the hold is released with no other status change along the way"
     );
 }
@@ -474,6 +474,78 @@ async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
     );
 }
 
+/// A progress reporter writes the first report, every phase change and a
+/// phase's last unit at once, and within a phase at most once per interval —
+/// so a producer can report every step without a write per step.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progress_reporter_writes_phase_changes_and_ends_and_spaces_the_rest(backend: BackendKind) {
+    use jammi_db::catalog::jobs_repo::{JobProgress, ProgressReporter};
+    use jammi_db::catalog::result_repo::JobAttempt;
+
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
+    catalog.submit_job(job_params("pr")).await.unwrap();
+    let claimed = catalog
+        .claim_next("worker", KINDS, Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("claim");
+    let mut reporter = ProgressReporter::new(
+        JobAttempt {
+            job_id: "pr",
+            instance_id: "worker",
+            attempts: claimed.attempts,
+        }
+        .to_buf(),
+    );
+    let training = |done| JobProgress {
+        phase: JobPhase::Training,
+        done: Some(done),
+        total: Some(10),
+    };
+    let recorded = || async { catalog.get_job("pr").await.unwrap().progress };
+
+    assert_eq!(
+        recorded().await,
+        None,
+        "nothing is recorded before the first report"
+    );
+    reporter.report(&catalog, training(1)).await.unwrap();
+    assert_eq!(
+        recorded().await,
+        Some(training(1)),
+        "the first report is written"
+    );
+    reporter.report(&catalog, training(2)).await.unwrap();
+    assert_eq!(
+        recorded().await,
+        Some(training(1)),
+        "a report within the interval of the last write waits"
+    );
+    reporter.report(&catalog, training(10)).await.unwrap();
+    assert_eq!(
+        recorded().await,
+        Some(training(10)),
+        "the phase's last unit is written"
+    );
+    let publishing = JobProgress {
+        phase: JobPhase::Publishing,
+        done: None,
+        total: None,
+    };
+    reporter.report(&catalog, publishing).await.unwrap();
+    assert_eq!(
+        recorded().await,
+        Some(publishing),
+        "a phase change is written"
+    );
+}
+
 /// The attempt guard also covers `finish_job` and `progress_job`: a
 /// stale-attempt caller (a zombie of a prior attempt this job already moved
 /// past via reclaim) matches zero rows on either.
@@ -508,7 +580,18 @@ async fn attempts_guard_covers_finish_and_progress(backend: BackendKind) {
     assert_eq!(current.attempts, 2);
 
     let stale_progress = catalog
-        .progress_job("ag", "zombie", 1, Some(10), None, None)
+        .progress_job(
+            jammi_db::catalog::result_repo::JobAttempt {
+                job_id: "ag",
+                instance_id: "zombie",
+                attempts: 1,
+            },
+            jammi_db::catalog::jobs_repo::JobProgress {
+                phase: JobPhase::Computing,
+                done: Some(10),
+                total: None,
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -532,7 +615,18 @@ async fn attempts_guard_covers_finish_and_progress(backend: BackendKind) {
 
     // The live claimant, at the current attempt, succeeds on both.
     assert!(catalog
-        .progress_job("ag", "live", 2, Some(5), Some(10), Some("embedding"))
+        .progress_job(
+            jammi_db::catalog::result_repo::JobAttempt {
+                job_id: "ag",
+                instance_id: "live",
+                attempts: 2,
+            },
+            jammi_db::catalog::jobs_repo::JobProgress {
+                phase: JobPhase::Computing,
+                done: Some(5),
+                total: Some(10),
+            },
+        )
         .await
         .unwrap());
     assert!(catalog
@@ -545,7 +639,7 @@ async fn attempts_guard_covers_finish_and_progress(backend: BackendKind) {
         .await
         .unwrap());
     let done = catalog.get_job("ag").await.unwrap();
-    assert_eq!(done.status, JobStatus::Completed.to_string());
+    assert_eq!(done.status, JobStatus::Completed);
 }
 
 /// An expired lease with attempts left re-queues the job; once attempts are
@@ -575,7 +669,7 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted(backend: BackendKin
         .unwrap();
     assert_eq!(actioned, 1, "the one expired lease is re-queued");
     let requeued = catalog.get_job("rc").await.unwrap();
-    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    assert_eq!(requeued.status, JobStatus::Queued);
     assert!(requeued.claimed_by.is_none(), "re-queue clears claimed_by");
     assert!(
         requeued.lease_expires_at.is_none(),
@@ -595,7 +689,7 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted(backend: BackendKin
         .unwrap();
     assert_eq!(actioned, 1, "the exhausted lease is actioned once");
     let failed = catalog.get_job("rc").await.unwrap();
-    assert_eq!(failed.status, JobStatus::Failed.to_string());
+    assert_eq!(failed.status, JobStatus::Failed);
     assert!(
         failed.lease_expires_at.is_none(),
         "a failed job carries no live lease"
@@ -649,7 +743,7 @@ async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     let after_a = catalog.get_job("fl").await.unwrap();
     assert_eq!(
         after_a.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "the stale fail leaves the job running for its real owner"
     );
 
@@ -659,7 +753,7 @@ async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
         .unwrap();
     assert!(b_failed, "the lease owner records the failure");
     let after_b = catalog.get_job("fl").await.unwrap();
-    assert_eq!(after_b.status, JobStatus::Failed.to_string());
+    assert_eq!(after_b.status, JobStatus::Failed);
     assert_eq!(after_b.error.as_deref(), Some("real failure"));
 }
 
@@ -681,7 +775,7 @@ async fn cancelling_a_queued_job_retires_it_without_a_claim(backend: BackendKind
     assert!(catalog.cancel_request("cq").await.unwrap());
 
     let after = catalog.get_job("cq").await.unwrap();
-    assert_eq!(after.status, JobStatus::Cancelled.to_string());
+    assert_eq!(after.status, JobStatus::Cancelled);
     assert!(after.is_terminal());
     assert!(after.cancel_requested);
     assert_eq!(after.attempts, 0, "no attempt was ever spent on it");
@@ -728,7 +822,7 @@ async fn cancelling_a_running_job_flags_it_and_its_owner_ends_it_cancelled(backe
     let flagged = catalog.get_job("cr").await.unwrap();
     assert_eq!(
         flagged.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "a running job is its executor's to end"
     );
     assert!(flagged.cancel_requested);
@@ -745,7 +839,7 @@ async fn cancelling_a_running_job_flags_it_and_its_owner_ends_it_cancelled(backe
         .await
         .unwrap());
     let ended = catalog.get_job("cr").await.unwrap();
-    assert_eq!(ended.status, JobStatus::Cancelled.to_string());
+    assert_eq!(ended.status, JobStatus::Cancelled);
     assert!(ended.error.as_deref().is_some_and(|e| e.contains("cr")));
 }
 
@@ -765,7 +859,7 @@ async fn cancelling_a_queued_inline_job_only_flags_it(backend: BackendKind) {
     assert!(catalog.cancel_request("ci").await.unwrap());
 
     let after = catalog.get_job("ci").await.unwrap();
-    assert_eq!(after.status, JobStatus::Queued.to_string());
+    assert_eq!(after.status, JobStatus::Queued);
     assert!(after.cancel_requested);
 }
 
@@ -793,7 +887,7 @@ async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
         .unwrap();
     assert_eq!(actioned, 0, "a live lease is not reclaimed");
     let still_running = catalog.get_job("live").await.unwrap();
-    assert_eq!(still_running.status, JobStatus::Running.to_string());
+    assert_eq!(still_running.status, JobStatus::Running);
 }
 
 /// PINS the claim side of the one-primitive reclaim rule ("absent or expired
@@ -815,14 +909,14 @@ async fn claim_always_stamps_a_non_null_lease(backend: BackendKind) {
         .await
         .unwrap()
         .expect("job claimed");
-    assert_eq!(claimed.status, JobStatus::Running.to_string());
+    assert_eq!(claimed.status, JobStatus::Running);
     assert!(
         claimed.lease_expires_at.is_some(),
         "every claim must stamp a non-NULL lease on the row it returns running"
     );
 
     let row = catalog.get_job("stamped").await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.status, JobStatus::Running);
     assert!(
         row.lease_expires_at.is_some(),
         "the persisted row must carry the same non-NULL lease the claim returned"
@@ -859,7 +953,7 @@ async fn a_running_row_with_a_null_lease_is_reclaimed(backend: BackendKind) {
         "a NULL lease is reclaimed exactly like an expired one"
     );
     let requeued = catalog.get_job("nl").await.unwrap();
-    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    assert_eq!(requeued.status, JobStatus::Queued);
 }
 
 // ─── liveness reclaim: inline-execution rows, gated on the owning instance ──
@@ -903,7 +997,7 @@ async fn inline_job_failed_when_owning_instance_is_stale(backend: BackendKind) {
     let row = catalog.get_job("dead-owner").await.unwrap();
     assert_eq!(
         row.status,
-        JobStatus::Failed.to_string(),
+        JobStatus::Failed,
         "a stale-instance inline job is failed, never requeued"
     );
     assert!(
@@ -940,7 +1034,7 @@ async fn inline_job_failed_when_owning_instance_is_absent(backend: BackendKind) 
     let actioned = catalog.reclaim_expired_jobs(lease, 5).await.unwrap();
     assert_eq!(actioned, 1);
     let row = catalog.get_job("no-owner").await.unwrap();
-    assert_eq!(row.status, JobStatus::Failed.to_string());
+    assert_eq!(row.status, JobStatus::Failed);
 }
 
 /// A LIVE owning instance leaves the inline job entirely untouched.
@@ -982,7 +1076,7 @@ async fn inline_job_untouched_when_owning_instance_is_live(backend: BackendKind)
         "a live owning instance means nothing is reclaimed"
     );
     let row = catalog.get_job("live-owner").await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.status, JobStatus::Running);
 }
 
 /// Two processes sharing one operator LABEL are still two instances: the
@@ -1055,12 +1149,12 @@ async fn dead_instances_inline_job_is_failed_while_a_live_peer_with_the_same_lab
          live peer must not keep it alive"
     );
     let dead = catalog.get_job("label-dead-job").await.unwrap();
-    assert_eq!(dead.status, JobStatus::Failed.to_string());
+    assert_eq!(dead.status, JobStatus::Failed);
     assert_eq!(dead.error.as_deref(), Some("inline executor died"));
     let live = catalog.get_job("label-live-job").await.unwrap();
     assert_eq!(
         live.status,
-        JobStatus::Running.to_string(),
+        JobStatus::Running,
         "the live peer's own inline job is untouched"
     );
 }
@@ -1513,7 +1607,7 @@ async fn an_attempt_records_where_its_ranks_run(backend: BackendKind) {
         .await
         .unwrap());
     let done = catalog.get_job("ranks-1").await.unwrap();
-    assert_eq!(done.status, "completed");
+    assert_eq!(done.status, JobStatus::Completed);
     assert_eq!(done.claimed_by.as_deref(), Some("executor"));
     assert_eq!(done.ranks, local);
 }
@@ -1623,7 +1717,7 @@ async fn acceleration_report_survives_finish(backend: BackendKind) {
     assert!(finished, "the lease owner finishes the job");
 
     let after = catalog.get_job("ar-fin").await.unwrap();
-    assert_eq!(after.status, JobStatus::Completed.to_string());
+    assert_eq!(after.status, JobStatus::Completed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(report),
@@ -1662,7 +1756,7 @@ async fn acceleration_report_survives_fail(backend: BackendKind) {
     assert!(failed, "the lease owner records the failure");
 
     let after = catalog.get_job("ar-fail").await.unwrap();
-    assert_eq!(after.status, JobStatus::Failed.to_string());
+    assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(report),
@@ -1709,7 +1803,7 @@ async fn acceleration_report_reclaim_arms_reset_on_requeue_and_persist_on_exhaus
         .unwrap();
     assert_eq!(actioned, 1, "the expired lease is re-queued");
     let requeued = catalog.get_job("ar-rc").await.unwrap();
-    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    assert_eq!(requeued.status, JobStatus::Queued);
     assert_eq!(
         requeued.acceleration_report.as_deref(),
         Some(PENDING_MARKER),
@@ -1734,7 +1828,7 @@ async fn acceleration_report_reclaim_arms_reset_on_requeue_and_persist_on_exhaus
         .unwrap();
     assert_eq!(actioned, 1, "attempts (2) >= max (2): the job fails");
     let failed = catalog.get_job("ar-rc").await.unwrap();
-    assert_eq!(failed.status, JobStatus::Failed.to_string());
+    assert_eq!(failed.status, JobStatus::Failed);
     assert_eq!(
         failed.acceleration_report.as_deref(),
         Some(fresh_report),
@@ -1784,7 +1878,7 @@ async fn fail_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
     assert!(failed, "the lease owner records the failure");
 
     let after = catalog.get_job("ar-f-pending").await.unwrap();
-    assert_eq!(after.status, JobStatus::Failed.to_string());
+    assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(FAILED_BEFORE_PROBE),
@@ -1827,7 +1921,7 @@ async fn finish_rewrites_a_pending_report_to_undetermined(backend: BackendKind) 
     assert!(finished);
 
     let after = catalog.get_job("ar-fz-pending").await.unwrap();
-    assert_eq!(after.status, JobStatus::Completed.to_string());
+    assert_eq!(after.status, JobStatus::Completed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(FINALIZED_WITHOUT_DETERMINATION),
@@ -1883,7 +1977,7 @@ async fn fail_preserves_an_already_terminal_report(backend: BackendKind) {
         assert!(failed, "the lease owner records the failure");
 
         let after = catalog.get_job(job_id).await.unwrap();
-        assert_eq!(after.status, JobStatus::Failed.to_string());
+        assert_eq!(after.status, JobStatus::Failed);
         assert_eq!(
             after.acceleration_report.as_deref(),
             Some(report),
@@ -1921,7 +2015,7 @@ async fn fail_leaves_a_legacy_null_report_unknown(backend: BackendKind) {
     assert!(failed);
 
     let after = catalog.get_job("ar-f-null").await.unwrap();
-    assert_eq!(after.status, JobStatus::Failed.to_string());
+    assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(
         after.acceleration_report, None,
         "a legacy NULL stays NULL ('unknown') — the pending rewrite must never fabricate \
@@ -1959,7 +2053,7 @@ async fn reclaim_exhausted_rewrites_a_pending_report_to_undetermined(backend: Ba
     );
 
     let after = catalog.get_job("ar-rc-exh").await.unwrap();
-    assert_eq!(after.status, JobStatus::Failed.to_string());
+    assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(LEASE_EXPIRED_EXHAUSTED),
@@ -2000,7 +2094,7 @@ async fn inline_liveness_reclaim_rewrites_a_pending_report_to_undetermined(backe
     assert_eq!(actioned, 1, "the dead inline executor's job is failed");
 
     let after = catalog.get_job("ar-inline-dead").await.unwrap();
-    assert_eq!(after.status, JobStatus::Failed.to_string());
+    assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(
         after.acceleration_report.as_deref(),
         Some(INLINE_EXECUTOR_DIED),
@@ -2160,7 +2254,7 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
 /// A compute-kind queued job (no FK model) with the given id.
 fn compute_job_params(job_id: &str) -> SubmitJobParams<'_> {
     SubmitJobParams {
-        kind: "embedding",
+        kind: JobKind::Embedding,
         model_ref: None,
         ..job_params(job_id)
     }
@@ -2209,7 +2303,7 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     let released = catalog.release_job_lease("rel", "me", 1).await.unwrap();
     assert!(released, "the owner releases its own live lease");
     let row = catalog.get_job("rel").await.unwrap();
-    assert_eq!(row.status, JobStatus::Running.to_string());
+    assert_eq!(row.status, JobStatus::Running);
     assert_eq!(row.claimed_by.as_deref(), Some("me"));
     assert!(row.lease_expires_at.is_none(), "release NULLs the lease");
     assert_eq!(row.releases, 1);
@@ -2233,7 +2327,7 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     let actioned = catalog.reclaim_expired_jobs(lease, 3).await.unwrap();
     assert_eq!(actioned, 1, "exactly the released row is requeued");
     let requeued = catalog.get_job("rel").await.unwrap();
-    assert_eq!(requeued.status, JobStatus::Queued.to_string());
+    assert_eq!(requeued.status, JobStatus::Queued);
     assert!(requeued.claimed_by.is_none());
     assert_eq!(
         requeued.releases, 1,
@@ -2241,7 +2335,7 @@ async fn released_job_is_requeued_by_the_next_reclaim_without_waiting_for_expiry
     );
     assert_eq!(requeued.attempts, 1);
     let untouched = catalog.get_job("live").await.unwrap();
-    assert_eq!(untouched.status, JobStatus::Running.to_string());
+    assert_eq!(untouched.status, JobStatus::Running);
     assert!(untouched.lease_expires_at.is_some());
     assert_eq!(untouched.releases, 0);
 }
@@ -2322,9 +2416,7 @@ async fn release_job_lease_write_is_exactly_lease_null_releases_plus_one_and_tim
     assert_eq!(after.partial_result, before.partial_result);
     assert_eq!(after.result, before.result);
     assert_eq!(after.error, before.error);
-    assert_eq!(after.progress_rows_done, before.progress_rows_done);
-    assert_eq!(after.progress_rows_total, before.progress_rows_total);
-    assert_eq!(after.progress_phase, before.progress_phase);
+    assert_eq!(after.progress, before.progress);
     assert_eq!(after.cancel_requested, before.cancel_requested);
     assert_eq!(after.model_ref, before.model_ref);
     assert_eq!(after.output_model_id, before.output_model_id);
@@ -2377,9 +2469,7 @@ fn assert_only_release_columns_changed(
     assert_eq!(after.partial_result, before.partial_result);
     assert_eq!(after.result, before.result);
     assert_eq!(after.error, before.error);
-    assert_eq!(after.progress_rows_done, before.progress_rows_done);
-    assert_eq!(after.progress_rows_total, before.progress_rows_total);
-    assert_eq!(after.progress_phase, before.progress_phase);
+    assert_eq!(after.progress, before.progress);
     assert_eq!(after.cancel_requested, before.cancel_requested);
     assert_eq!(after.model_ref, before.model_ref);
     assert_eq!(after.output_model_id, before.output_model_id);
@@ -2693,7 +2783,7 @@ async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
         let row = catalog.get_job("storm").await.unwrap();
         assert_eq!(
             row.status,
-            JobStatus::Queued.to_string(),
+            JobStatus::Queued,
             "release {round} must leave the job claimable, never failed"
         );
         assert_eq!(row.releases, round);
@@ -2733,7 +2823,7 @@ async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
         );
         assert_eq!(
             catalog.get_job("exp").await.unwrap().status,
-            JobStatus::Queued.to_string()
+            JobStatus::Queued
         );
     }
     let third = catalog
@@ -2750,7 +2840,7 @@ async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
         1
     );
     let failed = catalog.get_job("exp").await.unwrap();
-    assert_eq!(failed.status, JobStatus::Failed.to_string());
+    assert_eq!(failed.status, JobStatus::Failed);
     assert_eq!((failed.attempts, failed.releases), (3, 0));
 
     // 3 claims / 2 releases, the third lease expired: requeued (3 - 2 < 3).
@@ -2781,7 +2871,7 @@ async fn reclaim_cap_counts_attempts_minus_releases(backend: BackendKind) {
     let mixed = catalog.get_job("mix").await.unwrap();
     assert_eq!(
         mixed.status,
-        JobStatus::Queued.to_string(),
+        JobStatus::Queued,
         "attempts - releases = 1 < 3: requeued, never failed"
     );
     assert_eq!((mixed.attempts, mixed.releases), (3, 2));
@@ -2890,7 +2980,7 @@ async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend
 
     catalog.submit_job(compute_job_params("cpr")).await.unwrap();
     let claimed = catalog
-        .claim_next("me", &["embedding"], Duration::from_secs(3600))
+        .claim_next("me", &[JobKind::Embedding], Duration::from_secs(3600))
         .await
         .unwrap()
         .expect("cpr claimed");
@@ -2986,7 +3076,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
         .await
         .unwrap();
     let c = catalog
-        .claim_next("me", &["embedding"], lease)
+        .claim_next("me", &[JobKind::Embedding], lease)
         .await
         .unwrap()
         .expect("fin-c claimed");
@@ -3007,7 +3097,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
         "the finalize CAS ignores the lease"
     );
     let done = catalog.get_job("fin-c").await.unwrap();
-    assert_eq!(done.status, JobStatus::Completed.to_string());
+    assert_eq!(done.status, JobStatus::Completed);
     assert_eq!(done.releases, 1);
 
     // `finish_job_with_model` (the training finalize).
@@ -3056,7 +3146,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
     );
     assert_eq!(
         catalog.get_job("fin-t").await.unwrap().status,
-        JobStatus::Completed.to_string()
+        JobStatus::Completed
     );
 }
 
@@ -3169,32 +3259,37 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
         .await
         .unwrap();
     catalog
-        .upsert_worker("w-state", "all", WorkerState::Warming, &[])
+        .upsert_worker("w-state", &JobKinds::all(), WorkerState::Warming, &[])
         .await
         .unwrap();
     assert_eq!(
-        state_of(catalog.list_workers().await.unwrap()).as_deref(),
-        Some("warming")
+        state_of(catalog.list_workers().await.unwrap()),
+        Some(WorkerState::Warming)
     );
     assert!(catalog
         .set_worker_state("w-state", WorkerState::Claiming)
         .await
         .unwrap());
     assert_eq!(
-        state_of(catalog.list_workers().await.unwrap()).as_deref(),
-        Some("claiming")
+        state_of(catalog.list_workers().await.unwrap()),
+        Some(WorkerState::Claiming)
     );
     assert!(catalog
         .set_worker_state("w-state", WorkerState::Draining)
         .await
         .unwrap());
     assert_eq!(
-        state_of(catalog.list_workers().await.unwrap()).as_deref(),
-        Some("draining")
+        state_of(catalog.list_workers().await.unwrap()),
+        Some(WorkerState::Draining)
     );
     // A re-upsert (a restarted loop on the same instance) resets the state.
     catalog
-        .upsert_worker("w-state", "fine_tune", WorkerState::Warming, &[])
+        .upsert_worker(
+            "w-state",
+            &JobKinds::new(vec![JobKind::FineTune]),
+            WorkerState::Warming,
+            &[],
+        )
         .await
         .unwrap();
     let again = catalog
@@ -3205,8 +3300,8 @@ async fn set_worker_state_round_trips_through_list_workers(backend: BackendKind)
         .find(|w| w.instance_id == "w-state")
         .expect("row present");
     assert_eq!(
-        (again.state.as_str(), again.kinds.as_str()),
-        ("warming", "fine_tune")
+        (again.state, again.kinds),
+        (WorkerState::Warming, JobKinds::new(vec![JobKind::FineTune]))
     );
     assert!(
         !catalog
@@ -3251,7 +3346,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
         .await
         .unwrap();
     catalog
-        .upsert_worker("w-devices", "all", WorkerState::Warming, &[])
+        .upsert_worker("w-devices", &JobKinds::all(), WorkerState::Warming, &[])
         .await
         .unwrap();
     assert_eq!(
@@ -3262,16 +3357,21 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
 
     let devices = vec![
         DeviceFact {
-            kind: "cuda".to_string(),
+            kind: jammi_datafusion::ComputeDeviceKind::Cuda,
             ordinal: 0,
         },
         DeviceFact {
-            kind: "cuda".to_string(),
+            kind: jammi_datafusion::ComputeDeviceKind::Cuda,
             ordinal: 1,
         },
     ];
     catalog
-        .upsert_worker("w-devices", "all", WorkerState::Claiming, &devices)
+        .upsert_worker(
+            "w-devices",
+            &JobKinds::all(),
+            WorkerState::Claiming,
+            &devices,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3282,7 +3382,7 @@ async fn upsert_worker_devices_round_trips_through_list_workers(backend: Backend
 
     // A re-upsert with no devices REPLACES, never merges.
     catalog
-        .upsert_worker("w-devices", "all", WorkerState::Claiming, &[])
+        .upsert_worker("w-devices", &JobKinds::all(), WorkerState::Claiming, &[])
         .await
         .unwrap();
     assert_eq!(
@@ -3316,7 +3416,7 @@ async fn malformed_worker_devices_is_a_row_fact_not_a_read_fault(backend: Backen
         .await
         .unwrap();
     catalog
-        .upsert_worker("w-corrupt", "all", WorkerState::Warming, &[])
+        .upsert_worker("w-corrupt", &JobKinds::all(), WorkerState::Warming, &[])
         .await
         .unwrap();
     catalog

@@ -224,7 +224,7 @@ async fn predict_forward_cpu_gpu_parity() {
             .expect("default worker intervals are valid");
         let job = trainer.train_context_predictor("fns", &spec).await.unwrap();
         job.wait().await.unwrap();
-        assert_eq!(job.model_id(), "ctx-predictor");
+        assert_eq!(job.output_model_id(), Some("ctx-predictor"));
     }
 
     // The targets to serve: one row per task (a spread across the held data).

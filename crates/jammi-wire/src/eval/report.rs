@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use jammi_numerics::classification::ClassificationResult;
-use jammi_numerics::ner::{Entity, NerMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 // The bootstrap / rank-sum kernels are pulled in only where significance is
 // *computed* — the local engine's `eval_compare`. The significance *types*
@@ -31,7 +31,7 @@ pub struct EmbeddingEvalReport {
     pub eval_run_id: String,
     /// Mean metrics across all queries.
     pub aggregate: AggregateMetrics,
-    /// One record per query, in golden-set order.
+    /// One record per query, in ground truth order.
     pub per_query: Vec<PerQueryRecord>,
 }
 
@@ -45,7 +45,7 @@ pub struct EmbeddingEvalReport {
 /// `_jammi_eval_per_query`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerQueryRecord {
-    /// `query_id` from the golden source (the join key).
+    /// `query_id` from the ground-truth source (the join key).
     pub query_id: String,
     pub metrics: QueryMetrics,
     /// Recall at multiple cutoffs as `(k, recall@k)` pairs, in ascending k.
@@ -105,7 +105,7 @@ pub enum PerRecordPrediction {
     Ner {
         record_id: String,
         predicted: Vec<Entity>,
-        gold: Vec<Entity>,
+        gold: Vec<Span>,
     },
 }
 
@@ -1064,7 +1064,7 @@ mod calibration_tests {
 #[cfg(test)]
 mod projection_fixture_tests {
     //! Pin the serde dict shape of every eval report against the committed
-    //! golden fixture `tests/fixtures/eval_report_projection.json`.
+    //! committed fixture `tests/fixtures/eval_report_projection.json`.
     //!
     //! The fixture is the contract a thin client's report projection
     //! reproduces (the Python client's projection helpers are asserted against
@@ -1081,7 +1081,7 @@ mod projection_fixture_tests {
 
     use super::*;
     use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
-    use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
+    use jammi_numerics::ner::{Entity, NerMetrics, Span, TypeMetrics};
     use jammi_numerics::retrieval::AggregateMetrics;
 
     const FIXTURE: &str = concat!(
@@ -1215,12 +1215,10 @@ mod projection_fixture_tests {
                     text: "Alice".into(),
                     confidence: 0.5,
                 }],
-                gold: vec![Entity {
+                gold: vec![Span {
                     label: "PER".into(),
                     start: 0,
                     end: 5,
-                    text: String::new(),
-                    confidence: 0.0,
                 }],
             }],
         }

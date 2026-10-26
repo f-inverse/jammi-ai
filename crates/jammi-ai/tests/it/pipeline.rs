@@ -495,7 +495,7 @@ async fn large_batch_embedding_completes_without_oom() {
 // ─── Opt-in memoization: embeddings are honestly NEVER cacheable ─────────────
 //
 // An embedding pipeline anchors its raw source `UnpinnedAtInstant` (no version
-// surface in open-core), so `probe_cache` never hits: a `Use` request always
+// surface), so `probe_cache` never hits: a `Use` request always
 // computes. The cache is honestly OFF here, not silently broken.
 
 #[tokio::test]

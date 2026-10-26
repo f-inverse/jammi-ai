@@ -69,9 +69,7 @@ impl PyPerQueryAudit {
         top_k_result_ids: Vec<String>,
         retrieval_scores: Vec<f32>,
     ) -> PyResult<Self> {
-        let qid = Uuid::parse_str(query_id).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid query_id '{query_id}': {e}"))
-        })?;
+        let qid = parse_query_id(query_id)?;
         let lineage = pyobj_to_json(py, &query_lineage)?;
         let inner = PerQueryAudit::new(
             qid,
@@ -167,9 +165,7 @@ impl PyAuditHandle {
 
     /// Fetch one record by query id (tenant-scoped). Returns `None` if absent.
     fn fetch_by_query_id(&self, query_id: &str) -> PyResult<Option<PyPerQueryAudit>> {
-        let qid = Uuid::parse_str(query_id).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid query_id '{query_id}': {e}"))
-        })?;
+        let qid = parse_query_id(query_id)?;
         let rec = crate::released(&self.runtime, self.session.audit().fetch_by_query_id(qid))
             .map_err(audit_err)?;
         Ok(rec.map(|inner| PyPerQueryAudit { inner }))
@@ -194,9 +190,19 @@ fn pyobj_to_json(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<serde_json::Value>
     let json_mod = py.import("json")?;
     let dumps = json_mod.getattr("dumps")?;
     let s: String = dumps.call1((obj.bind(py),))?.extract()?;
-    serde_json::from_str(&s).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "query_lineage is not JSON-serializable: {e}"
-        ))
+    serde_json::from_str(&s).map_err(|e| invalid("query_lineage", format!("is not JSON: {e}")))
+}
+
+/// A query id the caller passed, refused unless it is a UUID.
+fn parse_query_id(query_id: &str) -> PyResult<Uuid> {
+    Uuid::parse_str(query_id)
+        .map_err(|e| invalid("query_id", format!("'{query_id}' is not a UUID: {e}")))
+}
+
+/// The taxonomy's refusal of a caller's bad argument.
+fn invalid(argument: &str, reason: String) -> PyErr {
+    crate::error::to_pyerr(jammi_db::error::JammiError::InvalidArgument {
+        argument: argument.into(),
+        reason,
     })
 }

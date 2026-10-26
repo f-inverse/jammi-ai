@@ -149,7 +149,7 @@ async fn aggregate_path_unaffected_by_per_query_rows(backend: BackendKind) {
         eval_type: "embedding".into(),
         model_id: Some(format!("{model_id}::1")),
         source_id: "src".into(),
-        golden_source: "golden".into(),
+        ground_truth: "truth".into(),
         k: Some(10),
         metrics_json: r#"{"recall_at_k":0.7}"#.into(),
         status: "completed".into(),

@@ -15,8 +15,9 @@
 use tonic::Status;
 
 use crate::fine_tune::{
-    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss, Warmup,
+    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, EncoderTraining,
+    FineTuneConfig, FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
+    Warmup,
 };
 
 use crate::proto::training as pb;
@@ -98,21 +99,27 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
         cfg.lr_schedule = lr_schedule_from_proto(c.lr_schedule, cfg.lr_schedule)?;
         cfg.early_stopping_metric =
             early_stopping_metric_from_proto(c.early_stopping_metric, cfg.early_stopping_metric)?;
-        if !c.target_modules.is_empty() {
-            cfg.target_modules = c.target_modules;
-        }
-        if let Some(l) = c.layers_to_transform {
-            cfg.layers_to_transform = Some(l.layers.into_iter().map(|n| n as usize).collect());
+        match c.encoder {
+            None => {}
+            Some(pb::fine_tune_config::Encoder::Adapted(a)) => {
+                cfg.encoder = EncoderTraining::Adapted {
+                    target_modules: a.target_modules,
+                    layers_to_transform: a
+                        .layers_to_transform
+                        .map(|l| l.layers.into_iter().map(|n| n as usize).collect()),
+                    rank_pattern: a
+                        .rank_pattern
+                        .into_iter()
+                        .map(|(k, v)| (k, v as usize))
+                        .collect(),
+                };
+            }
+            Some(pb::fine_tune_config::Encoder::Frozen(pb::FrozenEncoder {})) => {
+                cfg.encoder = EncoderTraining::Frozen;
+            }
         }
         if let Some(v) = c.use_rslora {
             cfg.use_rslora = v;
-        }
-        if !c.rank_pattern.is_empty() {
-            cfg.rank_pattern = c
-                .rank_pattern
-                .into_iter()
-                .map(|(k, v)| (k, v as usize))
-                .collect();
         }
         cfg.init_lora_weights =
             lora_init_mode_from_proto(c.init_lora_weights, cfg.init_lora_weights)?;
@@ -313,18 +320,26 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
         }),
         lr_schedule: lr_schedule_to_proto(config.lr_schedule) as i32,
         early_stopping_metric: early_stopping_metric_to_proto(config.early_stopping_metric) as i32,
-        target_modules: config.target_modules.clone(),
-        layers_to_transform: config.layers_to_transform.as_ref().map(|layers| {
-            pb::LayersToTransform {
-                layers: layers.iter().map(|n| *n as u32).collect(),
-            }
+        encoder: Some(match &config.encoder {
+            EncoderTraining::Adapted {
+                target_modules,
+                layers_to_transform,
+                rank_pattern,
+            } => pb::fine_tune_config::Encoder::Adapted(pb::AdaptedEncoder {
+                target_modules: target_modules.clone(),
+                layers_to_transform: layers_to_transform.as_ref().map(|layers| {
+                    pb::LayersToTransform {
+                        layers: layers.iter().map(|n| *n as u32).collect(),
+                    }
+                }),
+                rank_pattern: rank_pattern
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v as u32))
+                    .collect(),
+            }),
+            EncoderTraining::Frozen => pb::fine_tune_config::Encoder::Frozen(pb::FrozenEncoder {}),
         }),
         use_rslora: Some(config.use_rslora),
-        rank_pattern: config
-            .rank_pattern
-            .iter()
-            .map(|(k, v)| (k.clone(), *v as u32))
-            .collect(),
         init_lora_weights: lora_init_mode_to_proto(config.init_lora_weights) as i32,
         backbone_dtype: backbone_dtype_to_proto(config.backbone_dtype) as i32,
         weight_decay: Some(config.weight_decay),

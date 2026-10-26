@@ -5,15 +5,15 @@ Stands up a real CPU `jammi-server` (the shared `live_server` fixture in
 `RemoteDatabase`, asserting the remote reports agree with an embedded
 `jammi.EmbeddedBackend`'s over the same fixtures: the `patents.parquet` corpus
 embedded with the deterministic `tiny_modernbert` encoder, evaluated against
-the `golden_relevance.csv` golden set; and the deterministic
+the `relevance.csv` ground truth; and the deterministic
 `tiny_modernbert_classifier` run over the same corpus against the
-`tiny_labels.csv` golden labels.
+`tiny_labels.csv` ground-truth labels.
 
 The `live_server` fixture is module-scoped, so its catalog persists across the
 tests in this module. Each test registers its sources under a per-test name
-(`patents_<tag>`, `golden_<tag>`) so the tests' footprints stay disjoint on the
+(`patents_<tag>`, `truth_<tag>`) so the tests' footprints stay disjoint on the
 one shared server — the embedded peer is already isolated by its own
-`tmp_path`. The golden set is then addressed by that source's full catalog path
+`tmp_path`. The ground truth is then addressed by that source's full catalog path
 (`<source>.public.<table>`).
 
 The parity assertion is key-structure equality everywhere plus per-metric
@@ -50,7 +50,7 @@ FIXTURES = REPO_ROOT / "tests" / "fixtures"
 COOKBOOK_FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
 
 PATENTS_URL = f"file://{FIXTURES / 'patents.parquet'}"
-GOLDEN_URL = f"file://{FIXTURES / 'golden_relevance.csv'}"
+TRUTH_URL = f"file://{FIXTURES / 'relevance.csv'}"
 TINY_MODERNBERT = f"local:{FIXTURES / 'tiny_modernbert'}"
 
 TINY_CLASSIFIER = f"local:{FIXTURES / 'tiny_modernbert_classifier'}"
@@ -157,12 +157,12 @@ def _register_corpus(db, tag: str) -> str:
     return table
 
 
-def _register_relevance_golden(db, tag: str) -> str:
-    """Register the retrieval golden set under a per-test name; return its full
-    catalog path (`<source>.public.golden_relevance`)."""
-    source = f"golden_rel_{tag}"
-    db.add_source(source, url=GOLDEN_URL, format="csv")
-    return f"{source}.public.golden_relevance"
+def _register_relevance(db, tag: str) -> str:
+    """Register the retrieval ground truth under a per-test name; return its full
+    catalog path (`<source>.public.relevance`)."""
+    source = f"truth_rel_{tag}"
+    db.add_source(source, url=TRUTH_URL, format="csv")
+    return f"{source}.public.relevance"
 
 
 def test_eval_embeddings_and_per_query_round_trip_matches_embedded(
@@ -170,7 +170,7 @@ def test_eval_embeddings_and_per_query_round_trip_matches_embedded(
 ):
     """`eval_embeddings` returns the same report shape and `_TOL`-close metrics
     on both transports (cohort tags included), and `eval_per_query` reads back
-    one structurally identical persisted row per golden query."""
+    one structurally identical persisted row per ground-truth query."""
     tag = "emb"
     remote = jammi.connect(live_server)
     embedded = jammi.connect(f"file://{tmp_path}")
@@ -180,10 +180,10 @@ def test_eval_embeddings_and_per_query_round_trip_matches_embedded(
         per_query_rows = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
             _register_corpus(db, tag)
-            golden = _register_relevance_golden(db, tag)
+            truth = _register_relevance(db, tag)
             report = db.eval_embeddings(
                 source=f"patents_{tag}",
-                golden_source=golden,
+                ground_truth=truth,
                 k=10,
                 cohorts=cohorts,
             )
@@ -238,11 +238,11 @@ def test_eval_compare_round_trip_matches_embedded(live_server, tmp_path):
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
             table = _register_corpus(db, tag)
-            golden = _register_relevance_golden(db, tag)
+            truth = _register_relevance(db, tag)
             report = db.eval_compare(
                 embedding_tables=[table, table],
                 source=f"patents_{tag}",
-                golden_source=golden,
+                ground_truth=truth,
                 k=10,
             )
             # Each table's nested embedding report carries an unordered
@@ -311,19 +311,19 @@ def test_eval_compare_nondegenerate_significance_matches_embedded(
         for name, db in (("remote", remote), ("embedded", embedded)):
             baseline = _embed_with(db, tag, TINY_MODERNBERT, "mb")
             treatment = _embed_with(db, tag, TINY_BERT, "bert")
-            golden = _register_relevance_golden(db, tag)
+            truth = _register_relevance(db, tag)
             # Run twice on the SAME transport to pin within-transport
             # reproducibility independently of the cross-transport parity.
             first = db.eval_compare(
                 embedding_tables=[baseline, treatment],
                 source=f"patents_{tag}_mb",
-                golden_source=golden,
+                ground_truth=truth,
                 k=10,
             )
             second = db.eval_compare(
                 embedding_tables=[baseline, treatment],
                 source=f"patents_{tag}_mb",
-                golden_source=golden,
+                ground_truth=truth,
                 k=10,
             )
             for report in (first, second):
@@ -377,20 +377,20 @@ def test_eval_inference_ner_round_trip_matches_embedded(live_server, tmp_path):
     """
     tag = "infner"
     source = f"patents_ner_{tag}"
-    golden_source = f"golden_ner_{tag}"
+    ground_truth = f"truth_ner_{tag}"
     remote = jammi.connect(live_server)
     embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
             db.add_source(source, url=NER_CORPUS_URL, format="parquet")
-            db.add_source(golden_source, url=NER_GOLD_URL, format="csv")
+            db.add_source(ground_truth, url=NER_GOLD_URL, format="csv")
             reports[name] = db.eval_inference(
                 model=TINY_NER,
                 source=source,
                 columns=["text"],
                 task="ner",
-                golden_source=f"{golden_source}.public.tiny_ner_gold",
+                ground_truth=f"{ground_truth}.public.tiny_ner_gold",
                 label_column="label",
             )
 
@@ -421,23 +421,23 @@ def test_eval_inference_classification_round_trip_matches_embedded(
     """`eval_inference` (classification) over the deterministic classifier
     fixture returns the same report shape and `_TOL`-close metrics on both
     transports: a `{"task": "classification"}`-tagged aggregate and one tagged
-    per-record entry per golden-labelled row."""
+    per-record entry per truth-labelled row."""
     tag = "infcls"
     source = f"patents_{tag}"
-    golden_source = f"golden_lbl_{tag}"
+    ground_truth = f"truth_lbl_{tag}"
     remote = jammi.connect(live_server)
     embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
             db.add_source(source, url=PATENTS_URL, format="parquet")
-            db.add_source(golden_source, url=LABELS_URL, format="csv")
+            db.add_source(ground_truth, url=LABELS_URL, format="csv")
             reports[name] = db.eval_inference(
                 model=TINY_CLASSIFIER,
                 source=source,
                 columns=["abstract"],
                 task="classification",
-                golden_source=f"{golden_source}.public.tiny_labels",
+                ground_truth=f"{ground_truth}.public.tiny_labels",
                 label_column="label",
             )
 
@@ -454,23 +454,23 @@ def test_eval_inference_classification_round_trip_matches_embedded(
         remote.close()
 
 
-def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
+def test_eval_embeddings_empty_truth_set_zero_aggregate_matches_embedded(
     live_server, tmp_path
 ):
-    """An empty golden set yields an all-zero aggregate on BOTH transports.
+    """An empty ground truth yields an all-zero aggregate on BOTH transports.
 
-    The retrieval metrics are guarded against a zero-query golden set (the
+    The retrieval metrics are guarded against a zero-query ground truth (the
     aggregate defaults to 0.0 with no queries to average), so the report is a
     well-formed zero report — never a NaN, never a divergence. The remote and
-    embedded engines return that identical zero aggregate over a golden set
+    embedded engines return that identical zero aggregate over a ground truth
     that is schema-valid (typed `query_id` / `query_text` / `relevant_id`
     columns) but carries zero rows. A zero-row parquet preserves its column
-    types where a header-only CSV would infer them as Null, so the golden
+    types where a header-only CSV would infer them as Null, so the ground truth
     type-checks and resolves to zero queries on both transports."""
     tag = "empty"
     source = f"patents_{tag}"
-    golden_source = f"golden_empty_{tag}"
-    empty_golden = tmp_path / "empty_golden.parquet"
+    ground_truth = f"truth_empty_{tag}"
+    empty_truth = tmp_path / "empty_truth.parquet"
     pq.write_table(
         pa.table(
             {
@@ -479,9 +479,9 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
                 "relevant_id": pa.array([], type=pa.string()),
             }
         ),
-        empty_golden,
+        empty_truth,
     )
-    empty_url = f"file://{empty_golden}"
+    empty_url = f"file://{empty_truth}"
 
     remote = jammi.connect(live_server)
     embedded = jammi.connect(f"file://{tmp_path / 'embed'}")
@@ -489,7 +489,7 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
             db.add_source(source, url=PATENTS_URL, format="parquet")
-            db.add_source(golden_source, url=empty_url, format="parquet")
+            db.add_source(ground_truth, url=empty_url, format="parquet")
             db.generate_embeddings(
                 source=source,
                 model=TINY_MODERNBERT,
@@ -499,7 +499,7 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
             )
             reports[name] = db.eval_embeddings(
                 source=source,
-                golden_source=f"{golden_source}.public.empty_golden",
+                ground_truth=f"{ground_truth}.public.empty_truth",
                 k=10,
             )
 
@@ -519,7 +519,7 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
 def test_eval_error_paths_match_embedded(live_server, tmp_path):
     """A bad call is rejected by BOTH transports, mapping the same engine error.
 
-    An unknown `golden_source` is a source the engine has no row for, and a
+    An unknown `ground_truth` is a source the engine has no row for, and a
     caller catches the same `NotFound` on either transport (the server maps the
     engine error onto a status; the client maps the status back onto the
     taxonomy). An unknown `task` string is
@@ -546,13 +546,13 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
 
         # The error a caller catches is the same typed error on either transport.
         for db in (remote, embedded):
-            # Unknown golden_source: the engine has no row for the source and
+            # Unknown ground_truth: the engine has no row for the source and
             # refuses it by name as a NotFound; the remote client maps the
             # server's status back onto the same class.
             with pytest.raises(NotFound, match="source `no_such` not found"):
                 db.eval_embeddings(
                     source=source,
-                    golden_source="no_such.public.relevance",
+                    ground_truth="no_such.public.relevance",
                     k=10,
                 )
             # Unknown task string: rejected before any inference runs — the
@@ -564,7 +564,7 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
                     source=source,
                     columns=["abstract"],
                     task="not_a_task",
-                    golden_source="ignored.public.labels",
+                    ground_truth="ignored.public.labels",
                     label_column="label",
                 )
     finally:

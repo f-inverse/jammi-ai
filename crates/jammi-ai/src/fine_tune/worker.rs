@@ -2,7 +2,7 @@
 //! lease, reconstructs each from its persisted spec, executes it while
 //! renewing the lease, and records the terminal outcome.
 //!
-//! One worker drives every job kind ([`COMPILED_KINDS`]). A
+//! One worker drives every job kind ([`JobKind::ALL`]). A
 //! [`JobWorker::run_until`] tick — run only under
 //! [`EmbeddedWorker::spawn`]/[`EmbeddedWorker::spawn_worker`]'s claimed
 //! session slot (one claim loop per session is structural, not merely
@@ -145,9 +145,13 @@ use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, 
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
 };
-use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerState};
+use jammi_db::catalog::jobs_repo::{
+    AssemblyOutcome, JobProgress, ProgressReporter, TrainingSetAssembly, WorkerState,
+};
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::ModelLocation;
+use jammi_db::catalog::result_repo::JobAttempt;
+use jammi_db::catalog::status::{JobKind, JobKinds, JobPhase};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
@@ -182,6 +186,7 @@ use crate::model::hub::HubSource;
 use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
+use jammi_wire::fine_tune::EncoderTraining;
 use jammi_wire::proto::gang::{bind, AbortReason, Assign, Bind, InlineTransport, NcclTransport};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
@@ -251,64 +256,6 @@ pub(crate) fn mint_instance_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Every job kind this binary can execute — the vocabulary
-/// `resolve_kinds` validates `[worker] kinds` against at startup.
-/// The three training kinds dispatch through `JobWorker::run_spec`; the
-/// seven compute kinds (every embedded synchronous compute verb is one of
-/// [`crate::jobs::ComputeSpec`]'s variants) dispatch through
-/// [`crate::jobs::execute_compute`].
-pub const COMPILED_KINDS: &[&str] = &[
-    "fine_tune",
-    "graph_fine_tune",
-    "context_predictor",
-    "neighbor_graph",
-    "propagate",
-    "graph_structure",
-    "asof_join",
-    "lexical_index",
-    "embedding",
-    "infer",
-];
-
-/// Whether `kind` is one of [`crate::jobs::ComputeSpec`]'s variants (dispatched
-/// through [`crate::jobs::execute_compute`]) rather than a [`TrainingSpec`]
-/// variant (dispatched through [`JobWorker::run_spec`]).
-pub(crate) fn is_compute_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "neighbor_graph"
-            | "propagate"
-            | "graph_structure"
-            | "asof_join"
-            | "lexical_index"
-            | "embedding"
-            | "infer"
-    )
-}
-
-/// Resolve `[worker] kinds` against [`COMPILED_KINDS`] at startup.
-/// `WorkerKinds::All` claims every compiled
-/// kind; `WorkerKinds::Only` is validated member-by-member and returned
-/// as-is — an unknown name is a typed [`JammiError::Config`], never a
-/// silently-ignored token.
-fn resolve_kinds(kinds: &jammi_db::config::WorkerKinds) -> Result<Vec<String>> {
-    use jammi_db::config::WorkerKinds;
-    match kinds {
-        WorkerKinds::All(_) => Ok(COMPILED_KINDS.iter().map(|s| s.to_string()).collect()),
-        WorkerKinds::Only(list) => {
-            for k in list {
-                if !COMPILED_KINDS.contains(&k.as_str()) {
-                    return Err(JammiError::Config(format!(
-                        "[worker] kinds names unknown job kind '{k}' -- compiled kinds are: {}",
-                        COMPILED_KINDS.join(", ")
-                    )));
-                }
-            }
-            Ok(list.clone())
-        }
-    }
-}
-
 /// This host's shutdown phase: `Running` until a
 /// DRAIN or RELEASE begins; `Draining` finishes the in-flight job and stops
 /// claiming; `Releasing` hands every lease back and stops at once. Owned by
@@ -371,7 +318,7 @@ pub struct HostAdmission {
     registry: Arc<InstanceRegistration>,
     /// How a coordinator on this host reaches a gang member's `RunRank`
     /// installed ONCE by the process that mounts
-    /// the gang listener (`jammi-server`'s `OssServer::bind`, with
+    /// the gang listener (`jammi-server`'s `Server::bind`, with
     /// `gang_rounds::dial_member` behind it — the engine crate owns no
     /// transport), absent in a library process, which therefore cannot
     /// coordinate a `Peer` gang and says so as an assembly outcome
@@ -1226,13 +1173,13 @@ pub fn worker_devices(
     config: &jammi_db::config::JammiConfig,
     compute_device: ComputeDevice,
 ) -> Vec<DeviceFact> {
-    let kind = compute_device.kind().wire_str();
+    let kind = compute_device.kind();
     match config.worker.topology(&config.gpu) {
         Ok(topology) => topology
             .rank_devices()
             .iter()
             .map(|&ordinal| DeviceFact {
-                kind: kind.to_string(),
+                kind,
                 ordinal: ordinal.max(0) as u32,
             })
             .collect(),
@@ -1397,9 +1344,8 @@ pub struct JobWorker {
     /// with. `intervals.lease` is the single source of truth threaded to both
     /// the claim and the reclaim path.
     intervals: WorkerIntervals,
-    /// The job kinds this worker claims (`[worker] kinds`, validated against
-    /// [`COMPILED_KINDS`] by [`resolve_kinds`] at construction).
-    kinds: Vec<String>,
+    /// The job kinds this worker claims (`[worker] kinds`).
+    kinds: JobKinds,
     /// The session's [`HostAdmission`] (its own `Arc`, so holding it keeps
     /// no session alive): the phase and holder every loop this worker
     /// drives runs under.
@@ -1452,20 +1398,16 @@ pub(crate) async fn materialize_graph_training_set(
         let ids = batch
             .column_by_name(&sources.id_column)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "node id column '{}' is not text",
-                    sources.id_column
-                ))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("node id column '{}' is not text", sources.id_column),
             })?;
         let texts = batch
             .column_by_name(&sources.text_column)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "node text column '{}' is not text",
-                    sources.text_column
-                ))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("node text column '{}' is not text", sources.text_column),
             })?;
         for (id, text) in ids.into_iter().zip(texts) {
             nodes.push(TextNode::new(id, text));
@@ -1491,14 +1433,16 @@ pub(crate) async fn materialize_graph_training_set(
         let srcs = batch
             .column_by_name(src_name)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!("edge src column '{src_name}' is not text"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("edge src column '{src_name}' is not text"),
             })?;
         let dsts = batch
             .column_by_name(dst_name)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!("edge dst column '{dst_name}' is not text"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("edge dst column '{dst_name}' is not text"),
             })?;
         for (src, dst) in srcs.into_iter().zip(dsts) {
             edges.push(GraphEdge {
@@ -1785,8 +1729,11 @@ impl JobWorker {
     pub fn new(session: &Arc<InferenceSession>) -> Result<Self> {
         let config = session.inner_config();
         let intervals = config.worker.worker_intervals(config.lease.intervals()?)?;
-        let kinds = resolve_kinds(&config.worker.kinds)?;
-        Ok(Self::with_intervals_and_kinds(session, intervals, kinds))
+        Ok(Self::with_intervals_and_kinds(
+            session,
+            intervals,
+            config.worker.kinds.resolve(),
+        ))
     }
 
     /// Build a worker over a session with explicit, already-validated timing
@@ -1799,7 +1746,7 @@ impl JobWorker {
     pub fn with_intervals_and_kinds(
         session: &Arc<InferenceSession>,
         intervals: WorkerIntervals,
-        kinds: Vec<String>,
+        kinds: JobKinds,
     ) -> Self {
         Self {
             session: Arc::downgrade(session),
@@ -1811,14 +1758,10 @@ impl JobWorker {
     }
 
     /// Build a worker over a session with explicit, already-validated timing
-    /// and every compiled kind. Kept for callers that do not need to select a
-    /// kind subset (most tests; a single-process deployment).
+    /// and every kind. Kept for callers that do not need to select a kind
+    /// subset (most tests; a single-process deployment).
     pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
-        Self::with_intervals_and_kinds(
-            session,
-            intervals,
-            COMPILED_KINDS.iter().map(|s| s.to_string()).collect(),
-        )
+        Self::with_intervals_and_kinds(session, intervals, JobKinds::all())
     }
 
     /// The worker's stable id (`claimed_by` value). Exposed for tests that assert
@@ -1879,7 +1822,7 @@ impl JobWorker {
             session.instance_registration(),
             &self.worker_id,
             WorkerFacts {
-                kinds: self.kinds.join(","),
+                kinds: self.kinds.clone(),
                 state: WorkerState::Warming,
                 devices: worker_devices(session.inner_config(), session.compute_device()),
             },
@@ -1911,7 +1854,7 @@ impl JobWorker {
                 session.instance_registration(),
                 &self.worker_id,
                 WorkerFacts {
-                    kinds: self.kinds.join(","),
+                    kinds: self.kinds.clone(),
                     state: WorkerState::Claiming,
                     devices: worker_devices(session.inner_config(), session.compute_device()),
                 },
@@ -1973,11 +1916,10 @@ impl JobWorker {
                 }
                 continue;
             };
-            let kind_refs: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
             #[cfg(feature = "test-hooks")]
             loop_test_hooks::record_claim_next(&self.worker_id);
             let claimed = match catalog
-                .claim_next(&self.worker_id, &kind_refs, self.intervals.lease)
+                .claim_next(&self.worker_id, self.kinds.as_slice(), self.intervals.lease)
                 .await
             {
                 Ok(c) => c,
@@ -2149,7 +2091,7 @@ impl JobWorker {
         let attempt = record.attempts;
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
-        if is_compute_kind(&record.kind) {
+        if !record.kind.trains_a_model() {
             self.run_claimed_compute_job(session, &catalog, shared, &record)
                 .await;
             return;
@@ -2195,7 +2137,7 @@ impl JobWorker {
         };
         let Some(spec) = job_spec.as_training_spec() else {
             // `record.kind` (the `jobs.kind` column) named a training kind,
-            // routing this attempt here at all (the `is_compute_kind` guard
+            // routing this attempt here at all (the `trains_a_model` guard
             // above), but the persisted `spec` JSON's own `kind` decoded to
             // a compute variant — the two columns disagree. Same failure
             // shape as an undeserialisable spec: nothing has run yet.
@@ -2458,14 +2400,21 @@ impl JobWorker {
                 .await;
             }
             Err(WorkerJobError::Failed(error)) => {
-                tracing::error!(job_id = %job_id, error = %error, "training job failed");
+                // A job refused on the caller's own condition (its config, the
+                // data it named) reaches the caller typed through `wait`; only
+                // an engine or dependency fault is an operator's error.
+                if error.class().is_caller_condition() {
+                    tracing::info!(job_id = %job_id, error = %error, "training job refused");
+                } else {
+                    tracing::error!(job_id = %job_id, error = %error, "training job failed");
+                }
                 record_failed(
                     holder,
                     &catalog,
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    failed_job_message(&error),
+                    error.to_string(),
                 )
                 .await;
                 // Same reasoning as the `Cancelled` arm above: covers a panic,
@@ -3032,10 +2981,9 @@ impl JobWorker {
                         .map_err(WorkerJobError::from)?
                         .map(|manifest| manifest.artifact.0)
                         .ok_or_else(|| {
-                            WorkerJobError::from(JammiError::FineTune(format!(
-                                "training set '{}' has no materialization manifest",
-                                table.table_name()
-                            )))
+                            WorkerJobError::from(JammiError::MissingManifest {
+                                table: table.table_name().to_string(),
+                            })
                         })?
                 };
                 // The training-set identity pair a `Peer` gang's members
@@ -3160,8 +3108,21 @@ impl JobWorker {
                 // publishes the artifact and registers the model row through the
                 // tenant-pinned catalog (the same path the fine-tune kinds take),
                 // so the model lands under the job's tenant.
+                let progress = ProgressReporter::new(
+                    JobAttempt {
+                        job_id,
+                        instance_id: &self.worker_id,
+                        attempts: attempt,
+                    }
+                    .to_buf(),
+                );
                 session
-                    .run_context_predictor_training(source, predictor_spec, cancel)
+                    .run_context_predictor_training(
+                        source,
+                        predictor_spec,
+                        Arc::clone(cancel),
+                        Some((Arc::clone(catalog), progress)),
+                    )
                     .await
                     .map(|trained| AttemptOutput::Trained(Box::new(trained)))
                     .map_err(|e| classify(cancel, e))
@@ -3187,7 +3148,7 @@ impl JobWorker {
         materialization: &FineTuneMaterialization,
     ) -> std::result::Result<Option<ReusedModel>, WorkerJobError> {
         use jammi_db::catalog::jobs_repo::{FinishJobReusingArtifactParams, ReuseFinish};
-        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         let definition_hash = materialization
             .definition_hash()
             .map_err(WorkerJobError::from)?;
@@ -3281,7 +3242,7 @@ impl JobWorker {
             source: training_source,
             materialization,
         } = run;
-        let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let output_model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
 
         // The attempt's rank set is fixed here, whatever its topology: record
@@ -5381,12 +5342,14 @@ async fn bind_training_source(
         // reports come from one classifier, so a mismatch is a broken
         // engine invariant rather than a caller error — and it must be
         // loud: it would mean two formats sharing one definition hash.
-        if loader.format().format_tag() != detected.format_tag() {
-            return Err(JammiError::Other(format!(
-                "training set was committed as format '{}' but its loader reports '{}': the \
-                 column classifier and the loader disagree",
+        let loaded = loader
+            .format()
+            .map(crate::fine_tune::data::TrainingFormat::format_tag);
+        if loaded != Some(detected.format_tag()) {
+            return Err(JammiError::Internal(format!(
+                "training set was committed as format '{}' but its loader reports {loaded:?}: \
+                 the column classifier and the loader disagree",
                 detected.format_tag(),
-                loader.format().format_tag()
             )));
         }
         return Ok(crate::fine_tune::source::TrainingSource::Resident(loader));
@@ -5701,7 +5664,7 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         job_id: &str,
-        kind: &str,
+        kind: JobKind,
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
@@ -5790,7 +5753,7 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
         job_id: &str,
-        kind: &str,
+        kind: JobKind,
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
         attempt: u32,
@@ -6029,10 +5992,7 @@ impl JobWorker {
                 } else if let Some(fault) = coordinator.fault() {
                     (CoordinatorEnd::LinkFault(fault), None)
                 } else {
-                    (
-                        CoordinatorEnd::TrainingFailed(failed_job_message(&error)),
-                        None,
-                    )
+                    (CoordinatorEnd::TrainingFailed(error.to_string()), None)
                 }
             }
         }
@@ -6491,6 +6451,21 @@ async fn publish_artifact(
     attempt: u32,
     dir: &tempfile::TempDir,
 ) -> Result<StagedArtifact> {
+    let attempt_ref = JobAttempt {
+        job_id,
+        instance_id: worker_id,
+        attempts: attempt,
+    };
+    catalog
+        .progress_job(
+            attempt_ref,
+            JobProgress {
+                phase: JobPhase::Publishing,
+                done: None,
+                total: None,
+            },
+        )
+        .await?;
     let mut files: Vec<(String, Bytes)> = Vec::new();
     for entry in std::fs::read_dir(dir.path())? {
         let entry = entry?;
@@ -6624,9 +6599,9 @@ async fn settle_reclaim(
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
     Cancelled,
-    /// The job failed for a real reason; record it as `failed` + the error's
-    /// message ([`failed_job_message`]), and keep the error typed for the
-    /// attempt's own end.
+    /// The job failed for a real reason; record it as `failed` with the
+    /// error's message — the text a waiter's `JobFailed` carries verbatim —
+    /// and keep the error typed for the attempt's own end.
     Failed(JammiError),
     /// The coordinator body ended this attempt WITHOUT a run reaching a
     /// terminal state (an assembly outcome, or a gang fault mid-run — see
@@ -6638,35 +6613,6 @@ enum WorkerJobError {
     /// re-assembles once its cooldown passes. The string is the reason, for
     /// the log.
     Abandoned(String),
-}
-
-/// Render a terminal training failure's message for `record_failed` to
-/// persist as the job's durable `error_message`.
-///
-/// The stored value is the RAW inner message, never pre-fixed with
-/// "Fine-tune error: " here. That prefix is `JammiError::FineTune`'s own
-/// `Display` output, and two callers re-wrap the stored message in a fresh
-/// `JammiError::FineTune` when they read a `failed` job back —
-/// `TrainingJob::wait()` (`training_job.rs`) and the Python binding's
-/// `poll_until_terminal` (`jammi-python/src/job.rs`) — so those two surfaces
-/// each apply the prefix exactly once, on read. Two OTHER surfaces read the
-/// same durable `error_message` unprefixed and never re-wrap it: the gRPC
-/// `JobStatus.error` field (`jammi-server/src/grpc/job.rs`) and
-/// the Python `Database.list_training_jobs`/`get_training_job` `error` entry
-/// (`jammi-python/src/database.rs`) both relay the raw column verbatim.
-/// Storing `e.to_string()` unconditionally for a `FineTune`-typed source
-/// error would have `wait()`'s (or `poll_until_terminal`'s) re-wrap double
-/// the prefix verbatim: "Fine-tune error: Fine-tune error: …" reaching a
-/// Python caller as `TrainingError("Fine-tune error: Fine-tune error:
-/// …")`. Stripped to the raw inner message for that one variant here avoids
-/// that double; every other variant's own (DIFFERENT) prefix is preserved
-/// unchanged — "Fine-tune error: Model error: …" is one informative
-/// nesting, not a literal duplicate.
-fn failed_job_message(e: &JammiError) -> String {
-    match e {
-        JammiError::FineTune(msg) => msg.clone(),
-        other => other.to_string(),
-    }
 }
 
 impl From<JammiError> for WorkerJobError {
@@ -6684,27 +6630,26 @@ impl From<JammiError> for WorkerJobError {
 /// this function's output is durable and caller-facing). A non-OOM error
 /// passes through byte-identical.
 ///
-/// The echoed config and the remedies both differ by adapter shape, because
-/// `backbone_dtype` only takes effect on the encoder-adapters arm:
-/// `build_encoder_adapters` — reached only when `config.target_modules` is
-/// non-empty — is the sole caller of [`validate_backbone_precision`] and
-/// `compute_precision_to_dtype`. The projection-head arm (`target_modules`
-/// empty, the default) loads the frozen backbone but never re-dtypes it, so
-/// `backbone_dtype` is omitted from the echoed config entirely on that arm
-/// (never echoed and then disclaimed), and recommending `backbone_dtype:
-/// bf16` there would be dead advice.
+/// The echoed config and the remedies both differ by encoder training,
+/// because `backbone_dtype` only takes effect on an adapted encoder:
+/// `build_encoder_adapters` — reached only for
+/// [`EncoderTraining::Adapted`] — is the sole caller of
+/// [`validate_backbone_precision`] and `compute_precision_to_dtype`. A frozen
+/// encoder's backbone loads but is never re-dtyped, so `backbone_dtype` is
+/// omitted from the echoed config entirely on that arm (never echoed and then
+/// disclaimed), and recommending `backbone_dtype: bf16` there would be dead
+/// advice.
 ///
-/// - **Encoder adapters** (`target_modules` non-empty): config echo includes
-///   `backbone_dtype`; (1) `backbone_dtype: bf16` first — substantially
-///   reduces the frozen backbone's weight and activation residency; bf16
-///   requires CUDA, refused before training starts if unmet (see
-///   [`validate_backbone_precision`]); (2) a smaller `batch_size`, or trade
-///   batch size for `gradient_accumulation_steps`; (3) a smaller
+/// - **Adapted encoder**: config echo includes `backbone_dtype`; (1)
+///   `backbone_dtype: bf16` first — substantially reduces the frozen
+///   backbone's weight and activation residency; bf16 requires CUDA, refused
+///   before training starts if unmet (see [`validate_backbone_precision`]);
+///   (2) a smaller `batch_size`, or trade batch size for
+///   `gradient_accumulation_steps`; (3) a smaller `max_seq_length`.
+/// - **Frozen encoder**: config echo omits `backbone_dtype`; the message
+///   states outright that it does not apply; (1) a smaller `batch_size`, or
+///   trade batch size for `gradient_accumulation_steps`; (2) a smaller
 ///   `max_seq_length`.
-/// - **Projection head** (`target_modules` empty): config echo omits
-///   `backbone_dtype`; the message states outright that it does not apply;
-///   (1) a smaller `batch_size`, or trade batch size for
-///   `gradient_accumulation_steps`; (2) a smaller `max_seq_length`.
 ///
 /// The headline names the mechanism only as strongly as the matched text
 /// supports: this function never threads through which device the job
@@ -6722,17 +6667,16 @@ fn classify_training_oom(config: &FineTuneConfig, e: JammiError) -> JammiError {
     } else {
         "out of memory (device or host)"
     };
-    // The echoed config is arm-appropriate, not echo-then-disclaim: the
-    // projection-head arm never reads `backbone_dtype` for anything, so it
-    // is simply absent from the echo rather than named and then immediately
-    // disclaimed.
-    let (config_echo, remedies) = if config.target_modules.is_empty() {
+    // The echoed config is arm-appropriate, not echo-then-disclaim: a frozen
+    // encoder never reads `backbone_dtype` for anything, so it is simply
+    // absent from the echo rather than named and then immediately disclaimed.
+    let (config_echo, remedies) = if matches!(config.encoder, EncoderTraining::Frozen) {
         (
             format!(
                 "batch_size={}, max_seq_length={}",
                 config.batch_size, config.max_seq_length
             ),
-            "backbone_dtype does not apply to projection-head runs. Try, in order: \
+            "backbone_dtype does not apply to a frozen encoder. Try, in order: \
              (1) a smaller batch_size, or trade batch size for \
              gradient_accumulation_steps; (2) a smaller max_seq_length."
                 .to_string(),
@@ -7263,7 +7207,7 @@ pub mod training_test_hooks {
     /// One rank's target as built by `run_fine_tune_blocking`, before any
     /// step: the dropout seed it was given, each head layer's own dropout
     /// Philox seed (`LoraLinear::dropout_run_seed`; empty for an
-    /// encoder-adapters target, whose per-site seeds are not enumerable
+    /// adapted-encoder target, whose per-site seeds are not enumerable
     /// through `AnyEncoder`), and a SHA-256 over the trainable weights in
     /// canonical name order.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7286,14 +7230,15 @@ pub mod training_test_hooks {
         target: &crate::fine_tune::target::TrainingTarget,
     ) -> jammi_db::error::Result<()> {
         use sha2::Digest;
-        let layer_dropout_seeds = match target {
-            crate::fine_tune::target::TrainingTarget::ProjectionHead { head } => head
-                .layers
-                .iter()
-                .map(|(_, layer)| layer.dropout_run_seed())
-                .collect(),
-            crate::fine_tune::target::TrainingTarget::EncoderAdapters(_) => Vec::new(),
-        };
+        let layer_dropout_seeds = target
+            .head()
+            .into_iter()
+            .flat_map(|head| {
+                head.layers
+                    .iter()
+                    .map(|(_, layer)| layer.dropout_run_seed())
+            })
+            .collect();
         let weights = target.named_trainable_weights()?;
         let mut names: Vec<&String> = weights.keys().collect();
         names.sort();
@@ -7412,7 +7357,7 @@ pub mod training_test_hooks {
     /// Every member end the coordinator read for `job_id`'s output model
     /// (`fine_tuned_model_id(job_id)`), in reading order: `(rank, Debug)`.
     pub fn member_ends_for(job_id: &str) -> Vec<(u32, String)> {
-        let model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
+        let model_id = crate::fine_tune::spec::fine_tuned_model_id(job_id);
         member_ends()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -7722,9 +7667,8 @@ mod training_test_hooks_tests {
 }
 
 /// Record a terminal `Failed` status for a job this worker owns, surfacing
-/// the cause on `jobs.error` so a [`crate::fine_tune::training_job::TrainingJob::wait`]
-/// (or [`crate::jobs::JobHandle::wait`]) observer sees the failure instead of
-/// an indefinite `running` state.
+/// the cause on `jobs.error` so a [`crate::jobs::JobHandle::wait`] observer
+/// sees the failure instead of an indefinite `running` state.
 ///
 /// The write is lease-guarded (the failure peer of the finalize CAS): it lands
 /// only while this worker still holds the lease (`claimed_by = worker_id AND
@@ -8065,8 +8009,8 @@ struct RunFineTuneParams {
 }
 
 /// Run LoRA fine-tuning in a blocking context, checking `cancel` at every epoch
-/// boundary. Reconstructs the training target (projection head or encoder
-/// adapters) and drives the trainer. The loop trains and persists the adapter
+/// boundary. Reconstructs the training target (a frozen or an adapted encoder,
+/// and its head) and drives the trainer. The loop trains and persists the adapter
 /// but writes no terminal status — the worker registers the output model and
 /// runs the lease-guarded finalize after this returns. Returns the
 /// [`crate::fine_tune::trainer::TrainingResult`] (adapter path + run metrics)
@@ -8116,125 +8060,91 @@ fn run_fine_tune_blocking(
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let target = if config.target_modules.is_empty() {
-        let head = if task == ModelTask::Classification {
-            // `num_classes` from the SAME source: a `Resident` loader's
-            // `TrainingFormat::Classification { num_classes }` (built from
-            // the eager `BTreeSet` pass), or a `Streamed` source's
-            // `StreamedSet::num_classes()` (built from the worker's own
-            // whole-table vocabulary sweep) — both are the identical
-            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
-            // doc), so the head is sized identically either way.
-            let num_classes = match &training_source {
-                crate::fine_tune::source::TrainingSource::Resident(loader) => {
-                    match loader.format() {
-                        crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
-                            num_classes
-                        }
-                        _ => {
-                            return Err(JammiError::FineTune(
-                                "Classification task requires classification training data \
-                                 format"
-                                    .into(),
-                            ))
-                        }
-                    }
-                }
-                crate::fine_tune::source::TrainingSource::Streamed(streamed) => {
-                    streamed.num_classes().ok_or_else(|| {
-                        JammiError::FineTune(
-                            "Classification task requires classification training data format"
-                                .into(),
-                        )
-                    })?
-                }
-            };
-            crate::fine_tune::lora::build_classification_head_for_rank(
+    let target = match config.encoder {
+        EncoderTraining::Frozen => {
+            let head = build_task_head(TaskHeadParams {
+                task,
                 hidden_size,
-                num_classes,
-                &config,
-                &varmap,
-                &vb,
+                encoder: &config.encoder,
+                source: &training_source,
+                config: &config,
+                varmap: &varmap,
+                vb: &vb,
                 dropout_seed,
-            )?
-        } else if task == ModelTask::Regression {
-            let output_dim = match config.regression_loss.unwrap_or_default() {
-                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
-                _ => 2,
-            };
-            crate::fine_tune::lora::build_distribution_head_for_rank(
-                hidden_size,
-                output_dim,
-                &config,
-                &varmap,
-                &vb,
+            })?
+            .ok_or_else(|| {
+                JammiError::Internal("a frozen encoder trains a head for every task".into())
+            })?;
+            // `backbone_dtype` never takes effect on this arm (see
+            // `validate_backbone_precision`'s doc), so there is no encoder to
+            // probe fused-op admission against — the report still names the
+            // resolved device + compiled capabilities, with an empty
+            // `ops`/honest "no probe attempted" `flash` reason (never a
+            // fabricated per-op measurement for an arm that never ran one —
+            // see `flash_report_no_probe_attempted`'s doc).
+            compute_and_persist_acceleration_report(
+                &catalog,
+                &job_id,
+                &worker_id,
+                attempt,
+                role,
+                &device,
+                config.backbone_dtype,
+                None,
+                None,
+            );
+            crate::fine_tune::target::TrainingTarget::FrozenEncoder { head }
+        }
+        EncoderTraining::Adapted { .. } => {
+            let (mut encoder, adapter_cfg) = build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &config,
+                task,
+                varmap: &varmap,
+                device: &device,
+                hub: &hub,
                 dropout_seed,
-            )?
-        } else {
-            crate::fine_tune::lora::build_projection_head_for_rank(
-                hidden_size,
-                &config,
-                &varmap,
-                &vb,
+            })?;
+            let head = build_task_head(TaskHeadParams {
+                task,
+                hidden_size: encoder.hidden_size(),
+                encoder: &config.encoder,
+                source: &training_source,
+                config: &config,
+                varmap: &varmap,
+                vb: &vb,
                 dropout_seed,
-            )?
-        };
-        // `backbone_dtype` never takes effect on this arm (see
-        // `validate_backbone_precision`'s doc), so there is no encoder to probe
-        // fused-op admission against — the report still names the resolved
-        // device + compiled capabilities, with an empty `ops`/honest "no probe
-        // attempted" `flash` reason (never a fabricated per-op measurement for
-        // an arm that never ran one — see `flash_report_no_probe_attempted`'s
-        // doc).
-        compute_and_persist_acceleration_report(
-            &catalog,
-            &job_id,
-            &worker_id,
-            attempt,
-            role,
-            &device,
-            config.backbone_dtype,
-            None,
-            None,
-        );
-        crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
-    } else {
-        let (mut encoder, adapter_cfg) = build_encoder_adapters(BuildEncoderAdaptersParams {
-            base_model_id: &base_model,
-            catalog: &catalog,
-            artifact_store: &artifact_store,
-            config: &config,
-            task,
-            varmap: &varmap,
-            device: &device,
-            hub: &hub,
-            dropout_seed,
-        })?;
-        // Right after `build_encoder_adapters` (which calls
-        // `validate_backbone_precision` and materialises the real, dtype-typed
-        // encoder) and BEFORE the training loop's first step — the earliest
-        // point a per-job admission determination is both possible (the real
-        // encoder exists) and cheap (nothing has trained yet). `&varmap` is the
-        // SAME `VarMap` `build_encoder_adapters` registered the LoRA A/B
-        // trainable vars into — the probe's backward+optimizer step
-        // (`run_backward_and_optimizer_probe`) snapshots and restores it.
-        compute_and_persist_acceleration_report(
-            &catalog,
-            &job_id,
-            &worker_id,
-            attempt,
-            role,
-            &device,
-            config.backbone_dtype,
-            Some(&varmap),
-            Some(&mut encoder),
-        );
-        crate::fine_tune::target::TrainingTarget::EncoderAdapters(Box::new(
-            crate::fine_tune::target::EncoderAdaptersTarget {
-                encoder,
-                adapter_cfg,
-            },
-        ))
+            })?;
+            // Right after `build_encoder_adapters` (which calls
+            // `validate_backbone_precision` and materialises the real,
+            // dtype-typed encoder) and BEFORE the training loop's first step —
+            // the earliest point a per-job admission determination is both
+            // possible (the real encoder exists) and cheap (nothing has
+            // trained yet). `&varmap` is the SAME `VarMap` `build_encoder_adapters`
+            // registered the LoRA A/B trainable vars into — the probe's
+            // backward+optimizer step (`run_backward_and_optimizer_probe`)
+            // snapshots and restores it.
+            compute_and_persist_acceleration_report(
+                &catalog,
+                &job_id,
+                &worker_id,
+                attempt,
+                role,
+                &device,
+                config.backbone_dtype,
+                Some(&varmap),
+                Some(&mut encoder),
+            );
+            crate::fine_tune::target::TrainingTarget::AdaptedEncoder(Box::new(
+                crate::fine_tune::target::AdaptedEncoderTarget {
+                    encoder,
+                    adapter_cfg,
+                    head,
+                },
+            ))
+        }
     };
 
     // Discover the job's newest complete epoch checkpoint. If one exists (a
@@ -8269,6 +8179,7 @@ fn run_fine_tune_blocking(
     );
 
     let resume = discover_resume(&artifact_store, &catalog, &job_id, &device)?;
+    let progress_job_id = job_id.clone();
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
@@ -8295,6 +8206,17 @@ fn run_fine_tune_blocking(
     // own durable-write gate (and its agreement with the rank context is
     // checked at `build`).
     builder = builder.runner_role(role);
+    // The rank that holds the job reports its optimizer steps onto the row.
+    if role.lease_holder().is_some() {
+        builder = builder.progress(ProgressReporter::new(
+            JobAttempt {
+                job_id: &progress_job_id,
+                instance_id: &worker_id,
+                attempts: attempt,
+            }
+            .to_buf(),
+        ));
+    }
     if let Some(restored) = resume {
         builder = builder.resume(restored);
     }
@@ -8306,6 +8228,92 @@ fn run_fine_tune_blocking(
     // faulted never reaches here; its transport is aborted instead.
     training_loop.close_gang(call)?;
     Ok(trained)
+}
+
+/// [`build_task_head`]'s inputs, grouped so the call takes a single
+/// argument.
+struct TaskHeadParams<'a> {
+    task: ModelTask,
+    /// Width of the pooled output the head reads.
+    hidden_size: usize,
+    encoder: &'a EncoderTraining,
+    source: &'a crate::fine_tune::source::TrainingSource,
+    config: &'a FineTuneConfig,
+    varmap: &'a candle_nn::VarMap,
+    vb: &'a candle_nn::VarBuilder<'a>,
+    dropout_seed: u64,
+}
+
+/// The head a fine-tune trains over the encoder's pooled output: a
+/// classification task's `projection` and `classifier`, a regression task's
+/// `projection` and `distribution`, whichever way the encoder trains — the
+/// classes and the distribution exist only in the head. An embedding task's
+/// `projection` exists only over a frozen encoder, where it carries the whole
+/// adaptation; an adapted encoder's own pooled output is the embedding, so it
+/// trains no head (`None`).
+fn build_task_head(
+    params: TaskHeadParams<'_>,
+) -> Result<Option<crate::fine_tune::lora::LoraModel>> {
+    let TaskHeadParams {
+        task,
+        hidden_size,
+        encoder,
+        source,
+        config,
+        varmap,
+        vb,
+        dropout_seed,
+    } = params;
+    let head = match task {
+        ModelTask::Classification => {
+            // The class count from the source's own vocabulary: a `Resident`
+            // loader's (built from the eager pass) or a `Streamed` source's
+            // (built from the worker's whole-table sweep) — both the identical
+            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
+            // doc), so the head is sized identically either way.
+            let num_classes = source
+                .class_labels()
+                .map(|labels| labels.len())
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: "Classification task requires classification training data format"
+                        .into(),
+                })?;
+            crate::fine_tune::lora::build_classification_head_for_rank(
+                hidden_size,
+                num_classes,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?
+        }
+        ModelTask::Regression => {
+            let output_dim = match config.regression_loss.unwrap_or_default() {
+                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
+                _ => 2,
+            };
+            crate::fine_tune::lora::build_distribution_head_for_rank(
+                hidden_size,
+                output_dim,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?
+        }
+        _ => match encoder {
+            EncoderTraining::Frozen => crate::fine_tune::lora::build_projection_head_for_rank(
+                hidden_size,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?,
+            EncoderTraining::Adapted { .. } => return Ok(None),
+        },
+    };
+    Ok(Some(head))
 }
 
 /// Fetch and load the checkpoint a resume of the job restores, if any: the
@@ -8354,12 +8362,13 @@ fn validate_backbone_precision(
     device: &candle_core::Device,
 ) -> Result<()> {
     if precision == jammi_numerics::ComputePrecision::BF16 && !device.is_cuda() {
-        return Err(JammiError::FineTune(
-            "backbone_dtype=bf16 requires a CUDA device; this worker resolved a non-CUDA \
+        return Err(JammiError::InvalidArgument {
+            argument: "backbone_dtype".into(),
+            reason: "bf16 requires a CUDA device; this worker resolved a non-CUDA \
              device, whose matmul does not implement bf16. Use f16 for a reduced-precision \
              backbone on CPU, or f32."
                 .into(),
-        ));
+        });
     }
     Ok(())
 }
@@ -8447,7 +8456,7 @@ fn validate_backbone_precision(
 // dropout-mask RNG draw is NOT undone — see that doc's own disclosure).
 // `flash` degrades to a compiled/device-level fact (`cuda_not_compiled` /
 // `flash_not_compiled` / `device_is_cpu_or_metal_not_cuda` /
-// `no_encoder_to_probe_projection_head_arm`) whenever the cascade admission
+// `no_encoder_to_probe_frozen_encoder`) whenever the cascade admission
 // path cannot even be reached, or no encoder was built to probe at all
 // (distinct from a probe that WAS attempted and failed); a
 // reached-but-declined cascade reads its verbatim predicate key back out of
@@ -8582,7 +8591,7 @@ fn flash_compiled_device_reason(device: &candle_core::Device) -> Option<serde_js
 }
 
 /// The `"flash"` field for an arm that ran NO probe at all — no encoder was
-/// ever built to probe (the projection-head arm: `backbone_dtype` never
+/// ever built to probe (the frozen-encoder arm: `backbone_dtype` never
 /// takes effect there, so [`probe_acceleration`] never reaches a forward
 /// call). Distinct from [`flash_report`]'s `"probe_forward_failed"`, which
 /// means a probe WAS attempted and its forward pass errored: passing
@@ -8590,7 +8599,7 @@ fn flash_compiled_device_reason(device: &candle_core::Device) -> Option<serde_js
 /// probe failed" for a probe that was never attempted.
 fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::Value {
     flash_compiled_device_reason(device).unwrap_or_else(
-        || serde_json::json!({"holds": false, "reason": "no_encoder_to_probe_projection_head_arm"}),
+        || serde_json::json!({"holds": false, "reason": "no_encoder_to_probe_frozen_encoder"}),
     )
 }
 
@@ -8745,7 +8754,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
 /// (see [`run_backward_and_optimizer_probe`]) — when `encoder`/`varmap` are
 /// both `Some`, and builds the `ops` map + `flash` field from the
 /// before/after dispatch-registry delta. Either is `None` on the
-/// projection-head arm (`backbone_dtype` never takes effect there — see
+/// frozen-encoder arm (`backbone_dtype` never takes effect there — see
 /// `validate_backbone_precision`'s doc): `ops` is then empty and `flash`
 /// reports the honest "no probe was ever attempted" reason
 /// ([`flash_report_no_probe_attempted`]) — never a fabricated per-op
@@ -8851,9 +8860,12 @@ fn probe_acceleration(
                 } else {
                     reason_from_probe_window(&window, registry_key)
                 };
+                // `kernel` is the dispatch registry key the op admits under —
+                // the key `kernel_dispatches` counts it by — so a reader joins
+                // the two without knowing the kernels' own names.
                 ops.insert(
                     report_key.to_string(),
-                    serde_json::json!({"holds": holds, "reason": reason}),
+                    serde_json::json!({"holds": holds, "reason": reason, "kernel": registry_key}),
                 );
             }
         }
@@ -8892,7 +8904,7 @@ fn build_acceleration_report_json(
 /// Computes and persists this attempt's acceleration report. Runs
 /// synchronously inside the blocking training thread
 /// (`run_fine_tune_blocking`), right after the device is resolved and (on the
-/// encoder-adapters arm) right after `validate_backbone_precision` /
+/// adapted-encoder arm) right after `validate_backbone_precision` /
 /// `build_encoder_adapters` return — before the training loop's first step,
 /// so a status poll mid-training finds a `"determined"` report rather than
 /// the submission-time `"pending"` marker for this run's whole lifetime
@@ -8940,7 +8952,7 @@ fn compute_and_persist_acceleration_report(
     ));
 }
 
-/// Construct an encoder-adapters target: load the frozen backbone weights from
+/// Construct an adapted-encoder target: load the frozen backbone weights from
 /// the catalog artifact path, wrap the configured target modules with LoRA, and
 /// return both the resulting encoder and the persisted adapter metadata that
 /// pairs with the trained tensors on disk.
@@ -9022,7 +9034,9 @@ fn build_encoder_adapters(
     let model_record = tokio::runtime::Handle::current()
         .block_on(catalog.get_model(&catalog_model_id))?
         .ok_or_else(|| {
-            JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: base_model_id.to_string(),
+            })
         })?;
 
     let artifact_dir: std::path::PathBuf = match &model_record.location {
@@ -9042,7 +9056,7 @@ fn build_encoder_adapters(
             } else {
                 path.parent()
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        JammiError::Internal(format!(
                             "Cannot determine model dir from location '{p}'"
                         ))
                     })?
@@ -9090,13 +9104,13 @@ fn build_encoder_adapters(
                 weights
                     .parent()
                     .ok_or_else(|| {
-                        JammiError::FineTune(
+                        JammiError::Internal(
                             "Cannot determine model dir from HF hub cache path".into(),
                         )
                     })?
                     .to_path_buf()
             } else {
-                return Err(JammiError::FineTune(format!(
+                return Err(JammiError::Internal(format!(
                     "Base model '{base_model_id}' has no location in catalog"
                 )));
             }
@@ -9119,16 +9133,24 @@ fn build_encoder_adapters(
         })?,
         None => {
             let config_path = arch::config_candidates(&artifact_dir).ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Cannot find {} or {} for base model at {artifact_dir:?}",
-                    arch::CONFIG_CANDIDATE_NAMES[0],
-                    arch::CONFIG_CANDIDATE_NAMES[1],
-                ))
+                JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!(
+                        "Cannot find {} or {} for base model at {artifact_dir:?}",
+                        arch::CONFIG_CANDIDATE_NAMES[0],
+                        arch::CONFIG_CANDIDATE_NAMES[1],
+                    ),
+                }
             })?;
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| JammiError::FineTune(format!("Cannot read {config_path:?}: {e}")))?;
-            serde_json::from_str(&text)
-                .map_err(|e| JammiError::FineTune(format!("Cannot parse {config_path:?}: {e}")))?
+            let text =
+                std::fs::read_to_string(&config_path).map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Cannot read {config_path:?}: {e}"),
+                })?;
+            serde_json::from_str(&text).map_err(|e| JammiError::InvalidArgument {
+                argument: "base_model".into(),
+                reason: format!("Cannot parse {config_path:?}: {e}"),
+            })?
         }
     };
 
@@ -9142,16 +9164,39 @@ fn build_encoder_adapters(
         .and_then(|v| v.as_str())
         .unwrap_or("<absent>");
 
-    let family = EncoderFamily::from_config(&model_config).ok_or_else(|| {
-        JammiError::FineTune(format!(
-            "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
+    let family =
+        EncoderFamily::from_config(&model_config).ok_or_else(|| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!(
+                "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
              (base model '{base_model_id}'); supported: bert, roberta, camembert, \
              xlm-roberta, distilbert, modernbert, an OpenCLIP checkpoint \
              (open_clip_config.json with model_cfg), or an HF-CLAP audio checkpoint \
-             (clap_audio_model). Leave `target_modules` empty to train a projection \
-             head on a frozen backbone instead."
-        ))
-    })?;
+             (clap_audio_model). `encoder=\"frozen\"` trains a head over any \
+             backbone instead."
+            ),
+        })?;
+    let EncoderTraining::Adapted {
+        target_modules,
+        layers_to_transform,
+        rank_pattern,
+    } = &config.encoder
+    else {
+        return Err(JammiError::Internal(
+            "encoder adapters are built only for an adapted encoder".into(),
+        ));
+    };
+    // An empty request trains the family's default sites — PEFT's own
+    // placement; a named list trains exactly the sites it selects.
+    let target_modules: Vec<String> = if target_modules.is_empty() {
+        family
+            .default_lora_sites()
+            .iter()
+            .map(|site| site.to_string())
+            .collect()
+    } else {
+        target_modules.clone()
+    };
 
     // The string the two GGUF lookups below still key on (`GgufArchitecture`
     // and, through `gguf_num_layers`, the DistilBERT field normalization),
@@ -9167,12 +9212,14 @@ fn build_encoder_adapters(
     // the identical chain `ModelResolver::resolve_local` walks, so a fine-tune
     // and an inference load of the same directory can never read different
     // weights.
-    let weights_path = arch::weights_candidates(&artifact_dir).ok_or_else(|| {
-        JammiError::FineTune(format!(
-            "No weights found at {artifact_dir:?} (need one of {:?})",
-            arch::WEIGHTS_CANDIDATE_NAMES
-        ))
-    })?;
+    let weights_path =
+        arch::weights_candidates(&artifact_dir).ok_or_else(|| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!(
+                "No weights found at {artifact_dir:?} (need one of {:?})",
+                arch::WEIGHTS_CANDIDATE_NAMES
+            ),
+        })?;
     let gguf_weights_path = artifact_dir.join(arch::GGUF_WEIGHTS_FILENAME);
     let is_gguf = weights_path.ends_with(arch::GGUF_WEIGHTS_FILENAME);
     if is_gguf
@@ -9196,13 +9243,13 @@ fn build_encoder_adapters(
     };
 
     let lora = jammi_lora::LoraBuildConfig {
-        target_modules: &config.target_modules,
-        layers_to_transform: &config.layers_to_transform,
+        target_modules: &target_modules,
+        layers_to_transform,
         lora_rank: config.lora_rank,
         lora_alpha: config.lora_alpha,
         use_rslora: config.use_rslora,
         lora_dropout,
-        rank_pattern: &config.rank_pattern,
+        rank_pattern,
         init_mode: config.init_lora_weights,
         seed: config.seed,
         dropout_seed,
@@ -9246,11 +9293,10 @@ fn build_encoder_adapters(
         // fine-tune outright.
         let num_layers =
             crate::model::backend::gguf::gguf_num_layers(dispatch_model_type, &model_config)
-                .ok_or_else(|| {
-                    JammiError::FineTune(
-                        "GGUF load requires num_hidden_layers (or num_layers) in config.json"
-                            .into(),
-                    )
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: "GGUF load requires num_hidden_layers (or num_layers) in config.json"
+                        .into(),
                 })?;
         Some(
             crate::model::backend::gguf::load_gguf_backbone(
@@ -9282,7 +9328,10 @@ fn build_encoder_adapters(
         // ---- OpenCLIP text tower -------------------------------------
         (EncoderFamily::OpenClip, ModelTask::TextEmbedding) => {
             let text_config = jammi_encoders::ClipTextConfig::from_open_clip_config(&model_config)
-                .map_err(|e| JammiError::FineTune(format!("Parse OpenCLIP text config: {e}")))?;
+                .map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Parse OpenCLIP text config: {e}"),
+                })?;
             let tower = jammi_encoders::ClipText::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype)
@@ -9297,8 +9346,9 @@ fn build_encoder_adapters(
         (EncoderFamily::OpenClip, ModelTask::ImageEmbedding) => {
             let vision_config =
                 jammi_encoders::OpenClipVisionConfig::from_open_clip_config(&model_config)
-                    .map_err(|e| {
-                        JammiError::FineTune(format!("Parse OpenCLIP vision config: {e}"))
+                    .map_err(|e| JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse OpenCLIP vision config: {e}"),
                     })?;
             let tower = jammi_encoders::OpenClipVisionTransformer::builder()
                 .lora(lora)
@@ -9313,7 +9363,10 @@ fn build_encoder_adapters(
         // ---- HF-CLAP HTSAT audio tower -------------------------------
         (EncoderFamily::ClapAudio, ModelTask::AudioEmbedding) => {
             let audio_config = jammi_encoders::HtsatAudioConfig::from_hf_clap_config(&model_config)
-                .map_err(|e| JammiError::FineTune(format!("Parse CLAP audio config: {e}")))?;
+                .map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Parse CLAP audio config: {e}"),
+                })?;
             let tower = jammi_encoders::HtsatAudio::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype)
@@ -9347,7 +9400,10 @@ fn build_encoder_adapters(
         (EncoderFamily::DistilBert, _) => {
             let distilbert_config: jammi_encoders::DistilBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse DistilBert config.json: {e}"),
+                    }
                 })?;
             let mut builder = jammi_encoders::DistilBert::builder()
                 .lora(lora)
@@ -9369,7 +9425,10 @@ fn build_encoder_adapters(
         (EncoderFamily::ModernBert, _) => {
             let modernbert_config: jammi_encoders::ModernBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse ModernBert config.json: {e}"),
+                    }
                 })?;
             let mut builder = jammi_encoders::ModernBert::builder()
                 .lora(lora)
@@ -9390,8 +9449,12 @@ fn build_encoder_adapters(
         }
         (EncoderFamily::Bert, _) => {
             let bert_config: jammi_encoders::BertConfig =
-                serde_json::from_value(model_config.clone())
-                    .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
+                serde_json::from_value(model_config.clone()).map_err(|e| {
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse Bert config.json: {e}"),
+                    }
+                })?;
             let mut builder = jammi_encoders::Bert::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype);
@@ -9411,9 +9474,9 @@ fn build_encoder_adapters(
 
     // A selector that matched NOTHING is a hard refusal, not a run.
     //
-    // This arm is reached only when `config.target_modules` is non-empty (see
-    // `classify_training_oom`'s doc for that split), so an encoder with zero
-    // trainable `Var`s here means the caller ASKED for adapters and got none.
+    // This arm is reached only for an adapted encoder, whose sites are the
+    // request's or the family's defaults, so an encoder with zero trainable
+    // `Var`s here means the caller ASKED for adapters and got none.
     // Nothing downstream notices: candle's backward pass differentiates only
     // through `is_variable()` nodes, so `loss.backward()` populates an empty
     // `GradStore`; `optimizer::clip_and_step` treats an EMPTY `trainable_vars`
@@ -9423,7 +9486,7 @@ fn build_encoder_adapters(
     // model id. A typo'd selector must fail the job instead — the same
     // conclusion `jammi-bench`'s own training tier reached
     // (`finetune_run.rs`'s zero-trainable refusal), installed here at the one
-    // seam every encoder-adapters job passes through.
+    // seam every adapted-encoder job passes through.
     //
     // TWO producers land here and the message must not blame the wrong one:
     // `target_modules` matching no site on THIS tower's vocabulary, or a
@@ -9442,28 +9505,31 @@ fn build_encoder_adapters(
             Some(Tower::Audio) => "audio",
             None => family.towers(),
         };
-        let restriction = match &config.layers_to_transform {
+        let restriction = match layers_to_transform {
             Some(layers) => format!(" restricted to layers {layers:?}"),
             None => String::new(),
         };
-        return Err(JammiError::FineTune(format!(
-            "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
+        return Err(JammiError::InvalidArgument {
+            argument: "target_modules".into(),
+            reason: format!(
+                "{:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
              (base model '{base_model_id}', model_type '{model_type}'), so this job would \
              train zero parameters and publish an adapter that changes nothing. This \
              tower's own LoRA site names are: {:?} — a selector matches a site name \
              exactly or as a suffix of it (so 'query' selects 'attention.self.query' on a \
              BERT-family tower, whose sites are named by their full dotted checkpoint \
              path), and 'all-linear' selects every site.{}",
-            config.target_modules,
-            family.adapter_model_type(),
-            encoder.lora_site_names(),
-            if restriction.is_empty() {
-                ""
-            } else {
-                " If the selectors are right for this architecture, check \
+                target_modules,
+                family.adapter_model_type(),
+                encoder.lora_site_names(),
+                if restriction.is_empty() {
+                    ""
+                } else {
+                    " If the selectors are right for this architecture, check \
                  layers_to_transform for an out-of-range or off-by-one layer index."
-            },
-        )));
+                },
+            ),
+        });
     }
 
     Ok((encoder, adapter_cfg))
@@ -9986,7 +10052,7 @@ mod tests {
         assert_eq!(
             devices,
             vec![DeviceFact {
-                kind: "cpu".into(),
+                kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                 ordinal: 0,
             }],
             "{devices:?}"
@@ -10000,11 +10066,11 @@ mod tests {
             devices,
             vec![
                 DeviceFact {
-                    kind: "cpu".into(),
+                    kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                     ordinal: 0,
                 },
                 DeviceFact {
-                    kind: "cpu".into(),
+                    kind: jammi_datafusion::ComputeDeviceKind::Cpu,
                     ordinal: 1,
                 },
             ],
@@ -10013,7 +10079,8 @@ mod tests {
 
         let cuda = worker_devices(&config, ComputeDevice::Cuda { ordinal: 0 });
         assert_eq!(
-            cuda[0].kind, "cuda",
+            cuda[0].kind,
+            jammi_datafusion::ComputeDeviceKind::Cuda,
             "the session's own ComputeDevice decides kind, uniformly"
         );
     }
@@ -10172,8 +10239,8 @@ mod tests {
             "error must name a usable alternative: {msg}"
         );
         assert!(
-            matches!(err, JammiError::FineTune(_)),
-            "typed error, got {err:?}"
+            matches!(&err, JammiError::InvalidArgument { argument, .. } if argument == "backbone_dtype"),
+            "a refusal of the job's own argument, got {err:?}"
         );
     }
 
@@ -10218,7 +10285,7 @@ mod tests {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "panic-job",
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("panic-base::1"),
@@ -10232,7 +10299,7 @@ mod tests {
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
         let claimed = catalog
-            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
+            .claim_next("worker-x", &[JobKind::FineTune], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
@@ -10262,7 +10329,7 @@ mod tests {
         let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine panic must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&error);
+        let msg = error.to_string();
         assert!(
             msg.contains("Panic:") && msg.contains("simulated candle kernel fault"),
             "a caught panic must carry its message into the failure, got: {msg}"
@@ -10283,7 +10350,7 @@ mod tests {
         let job = catalog.get_job("panic-job").await.unwrap();
         assert_eq!(
             job.status,
-            JobStatus::Failed.to_string(),
+            JobStatus::Failed,
             "a panicking job lands `failed`, never wedged `running`"
         );
         assert!(
@@ -10295,7 +10362,7 @@ mod tests {
         );
     }
 
-    /// The encoder-adapters arm (`target_modules` non-empty): a CUDA
+    /// The adapted-encoder arm: a CUDA
     /// OOM-shaped failure is rewritten to name the config that OOM'd and the
     /// remedies to try, in order — `backbone_dtype: bf16` first (bf16
     /// actually takes effect here), then a smaller
@@ -10304,7 +10371,7 @@ mod tests {
     #[test]
     fn classify_training_oom_encoder_adapters_arm_leads_with_bf16() {
         let config = FineTuneConfig {
-            target_modules: vec!["query".into(), "value".into()],
+            encoder: EncoderTraining::adapted(vec!["query".into(), "value".into()]),
             ..FineTuneConfig::default() // batch_size=8, max_seq_length=512, backbone_dtype=f32
         };
         let raw = JammiError::FineTune(
@@ -10331,7 +10398,7 @@ mod tests {
         );
         assert!(
             msg.contains("backbone_dtype: bf16"),
-            "first remedy on the encoder-adapters arm must be the bf16 backbone, got: {msg}"
+            "first remedy on the adapted-encoder arm must be the bf16 backbone, got: {msg}"
         );
         assert!(
             msg.contains("bf16 requires CUDA"),
@@ -10351,15 +10418,17 @@ mod tests {
         );
     }
 
-    /// The projection-head arm (`target_modules` empty, the default):
-    /// `backbone_dtype` never takes effect there (only `build_encoder_adapters`
-    /// re-dtypes the backbone, and it is reached only for a non-empty
-    /// `target_modules`), so the remedy list must NOT suggest `backbone_dtype:
-    /// bf16` — that would be dead advice on this arm. The message says so
-    /// outright.
+    /// The frozen-encoder arm: `backbone_dtype` never takes effect there
+    /// (only `build_encoder_adapters` re-dtypes the backbone, and it is
+    /// reached only for an adapted encoder), so the remedy list must NOT
+    /// suggest `backbone_dtype: bf16` — that would be dead advice on this
+    /// arm. The message says so outright.
     #[test]
-    fn classify_training_oom_projection_head_arm_omits_bf16() {
-        let config = FineTuneConfig::default(); // target_modules empty
+    fn classify_training_oom_frozen_encoder_arm_omits_bf16() {
+        let config = FineTuneConfig {
+            encoder: EncoderTraining::Frozen,
+            ..FineTuneConfig::default()
+        };
         let raw = JammiError::FineTune(
             "Encoder forward: cuda error: CUDA_ERROR_OUT_OF_MEMORY: out of memory".into(),
         );
@@ -10373,14 +10442,14 @@ mod tests {
         assert!(
             !msg.contains("backbone_dtype="),
             "the echoed config must be arm-appropriate — backbone_dtype is never echoed \
-             (and then disclaimed) on the projection-head arm, got: {msg}"
+             (and then disclaimed) on the frozen-encoder arm, got: {msg}"
         );
         assert!(
             !msg.contains("backbone_dtype: bf16"),
-            "bf16 is inert on the projection-head arm — must not be suggested, got: {msg}"
+            "bf16 is inert on the frozen-encoder arm — must not be suggested, got: {msg}"
         );
         assert!(
-            msg.contains("backbone_dtype does not apply to projection-head runs"),
+            msg.contains("backbone_dtype does not apply to a frozen encoder"),
             "must say outright why bf16 is absent, got: {msg}"
         );
         assert!(
@@ -10460,29 +10529,23 @@ mod tests {
         let WorkerJobError::Failed(oom) = classify_training_error(&cancel, &config, oom_err) else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&oom);
+        let msg = oom.to_string();
         assert!(
             msg.contains("out of memory") && msg.contains("batch_size=8"),
             "must carry the classified OOM guidance, got: {msg}"
         );
 
-        // not cancelled + non-OOM: byte-identical passthrough of the RAW
-        // inner message — `failed_job_message` strips `JammiError::FineTune`'s
-        // own "Fine-tune error: " prefix here (see its doc): that prefix is
-        // re-applied on read by `TrainingJob::wait()` and the Python
-        // binding's `poll_until_terminal`, so it must not survive into the
-        // stored `WorkerJobError::Failed` message a second time.
+        // not cancelled + non-OOM: byte-identical passthrough.
         let cancel = AtomicBool::new(false);
-        let raw_inner = "Encoder forward: CUDA_ERROR_INVALID_PTX";
-        let raw = JammiError::FineTune(raw_inner.into());
+        let raw = JammiError::FineTune("Encoder forward: CUDA_ERROR_INVALID_PTX".into());
+        let raw_msg = raw.to_string();
         let WorkerJobError::Failed(passed) = classify_training_error(&cancel, &config, raw) else {
             panic!("a non-OOM failure must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&passed);
         assert_eq!(
-            msg, raw_inner,
-            "a non-OOM error must pass through unchanged, minus the redundant \
-             Fine-tune-error prefix"
+            passed.to_string(),
+            raw_msg,
+            "a non-OOM error must pass through unchanged"
         );
     }
 
@@ -10514,11 +10577,11 @@ mod tests {
     }
 
     /// End-to-end: a CUDA-OOM-shaped failure from the blocking trainer, on the
-    /// default (projection-head) config, drives the job to a terminal
+    /// frozen-encoder config, drives the job to a terminal
     /// `failed` status whose `error_message` (what `jammi train status` /
     /// Python `job.status()` read) carries the classified guidance — not the
     /// raw driver string, and without the inert `backbone_dtype: bf16`
-    /// suggestion the default arm cannot act on. Mirrors
+    /// suggestion the frozen-encoder arm cannot act on. Mirrors
     /// `panicking_training_job_lands_failed_with_recorded_error`'s pipeline,
     /// substituting `classify_training_error` for the plain `classify` call
     /// `train_fine_tune` makes on this arm.
@@ -10544,7 +10607,7 @@ mod tests {
         catalog
             .submit_job(jammi_db::catalog::jobs_repo::SubmitJobParams {
                 job_id: "oom-job",
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: jammi_db::catalog::status::JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("oom-base::1"),
@@ -10558,16 +10621,18 @@ mod tests {
         // The worker claims the job (running, leased to it) before running it —
         // the state in which a genuine failure is recorded under the lease guard.
         let claimed = catalog
-            .claim_next("worker-x", &["fine_tune"], Duration::from_secs(60))
+            .claim_next("worker-x", &[JobKind::FineTune], Duration::from_secs(60))
             .await
             .unwrap()
             .expect("the queued job is claimable");
 
         let cancel = Arc::new(AtomicBool::new(false));
-        // The engine defaults (batch 8, seq 512, backbone F32, empty
-        // target_modules => projection-head arm) that OOM on an L4 24GB card
-        // at inference-side defaults.
-        let config = FineTuneConfig::default();
+        // The engine defaults (batch 8, seq 512, backbone F32) on a frozen
+        // encoder, which OOM on an L4 24GB card at inference-side defaults.
+        let config = FineTuneConfig {
+            encoder: EncoderTraining::Frozen,
+            ..FineTuneConfig::default()
+        };
 
         // Run the worker's blocking wrapper over a trainer that raises a raw
         // CUDA driver OOM, then take the same terminal-classification branch
@@ -10595,13 +10660,13 @@ mod tests {
         let WorkerJobError::Failed(error) = outcome else {
             panic!("a genuine OOM must classify as Failed, not Cancelled");
         };
-        let msg = failed_job_message(&error);
+        let msg = error.to_string();
         assert!(
             msg.contains("batch_size=8")
-                && msg.contains("backbone_dtype does not apply to projection-head runs")
+                && msg.contains("backbone_dtype does not apply to a frozen encoder")
                 && !msg.contains("backbone_dtype: bf16"),
             "the classified OOM guidance must reach the terminal message, without the \
-             inert bf16 remedy on the default (projection-head) arm, got: {msg}"
+             inert bf16 remedy on the frozen-encoder arm, got: {msg}"
         );
 
         // The worker records the failure as the job's terminal status, under the
@@ -10619,14 +10684,14 @@ mod tests {
         let job = catalog.get_job("oom-job").await.unwrap();
         assert_eq!(
             job.status,
-            JobStatus::Failed.to_string(),
+            JobStatus::Failed,
             "an OOM'd job lands `failed`, never wedged `running`"
         );
         assert!(
             job.error
                 .as_deref()
                 .is_some_and(|m| m.contains("batch_size=8")
-                    && m.contains("backbone_dtype does not apply to projection-head runs")),
+                    && m.contains("backbone_dtype does not apply to a frozen encoder")),
             "`jammi train status` / job.status() must surface the classified OOM \
              guidance from the catalog's error, got {:?}",
             job.error
@@ -10722,7 +10787,7 @@ mod tests {
         let loader =
             build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
                 .unwrap();
-        assert!(matches!(loader.format(), TrainingFormat::Regression));
+        assert_eq!(loader.format(), Some(TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
         assert_eq!(
             loader.regression_targets().unwrap(),
@@ -10804,10 +10869,11 @@ mod tests {
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
         let loader = build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding).unwrap();
-        assert!(matches!(
-            loader.format(),
-            TrainingFormat::Classification { num_classes: 2 }
-        ));
+        assert_eq!(loader.format(), Some(TrainingFormat::Classification));
+        assert_eq!(
+            loader.class_labels(),
+            Some(["x".to_string(), "y".to_string()].as_slice())
+        );
     }
 
     /// A null target is rejected with a typed error citing the row — never
@@ -11211,7 +11277,7 @@ mod tests {
     /// nothing else that could differ between two runs of it.
     fn probe_job_config(lora_dropout: f64) -> FineTuneConfig {
         FineTuneConfig {
-            target_modules: vec!["query".to_string(), "value".to_string()],
+            encoder: EncoderTraining::adapted(vec!["query".to_string(), "value".to_string()]),
             lora_rank: 2,
             lora_dropout,
             seed: 7,
@@ -11294,34 +11360,43 @@ mod tests {
             .collect()
     }
 
-    /// `encoder` as the `EncoderAdapters` target a job of
+    /// `encoder` as the `AdaptedEncoder` target a job of
     /// [`probe_job_config`] trains, its adapter metadata derived from that
     /// same config.
     fn probe_job_target(
         encoder: jammi_encoders::AnyEncoder,
         config: &FineTuneConfig,
     ) -> crate::fine_tune::target::TrainingTarget {
-        use crate::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+        use crate::fine_tune::target::{AdaptedEncoderTarget, TrainingTarget};
 
+        let EncoderTraining::Adapted {
+            target_modules,
+            layers_to_transform,
+            rank_pattern,
+        } = &config.encoder
+        else {
+            panic!("the probe job adapts its encoder");
+        };
         let adapter_cfg = jammi_lora::AdapterConfig::from_build(
             "bert",
             &jammi_lora::LoraBuildConfig {
-                target_modules: &config.target_modules,
-                layers_to_transform: &config.layers_to_transform,
+                target_modules,
+                layers_to_transform,
                 lora_rank: config.lora_rank,
                 lora_alpha: config.lora_alpha,
                 use_rslora: config.use_rslora,
                 lora_dropout: Some(config.lora_dropout as f32),
-                rank_pattern: &config.rank_pattern,
+                rank_pattern,
                 init_mode: config.init_lora_weights,
                 seed: config.seed,
                 dropout_seed: config.seed,
             },
             config.backbone_dtype,
         );
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder,
             adapter_cfg,
+            head: None,
         }))
     }
 
@@ -11593,7 +11668,7 @@ mod tests {
         let hub = test_hub_source();
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
-                target_modules,
+                encoder: EncoderTraining::adapted(target_modules),
                 ..FineTuneConfig::default()
             };
             let varmap = candle_nn::VarMap::new();
@@ -11701,6 +11776,7 @@ mod tests {
     /// use `FineTuneConfig::default()`.
     async fn build_encoder_adapters_for_dir(
         dir: &std::path::Path,
+        task: ModelTask,
         target_modules: Vec<String>,
     ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
         let catalog_dir = tempfile::tempdir().unwrap();
@@ -11711,7 +11787,7 @@ mod tests {
 
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
-                target_modules,
+                encoder: EncoderTraining::adapted(target_modules),
                 lora_dropout: 0.0,
                 ..FineTuneConfig::default()
             };
@@ -11723,7 +11799,7 @@ mod tests {
                 artifact_store: &artifact_store,
                 config: &training_config,
                 dropout_seed: training_config.seed,
-                task: ModelTask::TextEmbedding,
+                task,
                 varmap: &varmap,
                 device: &device,
                 hub: &hub,
@@ -11731,6 +11807,50 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// An adapted encoder that names no sites trains its architecture's
+    /// defaults: every family's `default_lora_sites` selects real sites on
+    /// its tower, so the job trains parameters rather than refusing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_family_trains_its_default_sites() {
+        let assert_defaults = |encoder: &jammi_encoders::AnyEncoder,
+                               cfg: &jammi_lora::AdapterConfig| {
+            let family =
+                crate::model::arch::EncoderFamily::from_adapter_model_type(&cfg.model_type)
+                    .expect("the worker writes a family id");
+            assert_eq!(
+                cfg.target_modules,
+                family.default_lora_sites(),
+                "{family:?}"
+            );
+            assert!(
+                !encoder.trainable_params().is_empty(),
+                "{family:?} trains nothing"
+            );
+        };
+        for (fixture, task) in [
+            ("tiny_bert", ModelTask::TextEmbedding),
+            ("tiny_modernbert", ModelTask::TextEmbedding),
+            ("tiny_open_clip", ModelTask::TextEmbedding),
+            ("tiny_open_clip", ModelTask::ImageEmbedding),
+            ("htsat_clap_tiny", ModelTask::AudioEmbedding),
+        ] {
+            let (encoder, cfg) = build_encoder_adapters_for_dir(
+                &jammi_test_utils::fixture(fixture),
+                task,
+                Vec::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{fixture} {task}: {e}"));
+            assert_defaults(&encoder, &cfg);
+        }
+        let (tensors, config, matmul_weights) = distilbert_gguf_fixture(&candle_core::Device::Cpu);
+        let (encoder, cfg) =
+            build_encoder_adapters_gguf("distilbert", tensors, config, matmul_weights, Vec::new())
+                .await
+                .unwrap();
+        assert_defaults(&encoder, &cfg);
     }
 
     /// Deterministic additive-offset perturbation (no unseeded RNG) — every tensor is shifted by a fixed nonzero offset, keeping
@@ -11782,11 +11902,12 @@ mod tests {
         reference_forward: &[f32],
         phase: &str,
     ) {
-        let (encoder, adapter_cfg) = build_encoder_adapters_for_dir(dir, target_modules)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("phase {phase}: build_encoder_adapters must succeed, got: {e}")
-            });
+        let (encoder, adapter_cfg) =
+            build_encoder_adapters_for_dir(dir, ModelTask::TextEmbedding, target_modules)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("phase {phase}: build_encoder_adapters must succeed, got: {e}")
+                });
         assert!(
             matches!(encoder, jammi_encoders::AnyEncoder::Bert(_)),
             "phase {phase}: expected a Bert encoder built from the safetensors arm"
@@ -11857,10 +11978,13 @@ mod tests {
             serde_json::to_string(&config).unwrap(),
         )
         .unwrap();
-        let (reference_encoder, _) =
-            build_encoder_adapters_for_dir(&ref_dir, target_modules.clone())
-                .await
-                .unwrap();
+        let (reference_encoder, _) = build_encoder_adapters_for_dir(
+            &ref_dir,
+            ModelTask::TextEmbedding,
+            target_modules.clone(),
+        )
+        .await
+        .unwrap();
         let reference_forward = deterministic_bert_forward(&reference_encoder, &device);
 
         // The dual-format directory under test — safetensors starts (and
@@ -11982,7 +12106,7 @@ mod tests {
         catalog
             .submit_job(SubmitJobParams {
                 job_id: &job_id,
-                kind: "fine_tune",
+                kind: JobKind::FineTune,
                 execution: JobExecution::Queued,
                 spec: "{}",
                 model_ref: Some("sweep-base::1"),
@@ -11993,7 +12117,7 @@ mod tests {
             .await
             .unwrap();
         let attempt = catalog
-            .claim_next(worker, &["fine_tune"], Duration::from_secs(3600))
+            .claim_next(worker, &[JobKind::FineTune], Duration::from_secs(3600))
             .await
             .unwrap()
             .expect("the queued job is claimable")

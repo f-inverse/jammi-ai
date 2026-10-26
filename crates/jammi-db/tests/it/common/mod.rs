@@ -11,7 +11,7 @@ use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{ModelRow, ProducedModel, SubmitJobParams};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::storage::StorageUrl;
@@ -59,7 +59,7 @@ pub async fn register_base_model(catalog: &Catalog) {
 }
 
 /// The job kind every model-artifact test queues.
-pub const FINE_TUNE_KIND: &str = "fine_tune";
+pub const FINE_TUNE_KIND: JobKind = JobKind::FineTune;
 
 /// A LoRA adapter bundle's two files, with bytes distinguishable by `tag`.
 pub fn adapter_files(tag: &str) -> Vec<(String, Bytes)> {

@@ -21,12 +21,12 @@ use jammi_wire::eval::report::{
 use jammi_wire::request::{CompareEvalRequest, EmbeddingEvalRequest};
 
 use jammi_numerics::classification::ClassificationMetrics;
-use jammi_numerics::ner::{Entity, NerMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span};
 use jammi_numerics::retrieval::RetrievalMetrics;
 
-use super::golden::{
-    ensure_column, ensure_column_int64, load_classification_golden_from_batches,
-    load_ner_golden_from_batches, load_retrieval_golden_from_batches, QueryModality,
+use super::ground_truth::{
+    ensure_column, ensure_column_int64, load_classification_truth_from_batches,
+    load_ner_truth_from_batches, load_retrieval_truth_from_batches, QueryModality,
 };
 
 /// Orchestrates evaluation pipelines — retrieval and classification.
@@ -46,7 +46,9 @@ impl<'a> EvalRunner<'a> {
             .await?
             .map(|m| m.catalog_pk)
             .ok_or_else(|| {
-                JammiError::Eval(format!("Model '{model_name}' not registered in catalog"))
+                JammiError::NotFound(jammi_db::error::Missing::Model {
+                    model_id: model_name.to_string(),
+                })
             })
     }
 
@@ -56,7 +58,7 @@ impl<'a> EvalRunner<'a> {
     /// its input table's vectors in that table's space — its input's encoder,
     /// walked iteratively down the (acyclic) lineage. A table whose vectors no
     /// engine encoder produced (structure embeddings, imported vectors) has no
-    /// query encoder, so a text/image/audio golden cannot be run against it:
+    /// query encoder, so a text/image/audio truth cannot be run against it:
     /// the typed [`JammiError::NoQueryEncoder`] naming the producer, never a
     /// model load of the producer's tag.
     ///
@@ -89,7 +91,7 @@ impl<'a> EvalRunner<'a> {
         }
     }
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     ///
     /// Returns an [`EmbeddingEvalReport`] containing both the aggregate over
     /// all queries (`report.aggregate.recall_at_k`, etc.) and the per-query
@@ -101,14 +103,14 @@ impl<'a> EvalRunner<'a> {
     /// (spec J9): one row per query keyed by the run's `eval_run_id`, carrying
     /// Recall@{1,3,5,10}, MRR, nDCG, distance, and any opaque `cohorts` tags
     /// supplied for that `query_id`. Persistence is always-on — there is no
-    /// opt-in flag. `cohorts` maps a golden-set `query_id` to an opaque
+    /// opt-in flag. `cohorts` maps a ground truth `query_id` to an opaque
     /// `{key: value}` segment map; a query with no entry stores `{}`.
     ///
     /// Each query is ranked as `db.search()` ranks it, by the request's
     /// [`SearchMethod`](jammi_db::index::SearchMethod): through the table's ANN
     /// index (an exact scan when it has none), or exactly.
     ///
-    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// `ground_truth` is an unquoted relation reference (a bare name or a
     /// dotted `<source>.public.<table>`); each part is quoted independently
     /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_embeddings(
@@ -118,12 +120,12 @@ impl<'a> EvalRunner<'a> {
         let EmbeddingEvalRequest {
             source_id,
             embedding_table,
-            golden_source,
+            ground_truth,
             k,
             cohorts,
             method,
         } = request;
-        let (source_id, golden_source, k) = (source_id.as_str(), golden_source.as_str(), *k);
+        let (source_id, ground_truth, k) = (source_id.as_str(), ground_truth.as_str(), *k);
         let embedding_table = embedding_table.as_deref();
 
         // 1. Resolve embedding table.
@@ -135,19 +137,19 @@ impl<'a> EvalRunner<'a> {
 
         let result_store = self.session.result_store();
 
-        // 2. Load golden dataset — detect query modality from the present
+        // 2. Load ground-truth dataset — detect query modality from the present
         //    column: query_image (binary) / query_audio (binary) / query_text.
-        let golden_schema = self.source_schema(golden_source).await?;
-        ensure_column(&golden_schema, "query_id", DataType::Utf8)?;
-        ensure_column(&golden_schema, "relevant_id", DataType::Utf8)?;
-        let has_grades = golden_schema.field_with_name("relevance_grade").is_ok();
+        let truth_schema = self.source_schema(ground_truth).await?;
+        ensure_column(&truth_schema, "query_id", DataType::Utf8)?;
+        ensure_column(&truth_schema, "relevant_id", DataType::Utf8)?;
+        let has_grades = truth_schema.field_with_name("relevance_grade").is_ok();
 
-        let modality = if golden_schema.field_with_name("query_image").is_ok() {
+        let modality = if truth_schema.field_with_name("query_image").is_ok() {
             QueryModality::Image
-        } else if golden_schema.field_with_name("query_audio").is_ok() {
+        } else if truth_schema.field_with_name("query_audio").is_ok() {
             QueryModality::Audio
         } else {
-            ensure_column(&golden_schema, "query_text", DataType::Utf8)?;
+            ensure_column(&truth_schema, "query_text", DataType::Utf8)?;
             QueryModality::Text
         };
 
@@ -161,15 +163,15 @@ impl<'a> EvalRunner<'a> {
         } else {
             ""
         };
-        let golden_rel = quote_relation(golden_source);
+        let truth_rel = quote_relation(ground_truth);
         let batches = self
             .session
             .sql(&format!(
-                "SELECT \"query_id\", {query_col}, \"relevant_id\"{grade_select} FROM {golden_rel}"
+                "SELECT \"query_id\", {query_col}, \"relevant_id\"{grade_select} FROM {truth_rel}"
             ))
             .await?;
 
-        let golden = load_retrieval_golden_from_batches(&batches, has_grades, modality)?;
+        let truth = load_retrieval_truth_from_batches(&batches, has_grades, modality)?;
 
         // 4. For each query: encode → search → compute metrics.
         let encoder = self.query_encoder(&table).await?;
@@ -184,15 +186,15 @@ impl<'a> EvalRunner<'a> {
         let query_width = result_store
             .query_width_local(self.session.context(), &table)
             .await?;
-        for query in &golden.queries {
+        for query in &truth.queries {
             let query_vec = match &query.input {
-                super::golden::QueryInput::Text(text) => {
+                super::ground_truth::QueryInput::Text(text) => {
                     self.session.encode_text_query(&encode_id, text).await?
                 }
-                super::golden::QueryInput::Image(bytes) => {
+                super::ground_truth::QueryInput::Image(bytes) => {
                     self.session.encode_image_query(&encode_id, bytes).await?
                 }
-                super::golden::QueryInput::Audio(bytes) => {
+                super::ground_truth::QueryInput::Audio(bytes) => {
                     self.session.encode_audio_query(&encode_id, bytes).await?
                 }
             };
@@ -246,7 +248,7 @@ impl<'a> EvalRunner<'a> {
         //    single-cutoff `metrics` plus the J9 additions (multi-K recall,
         //    top-1 distance, opaque cohort tags); the aggregate is the mean.
         let aggregate = RetrievalMetrics::aggregate(&query_metrics);
-        let per_query: Vec<PerQueryRecord> = golden
+        let per_query: Vec<PerQueryRecord> = truth
             .queries
             .iter()
             .zip(query_metrics)
@@ -282,7 +284,7 @@ impl<'a> EvalRunner<'a> {
                 eval_type: "embedding".into(),
                 model_id: Some(model_fk),
                 source_id: source_id.into(),
-                golden_source: golden_source.into(),
+                ground_truth: ground_truth.into(),
                 k: Some(k as i32),
                 metrics_json: serde_json::to_string(&report.aggregate)?,
                 status: EvalRunStatus::Completed.to_string(),
@@ -299,13 +301,13 @@ impl<'a> EvalRunner<'a> {
         Ok(report)
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     ///
     /// Returns an [`InferenceEvalReport`] carrying the task-shaped
     /// aggregate and the per-record predicted / gold pairs that
     /// sample-based statistical rules consume.
     ///
-    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// `ground_truth` is an unquoted relation reference (a bare name or a
     /// dotted `<source>.public.<table>`); each part is quoted independently
     /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_inference(
@@ -314,7 +316,7 @@ impl<'a> EvalRunner<'a> {
         source_id: &str,
         columns: &[String],
         task: EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         // `model_id` is a user-supplied identifier (`local:/path`, `hf://owner/repo`,
@@ -323,22 +325,22 @@ impl<'a> EvalRunner<'a> {
         // the catalog (no `local:` prefix), which is not the shape callers pass here.
         let model_source = ModelSource::parse(model_id);
 
-        // `golden_source` is an unquoted source reference; quote each dotted
+        // `ground_truth` is an unquoted source reference; quote each dotted
         // part once so a hyphenated or reserved name resolves verbatim.
-        let golden_rel = quote_relation(golden_source);
+        let truth_rel = quote_relation(ground_truth);
         let (aggregate, per_record) = match task {
             EvalTask::Classification => {
-                let golden_schema = self.source_schema(golden_source).await?;
-                ensure_column(&golden_schema, "id", DataType::Utf8)?;
-                ensure_column(&golden_schema, label_column, DataType::Utf8)?;
+                let truth_schema = self.source_schema(ground_truth).await?;
+                ensure_column(&truth_schema, "id", DataType::Utf8)?;
+                ensure_column(&truth_schema, label_column, DataType::Utf8)?;
 
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"id\", \"{label_column}\" AS \"label\" FROM {golden_rel}"
+                        "SELECT \"id\", \"{label_column}\" AS \"label\" FROM {truth_rel}"
                     ))
                     .await?;
-                let golden = load_classification_golden_from_batches(&batches)?;
+                let truth = load_classification_truth_from_batches(&batches)?;
 
                 let (_table, results, _) = self
                     .session
@@ -360,10 +362,10 @@ impl<'a> EvalRunner<'a> {
                 let mut aligned_predicted = Vec::new();
                 let mut aligned_actual = Vec::new();
                 for batch in &results {
-                    let ids = super::golden::extract_string_column(batch, "_row_id")?;
-                    let labels = super::golden::extract_string_column(batch, "label")?;
+                    let ids = super::ground_truth::extract_string_column(batch, "_row_id")?;
+                    let labels = super::ground_truth::extract_string_column(batch, "label")?;
                     for (id, pred) in ids.iter().zip(&labels) {
-                        if let Some(actual) = golden.labels.get(id) {
+                        if let Some(actual) = truth.labels.get(id) {
                             aligned_predicted.push(pred.clone());
                             aligned_actual.push(actual.clone());
                             per_record.push(PerRecordPrediction::Classification {
@@ -379,23 +381,23 @@ impl<'a> EvalRunner<'a> {
                 (InferenceAggregate::Classification(result), per_record)
             }
             EvalTask::Ner => {
-                // NER goldens carry one entity span per row. The runner
+                // NER ground truth carries one entity span per row. The runner
                 // joins on `id`, then groups spans into per-row entity
                 // sets — the shape `NerMetrics::compute` consumes.
-                let golden_schema = self.source_schema(golden_source).await?;
-                ensure_column(&golden_schema, "id", DataType::Utf8)?;
-                ensure_column(&golden_schema, label_column, DataType::Utf8)?;
-                ensure_column_int64(&golden_schema, "start")?;
-                ensure_column_int64(&golden_schema, "end")?;
+                let truth_schema = self.source_schema(ground_truth).await?;
+                ensure_column(&truth_schema, "id", DataType::Utf8)?;
+                ensure_column(&truth_schema, label_column, DataType::Utf8)?;
+                ensure_column_int64(&truth_schema, "start")?;
+                ensure_column_int64(&truth_schema, "end")?;
 
                 let batches = self
                     .session
                     .sql(&format!(
                         "SELECT \"id\", \"{label_column}\" AS \"label\", \"start\", \"end\" \
-                         FROM {golden_rel}"
+                         FROM {truth_rel}"
                     ))
                     .await?;
-                let golden = load_ner_golden_from_batches(&batches)?;
+                let truth = load_ner_truth_from_batches(&batches)?;
 
                 let (_table, results, _) = self
                     .session
@@ -412,11 +414,12 @@ impl<'a> EvalRunner<'a> {
 
                 let mut per_record: Vec<PerRecordPrediction> = Vec::new();
                 let mut aligned_predicted: Vec<Vec<Entity>> = Vec::new();
-                let mut aligned_gold: Vec<Vec<Entity>> = Vec::new();
+                let mut aligned_gold: Vec<Vec<Span>> = Vec::new();
                 for batch in &results {
-                    let ids = super::golden::extract_string_column(batch, "_row_id")?;
-                    let statuses = super::golden::extract_string_column(batch, "_status")?;
-                    let entities_col = super::golden::extract_string_column(batch, "entities")?;
+                    let ids = super::ground_truth::extract_string_column(batch, "_row_id")?;
+                    let statuses = super::ground_truth::extract_string_column(batch, "_status")?;
+                    let entities_col =
+                        super::ground_truth::extract_string_column(batch, "entities")?;
                     for ((id, status), entities_json) in
                         ids.iter().zip(&statuses).zip(&entities_col)
                     {
@@ -428,7 +431,7 @@ impl<'a> EvalRunner<'a> {
                         if status != "ok" {
                             continue;
                         }
-                        let Some(gold) = golden.entities.get(id) else {
+                        let Some(gold) = truth.entities.get(id) else {
                             continue;
                         };
                         let predicted: Vec<Entity> =
@@ -467,7 +470,7 @@ impl<'a> EvalRunner<'a> {
                 eval_type: task.to_string(),
                 model_id: Some(model_fk),
                 source_id: source_id.into(),
-                golden_source: golden_source.into(),
+                ground_truth: ground_truth.into(),
                 k: None,
                 metrics_json: serde_json::to_string(&report.aggregate)?,
                 status: EvalRunStatus::Completed.to_string(),
@@ -485,7 +488,7 @@ impl<'a> EvalRunner<'a> {
     /// doesn't know?". The two are independent — a model can be accurate and
     /// badly calibrated, or calibrated and useless.
     ///
-    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// `ground_truth` is a held-out set pairing a predictive distribution with
     /// its realised `outcome`. `shape` selects the predictor's output family and
     /// the columns read:
     /// - [`EvalCalibrationShape::Gaussian`] — `record_id`, `mean`, `sd`,
@@ -506,36 +509,36 @@ impl<'a> EvalRunner<'a> {
     /// `_jammi_eval_per_query` keyed by the run id, and `cohorts` maps a
     /// `record_id` to opaque segment tags (a record with no entry stores `{}`).
     ///
-    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// `ground_truth` is an unquoted relation reference (a bare name or a
     /// dotted `<source>.public.<table>`); each part is quoted independently
     /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_calibration(
         &self,
         source_id: &str,
-        golden_source: &str,
+        ground_truth: &str,
         shape: EvalCalibrationShape,
         cohorts: &HashMap<String, BTreeMap<String, String>>,
     ) -> Result<CalibrationEvalReport> {
-        let golden_schema = self.source_schema(golden_source).await?;
-        ensure_column(&golden_schema, "record_id", DataType::Utf8)?;
+        let truth_schema = self.source_schema(ground_truth).await?;
+        ensure_column(&truth_schema, "record_id", DataType::Utf8)?;
 
-        // `golden_source` is an unquoted source reference; quote each dotted
+        // `ground_truth` is an unquoted source reference; quote each dotted
         // part once so a hyphenated or reserved name resolves verbatim.
-        let golden_rel = quote_relation(golden_source);
+        let truth_rel = quote_relation(ground_truth);
         let predictions = match shape {
             EvalCalibrationShape::Gaussian => {
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"record_id\", \"mean\", \"sd\", \"outcome\" FROM {golden_rel}"
+                        "SELECT \"record_id\", \"mean\", \"sd\", \"outcome\" FROM {truth_rel}"
                     ))
                     .await?;
                 let mut predictions = Vec::new();
                 for batch in &batches {
-                    let ids = super::golden::extract_string_column(batch, "record_id")?;
-                    let means = super::golden::extract_f64_column(batch, "mean")?;
-                    let sds = super::golden::extract_f64_column(batch, "sd")?;
-                    let outcomes = super::golden::extract_f64_column(batch, "outcome")?;
+                    let ids = super::ground_truth::extract_string_column(batch, "record_id")?;
+                    let means = super::ground_truth::extract_f64_column(batch, "mean")?;
+                    let sds = super::ground_truth::extract_f64_column(batch, "sd")?;
+                    let outcomes = super::ground_truth::extract_f64_column(batch, "outcome")?;
                     for (((id, &mean), &sd), &outcome) in
                         ids.iter().zip(&means).zip(&sds).zip(&outcomes)
                     {
@@ -554,17 +557,17 @@ impl<'a> EvalRunner<'a> {
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"record_id\", \"draws\", \"outcome\" FROM {golden_rel}"
+                        "SELECT \"record_id\", \"draws\", \"outcome\" FROM {truth_rel}"
                     ))
                     .await?;
                 let mut predictions = Vec::new();
                 for batch in &batches {
-                    let ids = super::golden::extract_string_column(batch, "record_id")?;
-                    let draws_col = super::golden::extract_string_column(batch, "draws")?;
-                    let outcomes = super::golden::extract_f64_column(batch, "outcome")?;
+                    let ids = super::ground_truth::extract_string_column(batch, "record_id")?;
+                    let draws_col = super::ground_truth::extract_string_column(batch, "draws")?;
+                    let outcomes = super::ground_truth::extract_f64_column(batch, "outcome")?;
                     for ((id, draws_json), &outcome) in ids.iter().zip(&draws_col).zip(&outcomes) {
                         let draws: Vec<f64> = serde_json::from_str(draws_json).map_err(|e| {
-                            JammiError::Eval(format!(
+                            JammiError::Internal(format!(
                                 "calibration draws JSON parse failed for record {id}: {e}"
                             ))
                         })?;
@@ -587,7 +590,7 @@ impl<'a> EvalRunner<'a> {
         // `_jammi_eval_per_query` keyed by the same run id — the same shape the
         // embedding eval reuses, so cohort slicing and significance read back
         // through one path. A calibration run is not model-scoped: it scores a
-        // held-out predictive distribution from the golden source, not a
+        // held-out predictive distribution from the ground-truth source, not a
         // registered model, so `model_id` is `None` and `k` is empty. The
         // predictor family is carried by `eval_type` (the shape's name).
         self.session
@@ -597,7 +600,7 @@ impl<'a> EvalRunner<'a> {
                 eval_type: shape.to_string(),
                 model_id: None,
                 source_id: source_id.into(),
-                golden_source: golden_source.into(),
+                ground_truth: ground_truth.into(),
                 k: None,
                 metrics_json: serde_json::to_string(&report.aggregate)?,
                 status: EvalRunStatus::Completed.to_string(),
@@ -632,7 +635,7 @@ impl<'a> EvalRunner<'a> {
                 .eval_embeddings(&EmbeddingEvalRequest {
                     source_id: request.source_id.clone(),
                     embedding_table: Some(table_name.clone()),
-                    golden_source: request.golden_source.clone(),
+                    ground_truth: request.ground_truth.clone(),
                     k: request.k,
                     cohorts: HashMap::new(),
                     method: request.method,
@@ -681,16 +684,16 @@ impl<'a> EvalRunner<'a> {
         Ok(CompareEvalReport { per_table })
     }
 
-    /// Get the schema of a registered golden source.
+    /// Get the schema of a registered ground-truth source.
     ///
-    /// `golden_source` is an unquoted source reference (`<source>.public.<table>`
+    /// `ground_truth` is an unquoted source reference (`<source>.public.<table>`
     /// or a bare name); each dotted part is quoted independently so a
     /// hyphenated or reserved name resolves verbatim.
-    async fn source_schema(&self, golden_source: &str) -> Result<Schema> {
-        let golden_rel = quote_relation(golden_source);
+    async fn source_schema(&self, ground_truth: &str) -> Result<Schema> {
+        let truth_rel = quote_relation(ground_truth);
         let batches = self
             .session
-            .sql(&format!("SELECT * FROM {golden_rel} LIMIT 0"))
+            .sql(&format!("SELECT * FROM {truth_rel} LIMIT 0"))
             .await?;
 
         if let Some(batch) = batches.first() {
@@ -699,10 +702,10 @@ impl<'a> EvalRunner<'a> {
             let df = self
                 .session
                 .context()
-                .sql(&format!("SELECT * FROM {golden_rel} LIMIT 0"))
+                .sql(&format!("SELECT * FROM {truth_rel} LIMIT 0"))
                 .await
                 .map_err(|e| {
-                    JammiError::Eval(format!("Failed to get schema for '{golden_source}': {e}"))
+                    JammiError::Eval(format!("Failed to get schema for '{ground_truth}': {e}"))
                 })?;
             Ok(df.schema().as_arrow().clone())
         }

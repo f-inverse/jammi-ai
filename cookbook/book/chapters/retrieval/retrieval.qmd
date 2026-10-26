@@ -13,7 +13,7 @@ Retrieval quality is usually reported as one number per embedding table. This ch
 the question a practitioner asks: **given dense embeddings, a lexical scorer, and
 a graph-propagated variant, which retriever — and which fusion — should I reach
 for?** The task is fixed (same-subject retrieval over the papers, asked by title,
-scored against an embedding-independent same-subject golden) and the *retriever* varies.
+scored against an embedding-independent same-subject ground truth) and the *retriever* varies.
 
 ```{python}
 import math
@@ -33,11 +33,11 @@ db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 arxiv = datasets.arxiv(db, SCALE)
 raw = keystone.embed(db, arxiv, SCALE)
 propagated = keystone.propagate(db, arxiv, raw)
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 
 relevant: dict[str, set[str]] = defaultdict(set)
 query_text: dict[str, str] = {}
-for g in db.sql(f"SELECT query_id, query_text, relevant_id FROM {golden}").to_pylist():
+for g in db.sql(f"SELECT query_id, query_text, relevant_id FROM {truth}").to_pylist():
     relevant[g["query_id"]].add(g["relevant_id"])
     query_text[g["query_id"]] = g["query_text"]
 queries = sorted(relevant)
@@ -65,7 +65,7 @@ def dense(table: str):
 
 
 def per_query(ranked: dict[str, list[str]]) -> np.ndarray:
-    """Each query's precision@10 and nDCG@10 against the same-subject golden,
+    """Each query's precision@10 and nDCG@10 against the same-subject relevance judgments,
     one row per query in ``queries`` order."""
     rows = []
     for q in queries:
@@ -152,41 +152,47 @@ encoder already places most papers by subject, and the propagated arm lands leve
 with the raw one: two hops of smoothing move every vector, but not the ranking's
 quality.
 
-## The honest fusion finding
+## Does fusion help?
 
-This is the part a benchmark table would quietly drop. A fused list "helps" only
-if it beats the best single arm by more than the queries' own noise, so the
+A fused list helps only if it beats the best single arm by more than the
+queries' own noise, so the
 comparison is **paired**: the same 200 queries, each scored under both lists, and
 the mean per-query difference set against its standard error.
 
 ```{python}
-single = max(("dense_raw", "dense_prop", "bm25"), key=lambda m: metrics[m][0])
-fused = max(("rrf_raw_prop", "rrf_raw_bm25"), key=lambda m: metrics[m][0])
-diff = by_query[fused] - by_query[single]
-gain, se = diff.mean(axis=0), diff.std(axis=0, ddof=1) / np.sqrt(len(diff))
-print(f"best single arm: {single}   best fusion: {fused}")
+# Each metric holds the best fusion to the single arm that is best on THAT
+# metric: a fused list helps only if it beats every arm it could replace.
+comparison = {}
 for i, metric in enumerate(("precision@10", "nDCG@10")):
-    print(f"{metric:<13} fused − single: {gain[i]:+.3f}   (standard error {se[i]:.3f})")
+    single = max(("dense_raw", "dense_prop", "bm25"), key=lambda m: metrics[m][i])
+    fused = max(("rrf_raw_prop", "rrf_raw_bm25"), key=lambda m: metrics[m][i])
+    diff = by_query[fused][:, i] - by_query[single][:, i]
+    comparison[metric] = (single, fused, diff.mean(), diff.std(ddof=1) / np.sqrt(len(diff)))
+for metric, (single, fused, gain, se) in comparison.items():
+    print(f"{metric:<13} {fused} − {single}: {gain:+.3f}   (standard error {se:.3f})")
+shown = ", ".join(f"{m} {g:+.3f} ± {e:.3f}" for m, (_, _, g, e) in comparison.items())
 ```
 
 ```{python}
+claim("no fused list beats the best single arm by two standard errors",
+      not any(g > 2 * e for _, _, g, e in comparison.values()), shown)
 if SCALE is scale.Scale.FULL:
     claim("the best fusion is the two dense arms, and the best single arm the propagated one",
-          fused == "rrf_raw_prop" and single == "dense_prop")
+          all(s == "dense_prop" and f == "rrf_raw_prop" for s, f, _, _ in comparison.values()))
     claim("fusion is a wash: neither metric moves by two standard errors",
-          all(abs(g) < 2 * e for g, e in zip(gain, se)),
-          f"precision@10 {gain[0]:+.3f} ± {se[0]:.3f}, nDCG@10 {gain[1]:+.3f} ± {se[1]:.3f}")
+          all(abs(g) < 2 * e for _, _, g, e in comparison.values()), shown)
     claim("the hybrid dense + lexical list lands below the propagated arm",
           metrics["rrf_raw_bm25"][0] < metrics["dense_prop"][0])
 ```
 
-At `full` scale **fusion is a wash**. RRF of the two dense arms lands next to the
+At every scale no fused list beats the best single arm by more than its noise. At
+`full` scale **fusion is a wash**. RRF of the two dense arms lands next to the
 propagated arm it contains — a hair ahead on one metric, a hair behind on the
 other, neither by two standard errors — and the hybrid dense + lexical list
 lands on its raw dense arm, well below the propagated one. Rank fusion adds
 something only when a weaker arm reliably surfaces relevant papers the stronger
 one misses; on this target neither the raw dense arm nor BM25 does it often
-enough to show. The large lever is **graph propagation** ([the propagation chapter](../analyze/analyze.qmd)), which
+enough to show. The large lever is **graph propagation** ([Propagating embeddings over a graph](../analyze/analyze.qmd)), which
 moves precision@10 by several points, where fusion moves it by less than its
 noise. Measure each arm first; fuse only when the paired difference says the
 fused list beats the best single arm.

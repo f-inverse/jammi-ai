@@ -106,10 +106,11 @@ SELECT * FROM annotate('local:/models/all-MiniLM-L6-v2', 'text_embedding',
                        ARRAY['abstract'])
 ```
 
-Model **registration** — a durable catalog entry with an id, stage
-transitions, and evidence — is a platform concern and lives outside the OSS
-engine; the engine consumes local checkpoints directly through the reference
-forms above.
+A local checkpoint needs no registration: the engine loads it directly
+through the reference forms above. The models catalog records the models a
+session has loaded and the ones a fine-tune produced (`list_models`,
+`describe_model`, `delete_model`); promotion stages and the evidence behind
+them are a deployment's own records, kept in its own tables.
 
 ## Configuring the Hub cache, endpoint, and token
 

@@ -63,7 +63,10 @@ pub(crate) fn content_row_count(content: &[ArrayRef]) -> Result<usize> {
     content
         .first()
         .map(|c| c.len())
-        .ok_or_else(|| JammiError::Inference("No content columns provided".into()))
+        .ok_or_else(|| JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: "No content columns provided".into(),
+        })
 }
 
 /// One float-embedding head over every row of a forward: `embedded[k]` is

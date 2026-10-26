@@ -144,7 +144,7 @@ pub async fn dial_member(
 /// The engine's [`MemberDialer`] seam, implemented over [`dial_member`]:
 /// what the coordinator body (`jammi_ai::fine_tune::worker`, `JobWorker::
 /// coordinate`) dials each assigned member through. Installed ONCE on the
-/// session's `HostAdmission` by `OssServer::bind` beside the gang listener
+/// session's `HostAdmission` by `Server::bind` beside the gang listener
 /// (`crate::runtime`), so a process that mounts `GangService` is exactly
 /// the process that can coordinate a `Peer` gang; a library process has
 /// none and says so as an assembly outcome.

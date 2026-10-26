@@ -66,7 +66,7 @@ pub fn embedding_batch_with_null_hash(
         Arc::new(Float32Array::from(flat)),
         None,
     )
-    .map_err(|e| JammiError::Other(format!("materialize: build vector column: {e}")))?;
+    .map_err(|e| JammiError::Internal(format!("materialize: build vector column: {e}")))?;
 
     RecordBatch::try_new(
         Arc::clone(schema),
@@ -78,5 +78,5 @@ pub fn embedding_batch_with_null_hash(
             crate::store::content_hash::null_hash_column(rows.len()),
         ],
     )
-    .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
+    .map_err(|e| JammiError::Internal(format!("materialize: build batch: {e}")))
 }

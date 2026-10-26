@@ -194,7 +194,7 @@ call. `list_jobs` reads them back, and `job(id)` reattaches to one.
 
 ```{python}
 jobs = db.list_jobs()
-kinds = sorted({j["kind"] for j in jobs})
+kinds = sorted({str(j["kind"]) for j in jobs})
 print(f"{len(jobs)} jobs of kinds {kinds}")
 latest = db.job(jobs[0]["job_id"])
 print(f"job {jobs[0]['job_id'][:8]}…: {latest.status()}")

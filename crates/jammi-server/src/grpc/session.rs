@@ -9,7 +9,7 @@
 //! engine-backed gRPC verbs). There is exactly ONE binder — no legacy
 //! interceptor path.
 //!
-//! The engine ships [`SessionIdTenantResolver`], the OSS-cooperative default:
+//! The engine ships [`SessionIdTenantResolver`], the cooperative default:
 //! a client binds its tenant with a typed gRPC verb (the tenant
 //! trio on [`CatalogService`](crate::grpc::catalog)) that updates a shared
 //! [`SessionStore`] keyed by an opaque `SessionId` (the `jammi-session-id`
@@ -92,9 +92,9 @@ impl SessionStore {
 /// The scope a request runs under, as decided by a [`TenantResolver`].
 ///
 /// [`TenantScope::Global`] is the EXPLICIT unscoped choice — the honest value
-/// an OSS-cooperative or single-tenant deployment returns when no tenant is
+/// a cooperative or single-tenant deployment returns when no tenant is
 /// bound. It is never a silent default a rejection falls through to: a resolver
-/// that authenticates (the platform / BYO-auth path) returns `Tenant`/`Err` and
+/// that authenticates (the bring-your-own-auth path) returns `Tenant`/`Err` and
 /// NEVER `Global`; the "reject-don't-default" contract lives per-resolver, not
 /// in this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub enum TenantScope {
 /// the Flight SQL provider applies it to the `db.sql` lane. There is exactly one
 /// binder — no separate interceptor.
 ///
-/// The engine default is [`SessionIdTenantResolver`] (OSS-cooperative:
+/// The engine default is [`SessionIdTenantResolver`] (cooperative:
 /// `jammi-session-id` → [`SessionStore`]). A downstream composing the seam
 /// supplies its own authenticating resolver instead, unifying the composability
 /// seam with the bring-your-own-auth seam. Engine-generic: `&MetadataMap` in,
@@ -126,7 +126,7 @@ pub trait TenantResolver: Send + Sync + 'static {
     /// a valid credential and `Err(Status)` (`UNAUTHENTICATED`) for a
     /// missing/invalid one — it never returns [`TenantScope::Global`], so a
     /// rejected caller can never fall through to an unscoped read. The
-    /// OSS-cooperative default resolver legitimately returns `Global` when no
+    /// cooperative default resolver legitimately returns `Global` when no
     /// session tenant is bound (the explicit unscoped choice).
     async fn resolve(&self, metadata: &MetadataMap) -> Result<TenantScope, Status>;
 }
@@ -137,7 +137,7 @@ pub trait TenantResolver: Send + Sync + 'static {
 /// server-side callers and the integration tests keep their existing path.
 pub use jammi_wire::SESSION_HEADER;
 
-/// The engine's default [`TenantResolver`] — the OSS-cooperative,
+/// The engine's default [`TenantResolver`] — the cooperative,
 /// single-listener multitenancy behavior made explicit. It reads the
 /// `jammi-session-id` header, looks the session's bound tenant up in the shared
 /// [`SessionStore`] (written by the `CatalogService` tenant trio), and returns
@@ -256,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn session_id_resolver_is_global_when_session_unbound() {
         // A header present but with no binding in the store resolves to Global,
-        // not an error — the OSS-cooperative default never rejects.
+        // not an error — the cooperative default never rejects.
         let resolver = SessionIdTenantResolver::new(SessionStore::new());
         let mut req = Request::new(());
         req.metadata_mut()

@@ -4,7 +4,7 @@
 Produces:
 - `tiny_corpus.parquet`     — 20-row synthetic patent corpus (id, title,
   abstract, year, category, assignee_id)
-- `tiny_golden.json`        — relevance judgments for `eval_embeddings`
+- `tiny_relevance.json`        — relevance judgments for `eval_embeddings`
 - `tiny_labels.csv`         — each corpus row's subject, `physics` or
   `biology`, which the federation chapter joins
 - `tiny_pairs.csv`          — contrastive text pairs for `fine_tune`
@@ -18,11 +18,11 @@ Produces:
   (id, label, start, end), people and organisations only
 - `tiny_image_corpus/`      — 20 synthetic 224x224 PNGs (geometric line
   drawings, 5 shape families) for the `image_search` recipe
-- `tiny_image_golden.json`  — query-image -> expected corpus-image top-K
+- `tiny_image_relevance.json`  — query-image -> expected corpus-image top-K
   judgments for the image-search eval (`db.eval_embeddings` image mode)
 - `tiny_audio_corpus/`      — 20 synthetic mono WAV clips (5 timbre families)
   for the `audio_search` recipe
-- `tiny_audio_golden.json`  — query-clip -> expected corpus-clip top-K
+- `tiny_audio_relevance.json`  — query-clip -> expected corpus-clip top-K
   judgments for the audio-search eval (`db.eval_embeddings` audio mode)
 - `tiny_citation_graph/`    — the corpus as a graph with DECLARED edges:
   `nodes.jsonl` (`id`, `text` = title + abstract) and `edges.jsonl` (`src`,
@@ -32,7 +32,7 @@ Produces:
 Re-run with `python cookbook/fixtures/generate.py` whenever the schema or row
 shape needs to change. Output is fully deterministic — same content every run.
 
-The corpus is synthetic public-domain text (no tenant data, no scraped content)
+The corpus is synthetic public-domain text (no scraped content)
 and the row count is intentionally small so the entire cookbook fixtures tree
 stays under 5 MB. The image corpus is rendered programmatically (no real patent
 imagery — licensing) as simple geometric shapes.
@@ -129,14 +129,14 @@ def write_corpus() -> None:
     pq.write_table(table, OUT / "tiny_corpus.parquet")
 
 
-def write_golden() -> None:
+def write_relevance() -> None:
     """Per-query relevance judgments for `eval_embeddings`.
 
     Shape: list of {query_id, query_text, relevant_ids}. The recipe loads
-    these into a CSV-shaped `golden_relevance` source via pyarrow + sql so
-    the eval runner can consume them through the same path as user goldens.
+    these into a CSV-shaped `relevance` source via pyarrow + sql so
+    the eval runner can consume them through the same path as user truths.
     """
-    golden = [
+    truth = [
         {"query_id": "q1", "query_text": "quantum computing applications",
          "relevant_ids": [1, 4, 7, 11]},
         {"query_id": "q2", "query_text": "machine learning for science",
@@ -148,8 +148,8 @@ def write_golden() -> None:
         {"query_id": "q5", "query_text": "chemical synthesis methods",
          "relevant_ids": [6, 15, 19]},
     ]
-    (OUT / "tiny_golden.json").write_text(
-        json.dumps(golden, indent=2, sort_keys=True) + "\n"
+    (OUT / "tiny_relevance.json").write_text(
+        json.dumps(truth, indent=2, sort_keys=True) + "\n"
     )
 
 
@@ -335,8 +335,7 @@ def write_ner_corpus() -> None:
     asks about.
 
     All names and organizations are fictional / public-domain pop-culture
-    references — no tenant or proprietary content lives in the OSS
-    cookbook tree.
+    references.
     """
     table = pa.table({
         "id": pa.array([r[0] for r in NER_CORPUS], type=pa.int64()),
@@ -385,7 +384,7 @@ def write_ner_gold() -> None:
 # rendered here.
 #
 # The held-out query set is one extra image per family (a fifth member, drawn
-# the same way with a distinct seed). `tiny_image_golden.json` maps each query
+# the same way with a distinct seed). `tiny_image_relevance.json` maps each query
 # to the corpus IDs in its own family — the expected top-K for an image-to-image
 # nearest-neighbour search.
 
@@ -467,19 +466,19 @@ def _render_png(family: str, variant: int) -> bytes:
 
 
 def write_image_corpus() -> None:
-    """20 synthetic 224x224 PNGs + the query->top-K golden judgments.
+    """20 synthetic 224x224 PNGs + the query->top-K ground-truth judgments.
 
     Corpus image IDs are `img_<family>_<variant>` (e.g. `img_circle_0`); the
     held-out query images are the family's variant `PER_FAMILY` member, written
     to a sibling `queries/` dir and referenced (by inline bytes) from the
-    golden file at recipe runtime.
+    ground-truth file at recipe runtime.
     """
     corpus_dir = OUT / "tiny_image_corpus"
     corpus_dir.mkdir(exist_ok=True)
     queries_dir = corpus_dir / "queries"
     queries_dir.mkdir(exist_ok=True)
 
-    golden: list[dict] = []
+    truth: list[dict] = []
     for family in SHAPE_FAMILIES:
         family_ids = []
         for variant in range(PER_FAMILY):
@@ -493,7 +492,7 @@ def write_image_corpus() -> None:
         (queries_dir / f"{query_id}.png").write_bytes(
             _render_png(family, PER_FAMILY)
         )
-        golden.append(
+        truth.append(
             {
                 "query_id": query_id,
                 "query_image": f"queries/{query_id}.png",
@@ -501,8 +500,8 @@ def write_image_corpus() -> None:
             }
         )
 
-    (OUT / "tiny_image_golden.json").write_text(
-        json.dumps(golden, indent=2, sort_keys=True) + "\n"
+    (OUT / "tiny_image_relevance.json").write_text(
+        json.dumps(truth, indent=2, sort_keys=True) + "\n"
     )
 
 
@@ -514,10 +513,10 @@ def write_image_corpus() -> None:
 # band-limited noise. Within a family the four members differ by a small pitch
 # detune / duration so the corpus is not degenerate, but members of the same
 # family are spectrally closer to each other than to other families. Every
-# sample is synthesised here — no recorded audio (licensing), no tenant data.
+# sample is synthesised here — no recorded audio (licensing).
 #
 # The held-out query set is one extra clip per family (a fifth member with a
-# distinct detune). `tiny_audio_golden.json` maps each query to its family's
+# distinct detune). `tiny_audio_relevance.json` maps each query to its family's
 # corpus IDs — the expected top-K for an audio-to-audio nearest-neighbour
 # search. Clips are tiny (16 kHz, <=0.25 s) so the fixtures tree stays small.
 
@@ -578,19 +577,19 @@ def _write_wav(path: Path, samples: list[int]) -> None:
 
 
 def write_audio_corpus() -> None:
-    """20 synthetic WAV clips + the query->top-K golden judgments.
+    """20 synthetic WAV clips + the query->top-K ground-truth judgments.
 
     Corpus clip IDs are `clip_<family>_<variant>` (e.g. `clip_sine_0`); the
     held-out query clips are the family's variant `AUDIO_PER_FAMILY` member,
     written to a sibling `queries/` dir and referenced (by inline bytes) from
-    the golden file at recipe runtime.
+    the ground-truth file at recipe runtime.
     """
     corpus_dir = OUT / "tiny_audio_corpus"
     corpus_dir.mkdir(exist_ok=True)
     queries_dir = corpus_dir / "queries"
     queries_dir.mkdir(exist_ok=True)
 
-    golden: list[dict] = []
+    truth: list[dict] = []
     for family in TIMBRE_FAMILIES:
         family_ids = []
         for variant in range(AUDIO_PER_FAMILY):
@@ -602,7 +601,7 @@ def write_audio_corpus() -> None:
         _write_wav(
             queries_dir / f"{query_id}.wav", _synth_clip(family, AUDIO_PER_FAMILY)
         )
-        golden.append(
+        truth.append(
             {
                 "query_id": query_id,
                 "query_audio": f"queries/{query_id}.wav",
@@ -610,8 +609,8 @@ def write_audio_corpus() -> None:
             }
         )
 
-    (OUT / "tiny_audio_golden.json").write_text(
-        json.dumps(golden, indent=2, sort_keys=True) + "\n"
+    (OUT / "tiny_audio_relevance.json").write_text(
+        json.dumps(truth, indent=2, sort_keys=True) + "\n"
     )
 
 
@@ -663,7 +662,7 @@ def write_citation_graph() -> None:
 
 def main() -> None:
     write_corpus()
-    write_golden()
+    write_relevance()
     write_labels()
     write_reviews()
     write_pairs()

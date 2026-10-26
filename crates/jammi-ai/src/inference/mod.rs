@@ -50,7 +50,10 @@ pub(crate) fn lowest_index_result<T>(results: Vec<Result<T>>) -> Result<Vec<T>> 
 /// against).
 pub fn arrow_to_texts(columns: &[ArrayRef]) -> Result<Vec<String>> {
     if columns.is_empty() {
-        return Err(JammiError::Inference("No content columns provided".into()));
+        return Err(JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: "No content columns provided".into(),
+        });
     }
     let validated: Vec<ArrayRef> = columns
         .iter()
@@ -96,12 +99,15 @@ fn validate_text_column(col: &ArrayRef) -> Result<ArrayRef> {
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => Err(JammiError::Inference(format!(
-            "text embedding input column has type {dt}, which holds raw binary bytes, \
+        | DataType::FixedSizeBinary(_) => Err(JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: format!(
+                "text embedding input column has type {dt}, which holds raw binary bytes, \
                  not text — refusing to silently embed the bytes as an empty string for \
                  every row",
-            dt = col.data_type()
-        ))),
+                dt = col.data_type()
+            ),
+        }),
         _ => render_content_column(col),
     }
 }
@@ -124,17 +130,23 @@ pub fn render_content_column(col: &ArrayRef) -> Result<ArrayRef> {
         | DataType::FixedSizeBinary(_) => Ok(std::sync::Arc::clone(col)),
         other => {
             let casted = arrow::compute::cast(col.as_ref(), &DataType::Utf8).map_err(|e| {
-                JammiError::Inference(format!(
-                    "text embedding input column has type {other}, which cannot be cast to \
+                JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: format!(
+                        "text embedding input column has type {other}, which cannot be cast to \
                      text: {e}"
-                ))
+                    ),
+                }
             })?;
             if (0..col.len()).any(|i| casted.is_null(i) && !col.is_null(i)) {
-                return Err(JammiError::Inference(format!(
-                    "text embedding input column has type {other}; casting it to text \
+                return Err(JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: format!(
+                        "text embedding input column has type {other}; casting it to text \
                      introduced a null value the source column did not have — refusing to \
                      silently drop data"
-                )));
+                    ),
+                });
             }
             Ok(casted)
         }
@@ -200,7 +212,10 @@ fn get_string_value(col: &ArrayRef, i: usize) -> Option<&str> {
 /// distinction from a bytes-valued row's failure is not lost.
 pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<DynamicImage>>>> {
     if columns.is_empty() {
-        return Err(JammiError::Inference("No image columns provided".into()));
+        return Err(JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: "No image columns provided".into(),
+        });
     }
     // Use the first column only (image embedding expects a single column).
     let col = &columns[0];
@@ -299,10 +314,13 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<Result<Dynamic
                 None,
             ),
             dt => {
-                return Err(JammiError::Inference(format!(
-                    "Unsupported column type for image input: {dt}. \
+                return Err(JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: format!(
+                        "Unsupported column type for image input: {dt}. \
                      Expected Utf8 (file paths) or Binary (image bytes)"
-                )));
+                    ),
+                });
             }
         };
         row_ids.push(i);
@@ -376,9 +394,10 @@ fn attach_source_path(err: JammiError, kind: &str, row: usize, path: Option<&str
         Some(marker_at) => &msg[marker_at + marker.len()..],
         None => return err,
     };
-    JammiError::Inference(format!(
-        "Failed to decode {kind} at row {row}: {cause} (path '{path}')"
-    ))
+    JammiError::InvalidArgument {
+        argument: "content".into(),
+        reason: format!("Failed to decode {kind} at row {row}: {cause} (path '{path}')"),
+    }
 }
 
 /// Extract and decode audio clips from an Arrow column.
@@ -408,7 +427,10 @@ pub fn arrow_to_audio(
     columns: &[ArrayRef],
 ) -> Result<Vec<Option<Result<audio_preprocess::DecodedAudio>>>> {
     if columns.is_empty() {
-        return Err(JammiError::Inference("No audio columns provided".into()));
+        return Err(JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: "No audio columns provided".into(),
+        });
     }
     // Use the first column only (audio embedding expects a single column).
     let col = &columns[0];
@@ -506,10 +528,13 @@ pub fn arrow_to_audio(
                 None,
             ),
             dt => {
-                return Err(JammiError::Inference(format!(
-                    "Unsupported column type for audio input: {dt}. \
+                return Err(JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: format!(
+                        "Unsupported column type for audio input: {dt}. \
                      Expected Utf8 (file paths) or Binary (audio bytes)"
-                )));
+                    ),
+                });
             }
         };
         row_ids.push(i);

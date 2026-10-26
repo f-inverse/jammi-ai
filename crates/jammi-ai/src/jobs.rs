@@ -62,9 +62,9 @@
 
 use std::sync::Arc;
 
-use jammi_db::catalog::jobs_repo::{FinishJobParams, SubmitJobParams};
+use jammi_db::catalog::jobs_repo::{FinishJobParams, JobRecord, SubmitJobParams};
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::{JobExecution, JobStatus};
+use jammi_db::catalog::status::{JobExecution, JobKind, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
@@ -80,9 +80,8 @@ use jammi_datafusion::ModelTask;
 
 /// A durable, self-contained description of a compute job: the verb that
 /// produced it (the variant) and the inputs [`execute_compute`] reconstructs
-/// the run from. Persisted as JSON on `jobs.spec`; the variant's serde tag
-/// mirrors into `jobs.kind` — see `crate::fine_tune::worker::is_compute_kind`
-/// for the vocabulary this must stay in sync with.
+/// the run from. Persisted as JSON on `jobs.spec`; [`ComputeSpec::kind`] is
+/// the `jobs.kind` it submits under.
 ///
 /// Every variant carries its own `cache`: EVERY embedded synchronous compute
 /// verb routes through [`InferenceSession::run_now`], including the ones
@@ -181,20 +180,16 @@ impl ComputeSpec {
         }
     }
 
-    /// The `jobs.kind` tag this variant submits under — spelled out
-    /// explicitly (rather than round-tripped through the serializer) so the
-    /// mapping stays greppable, and so `crate::fine_tune::worker::is_compute_kind`
-    /// and [`crate::fine_tune::worker::COMPILED_KINDS`] can name the same
-    /// strings without invoking serde.
-    pub fn kind(&self) -> &'static str {
+    /// The `jobs.kind` this variant submits under.
+    pub fn kind(&self) -> JobKind {
         match self {
-            ComputeSpec::NeighborGraph { .. } => "neighbor_graph",
-            ComputeSpec::Propagate { .. } => "propagate",
-            ComputeSpec::GraphStructure { .. } => "graph_structure",
-            ComputeSpec::AsofJoin { .. } => "asof_join",
-            ComputeSpec::LexicalIndex { .. } => "lexical_index",
-            ComputeSpec::Embedding(_) => "embedding",
-            ComputeSpec::Infer { .. } => "infer",
+            ComputeSpec::NeighborGraph { .. } => JobKind::NeighborGraph,
+            ComputeSpec::Propagate { .. } => JobKind::Propagate,
+            ComputeSpec::GraphStructure { .. } => JobKind::GraphStructure,
+            ComputeSpec::AsofJoin { .. } => JobKind::AsofJoin,
+            ComputeSpec::LexicalIndex { .. } => JobKind::LexicalIndex,
+            ComputeSpec::Embedding(_) => JobKind::Embedding,
+            ComputeSpec::Infer { .. } => JobKind::Infer,
         }
     }
 }
@@ -321,19 +316,19 @@ pub enum JobSpec {
 }
 
 impl JobSpec {
-    /// The `jobs.kind` tag this spec submits under.
-    pub fn kind(&self) -> &'static str {
+    /// The `jobs.kind` this spec submits under.
+    pub fn kind(&self) -> JobKind {
         match self {
-            JobSpec::FineTune { .. } => "fine_tune",
-            JobSpec::GraphFineTune { .. } => "graph_fine_tune",
-            JobSpec::ContextPredictor { .. } => "context_predictor",
-            JobSpec::NeighborGraph { .. } => "neighbor_graph",
-            JobSpec::Propagate { .. } => "propagate",
-            JobSpec::GraphStructure { .. } => "graph_structure",
-            JobSpec::AsofJoin { .. } => "asof_join",
-            JobSpec::LexicalIndex { .. } => "lexical_index",
-            JobSpec::Embedding(_) => "embedding",
-            JobSpec::Infer { .. } => "infer",
+            JobSpec::FineTune { .. } => JobKind::FineTune,
+            JobSpec::GraphFineTune { .. } => JobKind::GraphFineTune,
+            JobSpec::ContextPredictor { .. } => JobKind::ContextPredictor,
+            JobSpec::NeighborGraph { .. } => JobKind::NeighborGraph,
+            JobSpec::Propagate { .. } => JobKind::Propagate,
+            JobSpec::GraphStructure { .. } => JobKind::GraphStructure,
+            JobSpec::AsofJoin { .. } => JobKind::AsofJoin,
+            JobSpec::LexicalIndex { .. } => JobKind::LexicalIndex,
+            JobSpec::Embedding(_) => JobKind::Embedding,
+            JobSpec::Infer { .. } => JobKind::Infer,
         }
     }
 
@@ -345,9 +340,8 @@ impl JobSpec {
     /// the type doc), and a caller that needs the narrower standalone type
     /// — [`crate::fine_tune::spec::admit_training_spec`],
     /// [`InferenceSession::training_job_links`] (both take `&TrainingSpec`),
-    /// the loop-claimer and Peer-rank training-claim paths
-    /// (`crate::fine_tune::worker`), and [`crate::fine_tune::training_job::
-    /// resolve_model_id`] — decodes `JobSpec` first, then projects with
+    /// and the loop-claimer and Peer-rank training-claim paths
+    /// (`crate::fine_tune::worker`) — decodes `JobSpec` first, then projects with
     /// this method, never decoding `TrainingSpec` directly from a `jobs.spec`
     /// row again (only `JobSpec`'s OWN byte-pin tests still construct a bare
     /// `TrainingSpec` value, to prove the two shapes stay byte-identical).
@@ -577,6 +571,30 @@ pub enum JobResult {
         /// the table for an exact cache hit.
         cache_outcome: CacheOutcome,
     },
+}
+
+impl JobResult {
+    /// The result `record` holds: `Some` once the job completed, `None`
+    /// before. The finalize writes the result and `completed` in one
+    /// compare-and-set, so a completed row without a decodable result is a
+    /// catalog fault, never "no result yet".
+    pub fn recorded(record: &JobRecord) -> Result<Option<Self>> {
+        if record.status != JobStatus::Completed {
+            return Ok(None);
+        }
+        let raw = record.result.as_deref().ok_or_else(|| {
+            JammiError::Catalog(format!(
+                "job '{}' completed with no recorded result",
+                record.job_id
+            ))
+        })?;
+        serde_json::from_str(raw).map(Some).map_err(|e| {
+            JammiError::Catalog(format!(
+                "job '{}' recorded an unparseable result: {e}",
+                record.job_id
+            ))
+        })
+    }
 }
 
 /// The per-attempt disposition: what a claimed job's worker does BEFORE it
@@ -893,63 +911,85 @@ fn table_result(record: ResultTableRecord, outcome: CacheOutcome) -> JobResult {
     }
 }
 
-/// A handle to a submitted job — training or compute — returned by
-/// [`InferenceSession::enqueue`]. Polls/waits/cancels by id through the
-/// catalog; carries no in-memory job state of its own (a fresh process can
-/// reattach to the same `job_id`).
+/// A handle to a job — training or compute — by id: the one handle every
+/// submit path returns and [`InferenceSession::job`] attaches. It carries no
+/// in-memory job state beyond what the job was submitted as; every read goes
+/// to the catalog, so a fresh process attaching by id reads what the
+/// submitter would.
+#[derive(Clone)]
 pub struct JobHandle {
-    /// The submitted job's id.
-    pub job_id: String,
-    /// The `jobs.kind` tag this job submitted under.
-    pub kind: String,
+    job_id: String,
+    kind: JobKind,
+    /// The model a training kind registers; `None` for a compute kind.
+    output_model_id: Option<String>,
     catalog: Arc<Catalog>,
 }
 
 impl JobHandle {
-    pub(crate) fn new(job_id: String, kind: String, catalog: Arc<Catalog>) -> Self {
+    pub(crate) fn new(
+        job_id: String,
+        kind: JobKind,
+        output_model_id: Option<String>,
+        catalog: Arc<Catalog>,
+    ) -> Self {
         Self {
             job_id,
             kind,
+            output_model_id,
             catalog,
         }
     }
 
-    /// Current status string (`queued`/`running`/`completed`/`failed`).
-    pub async fn status(&self) -> Result<String> {
-        Ok(self.catalog.get_job(&self.job_id).await?.status)
+    /// Attach to the job `job_id` names. Existence is resolved here, by the
+    /// catalog read itself: a job this tenant cannot see is the read's own
+    /// not-found, never a handle that fails on first use.
+    pub(crate) async fn attach(catalog: Arc<Catalog>, job_id: &str) -> Result<Self> {
+        let record = catalog.get_job(job_id).await?;
+        Ok(Self::new(
+            record.job_id,
+            record.kind,
+            record.output_model_id,
+            catalog,
+        ))
     }
 
-    /// Block until the job reaches a terminal state, returning the parsed
+    /// The job's id.
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// What the job runs.
+    pub fn kind(&self) -> JobKind {
+        self.kind
+    }
+
+    /// The model a training kind registers, stamped on the job's row at
+    /// submission. `None` for a compute kind, which registers no model.
+    pub fn output_model_id(&self) -> Option<&str> {
+        self.output_model_id.as_deref()
+    }
+
+    /// The job's catalog row as it stands now.
+    pub async fn record(&self) -> Result<JobRecord> {
+        self.catalog.get_job(&self.job_id).await
+    }
+
+    /// The job's current status.
+    pub async fn status(&self) -> Result<JobStatus> {
+        Ok(self.record().await?.status)
+    }
+
+    /// Block until the job reaches a terminal state, returning its
     /// [`JobResult`] on success. A job that ended without its result surfaces
-    /// [`JobRecord::unsuccessful_error`](jammi_db::catalog::jobs_repo::JobRecord::unsuccessful_error):
-    /// its recorded error for a `failed` job, [`JammiError::JobCancelled`] for
-    /// a `cancelled` one.
+    /// [`JobRecord::unsuccessful_error`]: its recorded error for a `failed`
+    /// job, [`JammiError::JobCancelled`] for a `cancelled` one.
     pub async fn wait(&self) -> Result<JobResult> {
         loop {
-            let record = self.catalog.get_job(&self.job_id).await?;
-            let status: JobStatus = record
-                .status
-                .parse()
-                .map_err(|e| JammiError::Catalog(format!("{e}")))?;
-            // Derived from `JobStatus::is_terminal_unsuccessful`/`Completed`
-            // (the ONE terminality predicate) rather than a per-variant
-            // match arm, so a future terminal-unsuccessful status joining
-            // the vocabulary ends this wait with a one-line edit, not a
-            // hunt for every per-variant match arm.
-            if status == JobStatus::Completed {
-                let result_json = record.result.ok_or_else(|| {
-                    JammiError::Catalog(format!(
-                        "job '{}' completed with no recorded result",
-                        self.job_id
-                    ))
-                })?;
-                return serde_json::from_str(&result_json).map_err(|e| {
-                    JammiError::Catalog(format!(
-                        "job '{}' recorded an unparseable result: {e}",
-                        self.job_id
-                    ))
-                });
-            } else if let Some(error) = record.unsuccessful_error() {
+            let record = self.record().await?;
+            if let Some(result) = JobResult::recorded(&record)? {
+                return Ok(result);
+            }
+            if let Some(error) = record.unsuccessful_error() {
                 return Err(error);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -964,6 +1004,16 @@ impl JobHandle {
     /// or absent.
     pub async fn cancel(&self) -> Result<bool> {
         self.catalog.cancel_request(&self.job_id).await
+    }
+}
+
+impl std::fmt::Debug for JobHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobHandle")
+            .field("job_id", &self.job_id)
+            .field("kind", &self.kind)
+            .field("output_model_id", &self.output_model_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1010,22 +1060,8 @@ impl InferenceSession {
             Some(training) => {
                 let admitted =
                     crate::fine_tune::spec::admit_training_spec(self.jammi_config(), training)?;
-                let links = self.training_job_links(admitted.spec(), &job_id).await?;
-                let submitted = crate::fine_tune::spec::submit_admitted_training(
-                    self.catalog(),
-                    &admitted,
-                    &job_id,
-                    links.model_ref.as_deref(),
-                    &links.output_model_id,
-                    priority,
-                    None,
-                )
-                .await?;
-                debug_assert_eq!(
-                    submitted.recorded_job_id, job_id,
-                    "enqueue never dedupes (idempotency_key = None), so the recorded id is \
-                     always the one this call minted"
-                );
+                self.submit_training(&admitted, job_id, priority, None)
+                    .await
             }
             None => {
                 let spec_json = serde_json::to_string(&spec)?;
@@ -1042,13 +1078,22 @@ impl InferenceSession {
                         priority,
                     })
                     .await?;
+                Ok(JobHandle::new(
+                    job_id,
+                    kind,
+                    None,
+                    Arc::clone(self.catalog_arc()),
+                ))
             }
         }
-        Ok(JobHandle::new(
-            job_id,
-            kind.to_string(),
-            Arc::clone(self.catalog_arc()),
-        ))
+    }
+
+    /// A handle to the job `job_id` names, submitted by this session or any
+    /// other. Existence is resolved by the catalog read itself: a job this
+    /// tenant cannot see is that read's not-found, never a handle that fails on
+    /// first use.
+    pub async fn job(&self, job_id: &str) -> Result<JobHandle> {
+        JobHandle::attach(Arc::clone(self.catalog_arc()), job_id).await
     }
 
     /// Execute `spec` inline, in the caller's own task: submits an
@@ -1368,14 +1413,14 @@ mod tests {
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind(), "propagate");
+        assert_eq!(back.kind(), JobKind::Propagate);
         assert_eq!(spec.kind(), back.kind());
 
         let job_spec: JobSpec = spec.into();
-        assert_eq!(job_spec.kind(), "propagate");
+        assert_eq!(job_spec.kind(), JobKind::Propagate);
         let job_json = serde_json::to_string(&job_spec).unwrap();
         let back_job: JobSpec = serde_json::from_str(&job_json).unwrap();
-        assert_eq!(back_job.kind(), "propagate");
+        assert_eq!(back_job.kind(), JobKind::Propagate);
     }
 
     #[test]
@@ -1394,7 +1439,7 @@ mod tests {
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind(), "graph_structure");
+        assert_eq!(back.kind(), JobKind::GraphStructure);
         let ComputeSpec::GraphStructure {
             request: decoded,
             cache,
@@ -1406,12 +1451,12 @@ mod tests {
         assert_eq!(cache, CachePolicy::Use);
 
         let job_spec: JobSpec = spec.into();
-        assert_eq!(job_spec.kind(), "graph_structure");
+        assert_eq!(job_spec.kind(), JobKind::GraphStructure);
         let back_job: JobSpec =
             serde_json::from_str(&serde_json::to_string(&job_spec).unwrap()).unwrap();
         assert_eq!(
             back_job.as_compute_spec().unwrap().kind(),
-            "graph_structure"
+            JobKind::GraphStructure
         );
     }
 
@@ -1450,7 +1495,7 @@ mod tests {
              wrapper, got: {json}"
         );
         let back: JobSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind(), "fine_tune");
+        assert_eq!(back.kind(), JobKind::FineTune);
     }
 
     /// The untagged-collapse case, through `JobSpec` (not `TrainingSpec`
@@ -1808,7 +1853,7 @@ mod tests {
         };
         let json = serde_json::to_string(&ng).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind(), "neighbor_graph");
+        assert_eq!(back.kind(), JobKind::NeighborGraph);
 
         let left = crate::pipeline::asof::AsofKey {
             by: vec!["id".into()],
@@ -1826,7 +1871,7 @@ mod tests {
         };
         let json = serde_json::to_string(&asof).unwrap();
         let back: ComputeSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kind(), "asof_join");
+        assert_eq!(back.kind(), JobKind::AsofJoin);
     }
 
     /// The `PropagateRequest` builder knobs (direction/hops/weighting/alpha/

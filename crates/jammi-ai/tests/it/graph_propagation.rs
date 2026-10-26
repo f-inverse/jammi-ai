@@ -307,7 +307,7 @@ fn two_class_homophilous(per_class: usize) -> (Vec<Node>, Vec<Edge>) {
 
 /// The rate at which each node's nearest neighbour (by cosine, over the given
 /// vectors, excluding itself) shares its class label. The structure-respect
-/// metric `eval_embeddings` would compute against a golden set, here measured
+/// metric `eval_embeddings` would compute against a ground truth, here measured
 /// directly and deterministically.
 fn nn_same_class_rate(
     vectors: &HashMap<String, Vec<f32>>,

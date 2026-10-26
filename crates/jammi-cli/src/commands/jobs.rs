@@ -9,7 +9,8 @@
 //! from training jobs to every job kind.
 
 use clap::Subcommand;
-use jammi_admin::{CatalogClient, JobSummary};
+use jammi_admin::CatalogClient;
+use jammi_wire::JobSummary;
 
 #[derive(Subcommand)]
 pub enum JobAction {
@@ -51,11 +52,11 @@ pub async fn run(
             println!("job_id:   {job_id}");
             println!("kind:     {}", info.kind);
             println!("status:   {}", info.status);
-            if !info.output_model_id.is_empty() {
-                println!("model_id: {}", info.output_model_id);
+            if let Some(model) = &info.produced_model_id {
+                println!("model_id: {model}");
             }
-            if !info.error.is_empty() {
-                println!("error:    {}", info.error);
+            if let Some(error) = &info.error {
+                println!("error:    {error}");
             }
             if let Some(metrics) = &info.metrics_json {
                 // Opaque blob — printed verbatim, not parsed or reformatted.
@@ -98,6 +99,10 @@ fn print_header() {
 fn print_row(j: &JobSummary) {
     println!(
         "{:<38} {:<18} {:<10} {:<26} {}",
-        j.job_id, j.kind, j.status, j.created_at, j.output_model_id,
+        j.job_id,
+        j.kind,
+        j.status,
+        j.created_at,
+        j.output_model_id.as_deref().unwrap_or("—"),
     );
 }

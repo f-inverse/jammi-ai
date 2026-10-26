@@ -124,20 +124,16 @@ async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
     )
     .await;
     Box::pin(worker.run_claimed_job(session, record)).await;
-    let record = session.catalog().get_job(&job.job_id).await.expect("row");
-    assert_eq!(
-        record.status, "completed",
-        "the job must complete: {:?}",
-        record.error
-    );
-    let result: jammi_ai::jobs::JobResult =
-        serde_json::from_str(record.result.as_deref().expect("a result")).expect("result");
-    let jammi_ai::jobs::JobResult::Model {
+    let record = job.record().await.expect("row");
+    let Some(jammi_ai::jobs::JobResult::Model {
         metrics: Some(metrics),
         ..
-    } = result
+    }) = jammi_ai::jobs::JobResult::recorded(&record).expect("the result decodes")
     else {
-        panic!("a fine-tune's result is a model with metrics");
+        panic!(
+            "the job must complete with a model and its metrics: {:?}",
+            record.error
+        );
     };
     let metrics: serde_json::Value = serde_json::from_str(&metrics).expect("metrics json");
     let loss_curve = metrics["train_loss_curve"]
@@ -147,7 +143,7 @@ async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
         .map(|point| point["loss"].as_f64().expect("a loss"))
         .collect();
     Trained {
-        adapter: published_adapter_bytes(session, &job.job_id).await,
+        adapter: published_adapter_bytes(session, job.job_id()).await,
         loss_curve,
         claimed_by: record.claimed_by,
         ranks: record.ranks,

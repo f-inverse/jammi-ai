@@ -20,6 +20,7 @@ use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
+use jammi_db::catalog::status::{JobKind, JobStatus};
 use jammi_db::config::{
     CatalogConfig, DistributedConfig, JammiConfig, LeaseConfig, StorageConfig, WorkerConfig,
 };
@@ -643,7 +644,6 @@ pub async fn await_job(
 /// name, through [`await_job`]'s terminal-status arm — the fixture is too short
 /// for the host, which is a fault of the test and not of the engine.
 pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, job_id: &str) {
-    let running = jammi_db::catalog::status::JobStatus::Running.to_string();
     let deadline = Instant::now() + TERMINAL_TIMEOUT;
     loop {
         await_job(
@@ -652,7 +652,7 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
             job_id,
             None,
             "the job is running, to be crashed mid-run",
-            |r| r.status == running,
+            |r| r.status == JobStatus::Running,
         )
         .await;
         // The lease holder writes each epoch's checkpoint under its own
@@ -684,7 +684,7 @@ pub async fn await_mid_run(fleet: &mut Fleet, session: &Arc<InferenceSession>, j
 /// — so rank `r` of a gang this instant assembled is the `r`-th entry.
 pub async fn gang_members(
     session: &Arc<InferenceSession>,
-    kind: &str,
+    kind: JobKind,
     self_instance: &str,
 ) -> Vec<jammi_db::catalog::instance::GangMember> {
     let root = jammi_db::catalog::instance::MemberRoot::resolved(session.inner_config())
@@ -708,7 +708,7 @@ pub async fn gang_members(
 pub async fn await_fleet_gang_ready(
     fleet: &mut Fleet,
     session: &Arc<InferenceSession>,
-    kind: &str,
+    kind: JobKind,
     n: usize,
 ) {
     let deadline = Instant::now() + TERMINAL_TIMEOUT;
@@ -891,7 +891,12 @@ pub async fn submit_gang_fine_tune(
         })
         .await
         .expect("submit a queued two-rank fine-tune job to the shared catalog");
-    (job.job_id.clone(), job.model_id().to_string())
+    (
+        job.job_id().to_string(),
+        job.output_model_id()
+            .expect("a fine-tune stamps the model it registers")
+            .to_string(),
+    )
 }
 
 /// Submit one durable LoRA fine-tune job over `source` on `session`, returning
@@ -920,5 +925,10 @@ pub async fn submit_fine_tune(
         )
         .await
         .expect("submit queued fine-tune job to shared catalog");
-    (job.job_id.clone(), job.model_id().to_string())
+    (
+        job.job_id().to_string(),
+        job.output_model_id()
+            .expect("a fine-tune stamps the model it registers")
+            .to_string(),
+    )
 }

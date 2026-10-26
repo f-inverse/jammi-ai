@@ -501,13 +501,13 @@ async fn recipe_fine_tune() {
         .await
         .unwrap();
 
-    assert!(!job.job_id.is_empty());
+    assert!(!job.job_id().is_empty());
 
     // Wait for completion (cookbook recipe)
     job.wait().await.unwrap();
 
     // Use the fine-tuned model (cookbook recipe)
-    let ft_model_id = job.model_id();
+    let ft_model_id = job.output_model_id().unwrap();
     assert!(ft_model_id.starts_with("jammi:fine-tuned:"));
 
     // Register a source and generate embeddings with the fine-tuned model
@@ -555,7 +555,7 @@ async fn recipe_evaluation() {
     let session = cookbook_session(&dir).await;
     let model_id = tiny_bert_id();
 
-    // Register source + golden set (cookbook recipe)
+    // Register source + ground truth (cookbook recipe)
     session
         .add_source(
             "patents",
@@ -571,10 +571,10 @@ async fn recipe_evaluation() {
 
     session
         .add_source(
-            "golden",
+            "truth",
             SourceType::File,
             SourceConnection {
-                url: Some(common::fixture_url("golden_relevance.csv")),
+                url: Some(common::fixture_url("relevance.csv")),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -601,7 +601,7 @@ async fn recipe_evaluation() {
         .eval_embeddings(common::retrieval_eval(
             "patents",
             None,
-            "golden.public.golden_relevance",
+            "truth.public.relevance",
             10,
         ))
         .await
@@ -613,7 +613,7 @@ async fn recipe_evaluation() {
     assert!(metrics.aggregate.precision_at_k >= 0.0);
     assert!(metrics.aggregate.mrr >= 0.0);
     assert!(metrics.aggregate.ndcg >= 0.0);
-    // Per-query arrays carry one record per golden-set query
+    // Per-query arrays carry one record per ground-truth query
     assert!(!metrics.per_query.is_empty());
 
     // eval_compare with two embedding tables (cookbook recipe)
@@ -634,7 +634,7 @@ async fn recipe_evaluation() {
         .eval_compare(common::compare_eval(
             &[record.table_name.clone(), record2.table_name.clone()],
             "patents",
-            "golden.public.golden_relevance",
+            "truth.public.relevance",
             10,
         ))
         .await
@@ -1039,7 +1039,7 @@ async fn recipe_evaluation_ner() {
 
     session
         .add_source(
-            "golden",
+            "truth",
             SourceType::File,
             SourceConnection {
                 url: Some(common::cookbook_fixture_url("tiny_ner_gold.csv")),
@@ -1057,7 +1057,7 @@ async fn recipe_evaluation_ner() {
                 "corpus",
                 &["text".to_string()],
                 EvalTask::Ner,
-                "golden.public.tiny_ner_gold",
+                "truth.public.tiny_ner_gold",
                 "label",
             )
             .await

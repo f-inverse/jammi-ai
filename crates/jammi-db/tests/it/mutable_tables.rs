@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use futures::StreamExt;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
 };
@@ -651,10 +651,10 @@ async fn drop_makes_select_fail(backend: BackendKind) {
         ))
         .await
         .unwrap_err();
-    let msg = err.to_string();
+    let named = format!("mutable.public.{}", id.as_str());
     assert!(
-        msg.contains("not found") || msg.contains("Table") || msg.contains(id.as_str()),
-        "expected table-not-found error; got: {msg}"
+        matches!(&err, JammiError::NotFound(Missing::Relation { name }) if *name == named),
+        "a query over a dropped table is the typed NotFound naming it; got: {err:?}"
     );
 }
 
@@ -849,6 +849,59 @@ async fn list_filters_by_tenant_scope(backend: BackendKind) {
         .drop_mutable_table(&scoped_id)
         .await
         .unwrap();
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_id_is_already_exists_for_its_owner_and_for_another_tenant(backend: BackendKind) {
+    use jammi_db::TenantId;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let owner = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let other = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
+    let id = unique_id("taken");
+    let def = |tenant: TenantId| {
+        MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+            .primary_key(vec!["id".into()])
+            .tenant(Some(tenant))
+            .build()
+            .unwrap()
+    };
+
+    session.bind_tenant(owner);
+    session.create_mutable_table(def(owner)).await.unwrap();
+    for (who, tenant) in [("its owner", owner), ("another tenant", other)] {
+        session.bind_tenant(tenant);
+        let err = session
+            .create_mutable_table(def(tenant))
+            .await
+            .expect_err("a taken id must be refused");
+        assert!(
+            matches!(
+                &err,
+                JammiError::MutableTable(MutableTableError::AlreadyExists(taken)) if *taken == id
+            ),
+            "{who}: {err:?}"
+        );
+    }
+
+    let kept = session
+        .mutable_tables()
+        .list(Some(owner))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == id)
+        .expect("the owner's table survives the refused creates");
+    assert_eq!(kept.tenant, Some(owner));
+    session.bind_tenant(owner);
+    session.drop_mutable_table(&id).await.unwrap();
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

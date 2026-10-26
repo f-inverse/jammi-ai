@@ -87,11 +87,14 @@ impl SessionTransport {
             .into()
             .connect()
             .await
-            .map_err(|e| JammiError::Config(format!("connect to jammi endpoint: {e}")))?;
+            .map_err(|e| JammiError::Unavailable {
+                resource: "jammi endpoint".into(),
+                reason: e.to_string(),
+            })?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let id: MetadataValue<tonic::metadata::Ascii> = session_id
             .parse()
-            .map_err(|e| JammiError::Config(format!("session id metadata: {e}")))?;
+            .map_err(|e| JammiError::Internal(format!("session id metadata: {e}")))?;
         Ok(Self {
             channel,
             header: SessionHeader { id, bearer: None },

@@ -41,7 +41,7 @@ pub fn total_physical_memory_bytes() -> Result<u64> {
 #[cfg(target_os = "linux")]
 fn platform_total_memory_bytes() -> Result<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").map_err(|e| {
-        JammiError::Config(format!(
+        JammiError::Internal(format!(
             "[engine] memory_limit: could not read /proc/meminfo to resolve a percentage: {e}"
         ))
     })?;
@@ -52,7 +52,7 @@ fn platform_total_memory_bytes() -> Result<u64> {
         .and_then(|kb| kb.trim().parse::<u64>().ok())
         .map(|kb| kb.saturating_mul(1024))
         .ok_or_else(|| {
-            JammiError::Config(
+            JammiError::Internal(
                 "[engine] memory_limit: /proc/meminfo carries no parseable 'MemTotal' line"
                     .to_string(),
             )
@@ -94,7 +94,7 @@ fn platform_total_memory_bytes() -> Result<u64> {
         )
     };
     if rc != 0 {
-        return Err(JammiError::Config(format!(
+        return Err(JammiError::Internal(format!(
             "[engine] memory_limit: sysctlbyname(\"hw.memsize\") failed: {}",
             std::io::Error::last_os_error()
         )));

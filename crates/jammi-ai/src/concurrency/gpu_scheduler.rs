@@ -122,7 +122,10 @@ impl GpuScheduler {
         let slot = Arc::clone(&self.forward_slots)
             .acquire_owned()
             .await
-            .map_err(|_| JammiError::Gpu("the device's forward admission is closed".into()))?;
+            .map_err(|_| JammiError::Unavailable {
+                resource: "device".into(),
+                reason: "its forward admission is closed".into(),
+            })?;
         Ok(ForwardPermit { _slot: slot })
     }
 

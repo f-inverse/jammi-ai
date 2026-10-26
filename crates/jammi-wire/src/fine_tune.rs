@@ -55,9 +55,10 @@ impl std::str::FromStr for FineTuneMethod {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "lora" => Ok(Self::Lora),
-            other => Err(jammi_db::error::JammiError::FineTune(format!(
-                "Unknown fine-tuning method '{other}'. Supported: lora"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "method".into(),
+                reason: format!("Unknown fine-tuning method '{other}'. Supported: lora"),
+            }),
         }
     }
 }
@@ -260,6 +261,54 @@ impl Default for HardNegativeConfig {
     }
 }
 
+/// Where a fine-tune's LoRA adapters train.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EncoderTraining {
+    /// LoRA inside the encoder: trainable low-rank updates beside the frozen
+    /// weights of the selected linears, as LoRA describes (Hu et al., 2022).
+    /// A task that needs a head (classification, regression) trains it over
+    /// the adapted encoder's pooled output.
+    Adapted {
+        /// The sites, named as PEFT's `target_modules` names them: a site
+        /// name or a suffix of one, or `all-linear` for every site. Empty
+        /// selects the architecture's defaults: its attention block's query
+        /// and value projections, or the fused projection that holds them.
+        #[serde(default)]
+        target_modules: Vec<String>,
+        /// Only these 0-based encoder layers. `None` (default) = every layer.
+        #[serde(default)]
+        layers_to_transform: Option<Vec<usize>>,
+        /// Per-site rank overrides keyed by site-name substring, e.g.
+        /// `{"query": 16, "value": 4}`. Empty uses `lora_rank` everywhere.
+        #[serde(default)]
+        rank_pattern: HashMap<String, usize>,
+    },
+    /// The encoder trains frozen: a LoRA head over its pooled output carries
+    /// the whole adaptation. Cheaper per step, and the only choice for an
+    /// architecture the engine has no LoRA sites for.
+    Frozen,
+}
+
+impl EncoderTraining {
+    /// LoRA at `target_modules` in every encoder layer, at the request's
+    /// `lora_rank` everywhere.
+    pub fn adapted(target_modules: Vec<String>) -> Self {
+        Self::Adapted {
+            target_modules,
+            layers_to_transform: None,
+            rank_pattern: HashMap::new(),
+        }
+    }
+}
+
+impl Default for EncoderTraining {
+    /// LoRA inside the encoder at the architecture's default sites.
+    fn default() -> Self {
+        Self::adapted(Vec::new())
+    }
+}
+
 /// Configuration for a fine-tuning job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,32 +362,14 @@ pub struct FineTuneConfig {
     #[serde(default)]
     pub early_stopping_metric: EarlyStoppingMetric,
 
-    // ── Encoder-adapters fields (LoRA injected inside the encoder) ─────────
-    /// Layer name suffixes that receive LoRA adapters (PEFT `target_modules`).
-    ///
-    /// Empty = train a projection head on top of the frozen base model.
-    /// Non-empty = inject LoRA into the encoder's internal linears at the
-    /// listed sites and train those.
-    /// `["all-linear"]` = every linear layer.
-    /// Model-specific examples: `["query", "value"]` for BERT/RoBERTa;
-    /// `["q_lin", "v_lin"]` for DistilBERT; `["Wqkv"]` for ModernBERT.
+    /// Where the LoRA adapters train: inside the encoder (the default), or in
+    /// a head over a frozen encoder. See [`EncoderTraining`].
     #[serde(default)]
-    pub target_modules: Vec<String>,
-
-    /// Only apply LoRA to these 0-based encoder layer indices.
-    /// `None` (default) = all layers.
-    #[serde(default)]
-    pub layers_to_transform: Option<Vec<usize>>,
+    pub encoder: EncoderTraining,
 
     /// Use rank-stabilized scaling: `alpha / sqrt(rank)` instead of `alpha / rank`.
     #[serde(default)]
     pub use_rslora: bool,
-
-    /// Per-module rank overrides keyed by module-name substring.
-    /// E.g. `{"query": 16, "value": 4}` overrides the global `lora_rank` for
-    /// matching modules. An empty map uses `lora_rank` everywhere.
-    #[serde(default)]
-    pub rank_pattern: HashMap<String, usize>,
 
     /// Initialization strategy for the LoRA A (and optionally B) matrix.
     #[serde(default)]
@@ -537,10 +568,8 @@ impl Default for FineTuneConfig {
             warmup: Warmup::default(),
             lr_schedule: LrSchedule::CosineDecay,
             early_stopping_metric: EarlyStoppingMetric::ValLoss,
-            target_modules: Vec::new(),
-            layers_to_transform: None,
+            encoder: EncoderTraining::default(),
             use_rslora: false,
-            rank_pattern: HashMap::new(),
             init_lora_weights: jammi_lora::LoraInitMode::ZerosB,
             backbone_dtype: jammi_numerics::ComputePrecision::F32,
             weight_decay: 0.01,
@@ -560,36 +589,54 @@ impl FineTuneConfig {
         use jammi_db::error::JammiError;
 
         if self.lora_rank == 0 {
-            return Err(JammiError::FineTune("lora_rank must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_rank".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if let Warmup::Fraction(fraction) = self.warmup {
             if !(0.0..1.0).contains(&fraction) {
-                return Err(JammiError::FineTune(format!(
-                    "warmup fraction must be in [0, 1), got {fraction}"
-                )));
+                return Err(JammiError::InvalidArgument {
+                    argument: "warmup_fraction".into(),
+                    reason: format!("must be in [0, 1), got {fraction}"),
+                });
             }
         }
         if self.lora_alpha <= 0.0 {
-            return Err(JammiError::FineTune("lora_alpha must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_alpha".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if !(0.0..1.0).contains(&self.lora_dropout) {
-            return Err(JammiError::FineTune(
-                "lora_dropout must be in [0.0, 1.0)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "lora_dropout".into(),
+                reason: "must be in [0.0, 1.0)".into(),
+            });
         }
         if self.learning_rate <= 0.0 {
-            return Err(JammiError::FineTune("learning_rate must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "learning_rate".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.epochs == 0 {
-            return Err(JammiError::FineTune("epochs must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "epochs".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.batch_size == 0 {
-            return Err(JammiError::FineTune("batch_size must be > 0".into()));
+            return Err(JammiError::InvalidArgument {
+                argument: "batch_size".into(),
+                reason: "must be > 0".into(),
+            });
         }
         if self.gradient_accumulation_steps == 0 {
-            return Err(JammiError::FineTune(
-                "gradient_accumulation_steps must be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "gradient_accumulation_steps".into(),
+                reason: "must be > 0".into(),
+            });
         }
         // Domain-validity at the edge: a NaN `max_grad_norm` compares `false`
         // against everything, so it would pass a `<= 0.0` "disabled" check
@@ -597,20 +644,22 @@ impl FineTuneConfig {
         // of non-finite tuning parameter. `0.0` (disable) and any finite
         // value stay legal.
         if !self.max_grad_norm.is_finite() {
-            return Err(JammiError::FineTune(format!(
-                "max_grad_norm must be finite, got {}",
-                self.max_grad_norm
-            )));
+            return Err(JammiError::InvalidArgument {
+                argument: "max_grad_norm".into(),
+                reason: format!("must be finite, got {}", self.max_grad_norm),
+            });
         }
         if !(0.0..1.0).contains(&self.validation_fraction) {
-            return Err(JammiError::FineTune(
-                "validation_fraction must be in [0.0, 1.0)".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "validation_fraction".into(),
+                reason: "must be in [0.0, 1.0)".into(),
+            });
         }
         if self.early_stopping_patience == 0 {
-            return Err(JammiError::FineTune(
-                "early_stopping_patience must be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "early_stopping_patience".into(),
+                reason: "must be > 0".into(),
+            });
         }
         // Monitoring a metric that will never be measured. Refused rather than
         // coerced to TrainLoss: the caller asked for two things that cannot both
@@ -621,56 +670,64 @@ impl FineTuneConfig {
         if self.validation_fraction == 0.0
             && self.early_stopping_metric == EarlyStoppingMetric::ValLoss
         {
-            return Err(JammiError::FineTune(
-                "early_stopping_metric=val_loss requires validation_fraction > 0; \
-                 set early_stopping_metric=train_loss to train on the whole \
-                 dataset, or raise validation_fraction to hold out a split"
+            return Err(JammiError::InvalidArgument {
+                argument: "early_stopping_metric".into(),
+                reason: "val_loss requires validation_fraction > 0; set \
+                         early_stopping_metric=train_loss to train on the whole dataset, or \
+                         raise validation_fraction to hold out a split"
                     .into(),
-            ));
+            });
         }
         if self.hard_negatives.mine {
             if self.hard_negatives.k == 0 {
-                return Err(JammiError::FineTune(
-                    "hard_negatives.k must be > 0 when mining is enabled".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "hard_negative_k".into(),
+                    reason: "must be > 0 when mining is enabled".into(),
+                });
             }
             if self.hard_negatives.refresh_every == 0 {
-                return Err(JammiError::FineTune(
-                    "hard_negatives.refresh_every must be > 0 when mining is enabled".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "hard_negative_refresh_every".into(),
+                    reason: "must be > 0 when mining is enabled".into(),
+                });
             }
         }
         if self.matryoshka_dims.contains(&0) {
-            return Err(JammiError::FineTune(
-                "matryoshka_dims entries must all be > 0".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "matryoshka_dims".into(),
+                reason: "entries must all be > 0".into(),
+            });
         }
         if let Some(RegressionLoss::BetaNll { beta }) = self.regression_loss {
             if !(0.0..=1.0).contains(&beta) {
-                return Err(JammiError::FineTune(
-                    "regression_loss BetaNll beta must be in [0.0, 1.0]".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "regression_beta".into(),
+                    reason: "must be in [0.0, 1.0]".into(),
+                });
             }
         }
         if matches!(self.regression_loss, Some(RegressionLoss::Pinball)) {
             if self.quantile_levels.is_empty() {
-                return Err(JammiError::FineTune(
-                    "Pinball regression loss requires at least one quantile level".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "the pinball loss needs at least one level".into(),
+                });
             }
             if self
                 .quantile_levels
                 .iter()
                 .any(|&q| !(0.0..1.0).contains(&q) || q <= 0.0)
             {
-                return Err(JammiError::FineTune(
-                    "quantile_levels must lie strictly in (0, 1)".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "must lie strictly in (0, 1)".into(),
+                });
             }
             if self.quantile_levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::FineTune(
-                    "quantile_levels must be strictly ascending".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "quantile_levels".into(),
+                    reason: "must be strictly ascending".into(),
+                });
             }
         }
         // 0 is ambiguous; omit the field to keep all. A caller that means "no
@@ -678,12 +735,13 @@ impl FineTuneConfig {
         // artifact is unconditional and unaffected either way) — refuse rather
         // than silently reinterpret it.
         if self.keep_last_n_checkpoints == Some(0) {
-            return Err(JammiError::FineTune(
-                "keep_last_n_checkpoints=0 is ambiguous; omit the field to disable per-epoch \
-                 checkpointing entirely (the default), or set it to a value >= 1 to enable it \
-                 and retain a rolling window (>= epochs retains every epoch)"
+            return Err(JammiError::InvalidArgument {
+                argument: "keep_last_n_checkpoints".into(),
+                reason: "0 is ambiguous; omit the field to disable per-epoch checkpointing \
+                         entirely (the default), or set it to a value >= 1 to enable it and \
+                         retain a rolling window (>= epochs retains every epoch)"
                     .into(),
-            ));
+            });
         }
         Ok(())
     }
@@ -952,7 +1010,7 @@ mod validation_tests {
     /// epoch 0 win `0.0 < f64::MAX` and write `checkpoint_best`, every later
     /// epoch fails `0.0 < 0.0` and burns patience, the loop breaks at
     /// `patience + 1` epochs, and the epoch-0 adapter publishes as the run's
-    /// result with a reported `final_loss` of 0.0. A silently untrained model
+    /// result with a reported `best_loss` of 0.0. A silently untrained model
     /// reported as perfect.
     ///
     /// Refused, not coerced. Auto-switching the metric to `TrainLoss` would

@@ -32,8 +32,6 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use super::artifact_repo::{
     probe_published_artifact, publish_staged_artifact, ArtifactRef, MaterializationSummary,
     PublishingArtifact, ReclaimLicence, StagedArtifact, REFERENCED,
@@ -47,7 +45,7 @@ use super::lease::{
     canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
     stale_before_clause, CanonicalStampColumn,
 };
-use super::status::{ArtifactState, JobExecution, JobStatus};
+use super::status::{ArtifactState, JobExecution, JobKind, JobKinds, JobPhase, JobStatus};
 use super::Catalog;
 use crate::error::{JammiError, Missing, Result};
 use crate::store::manifest::{DefinitionHash, InputAnchor, PinnedAnchors};
@@ -55,13 +53,13 @@ use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
 /// A row from the `jobs` catalog table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct JobRecord {
     pub job_id: String,
-    pub kind: String,
+    pub kind: JobKind,
     pub tenant_id: Option<TenantId>,
-    pub status: String,
-    pub execution: String,
+    pub status: JobStatus,
+    pub execution: JobExecution,
     /// The self-contained, producer-owned tagged JSON specification a worker
     /// reconstructs the run from on a fresh process. Stored opaquely — the
     /// typed shape lives in the engine crate that produces and consumes it.
@@ -76,9 +74,9 @@ pub struct JobRecord {
     pub result: Option<String>,
     /// The terminal failure message. `None` until the job fails.
     pub error: Option<String>,
-    pub progress_rows_done: Option<i64>,
-    pub progress_rows_total: Option<i64>,
-    pub progress_phase: Option<String>,
+    /// The latest progress the running attempt recorded; `None` until it
+    /// records any.
+    pub progress: Option<JobProgress>,
     /// Set by a cancel request; the executor observes it at a checkpoint
     /// boundary. Never cleared back to `false` once set.
     pub cancel_requested: bool,
@@ -185,29 +183,27 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
-    /// Whether this row is terminal (`completed` or `failed`) — no further
-    /// lease-guarded write is accepted, and the row is eligible for
-    /// retention once past `[jobs] retention_days`. Derived from
-    /// [`JobStatus::is_terminal`] (the ONE terminality predicate,
-    /// `status.rs:70-72`) rather than a hand-typed literal set, so a status
-    /// added to [`JobStatus::ALL`] is reflected here without a second edit.
-    /// An unparseable `status` (never written by this crate) is treated as
-    /// non-terminal — fail OPEN on lease-guard eligibility, never silently
-    /// terminal.
+    /// Whether this row is terminal — no further lease-guarded write is
+    /// accepted, and the row is eligible for retention once past
+    /// `[jobs] retention_days`. See [`JobStatus::is_terminal`].
     pub fn is_terminal(&self) -> bool {
-        self.status
-            .parse::<JobStatus>()
-            .map(|s| s.is_terminal())
-            .unwrap_or(false)
+        self.status.is_terminal()
     }
 
     /// Whether this row is terminal AND unsuccessful (`failed` or
     /// `cancelled`). See [`JobStatus::is_terminal_unsuccessful`].
     pub fn is_terminal_unsuccessful(&self) -> bool {
-        self.status
-            .parse::<JobStatus>()
-            .map(|s| s.is_terminal_unsuccessful())
-            .unwrap_or(false)
+        self.status.is_terminal_unsuccessful()
+    }
+
+    /// The model this job produced: the name its training kind registers
+    /// under, once it has completed. Before then, or for a job that failed or
+    /// was cancelled, no model exists — the name alone is
+    /// [`Self::output_model_id`].
+    pub fn produced_model_id(&self) -> Option<&str> {
+        (self.status == JobStatus::Completed)
+            .then_some(self.output_model_id.as_deref())
+            .flatten()
     }
 
     /// The typed error a caller waiting on this job sees once it has ended
@@ -216,15 +212,81 @@ impl JobRecord {
     /// [`JammiError::JobCancelled`], never the generic failure: the caller
     /// asked for that end and must be able to tell it from a fault.
     pub fn unsuccessful_error(&self) -> Option<JammiError> {
-        match self.status.parse::<JobStatus>().ok()? {
+        match self.status {
             JobStatus::Cancelled => Some(JammiError::JobCancelled {
                 job_id: self.job_id.clone(),
             }),
-            JobStatus::Failed => Some(JammiError::FineTune(
-                self.error.clone().unwrap_or_else(|| "job failed".into()),
-            )),
+            // `fail_job` always records the executor's error, so a failed row
+            // without one is a catalog fault, never a made-up reason.
+            JobStatus::Failed => Some(match &self.error {
+                Some(reason) => JammiError::JobFailed {
+                    job_id: self.job_id.clone(),
+                    reason: reason.clone(),
+                },
+                None => JammiError::Catalog(format!(
+                    "job '{}' failed with no recorded error",
+                    self.job_id
+                )),
+            }),
             JobStatus::Queued | JobStatus::Running | JobStatus::Completed => None,
         }
+    }
+}
+
+/// What a running attempt reports at a checkpoint: the phase it is in and
+/// how far through it is, counted in the phase's unit — rows while it
+/// assembles or computes, optimizer steps while it trains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobProgress {
+    /// What the attempt is doing.
+    pub phase: JobPhase,
+    /// How much of the phase is done.
+    pub done: Option<u64>,
+    /// How much the phase will do, where that is known up front.
+    pub total: Option<u64>,
+}
+
+/// Writes a running job's progress onto its row for the attempt that holds
+/// it: at every phase change, and within a phase at most once per
+/// [`PROGRESS_INTERVAL`] and at the phase's last unit — so a producer reports
+/// every step or batch without a catalog write for each.
+#[derive(Debug)]
+pub struct ProgressReporter {
+    attempt: super::result_repo::JobAttemptBuf,
+    last: Option<(JobPhase, std::time::Instant)>,
+}
+
+/// The shortest gap between two progress writes within one phase.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+impl ProgressReporter {
+    /// A reporter for `attempt`.
+    pub fn new(attempt: super::result_repo::JobAttemptBuf) -> Self {
+        Self {
+            attempt,
+            last: None,
+        }
+    }
+
+    /// Record `progress` through `catalog` (scoped to the job's tenant) when
+    /// it is due. A superseded attempt records nothing; its lease loss
+    /// surfaces where the attempt next writes under the lease.
+    pub async fn report(&mut self, catalog: &Catalog, progress: JobProgress) -> Result<()> {
+        let now = std::time::Instant::now();
+        let finished = progress.done.is_some() && progress.done == progress.total;
+        let due = match self.last {
+            None => true,
+            Some((phase, at)) => {
+                phase != progress.phase || finished || now.duration_since(at) >= PROGRESS_INTERVAL
+            }
+        };
+        if due {
+            catalog
+                .progress_job(self.attempt.as_attempt(), progress)
+                .await?;
+            self.last = Some((progress.phase, now));
+        }
+        Ok(())
     }
 }
 
@@ -536,7 +598,7 @@ impl AttemptColumn {
 }
 
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
-     result, error, progress_rows_done, progress_rows_total, progress_phase, cancel_requested, \
+     result, error, progress_done, progress_total, progress_phase, cancel_requested, \
      model_ref, output_model_id, model_source, claimed_by, ranks, attempts, releases, \
      lease_expires_at, priority, claimable, acceleration_report, \
      training_set_ref, training_set_location, created_at, updated_at";
@@ -638,9 +700,30 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
         partial_result: row.try_get("partial_result")?,
         result: row.try_get("result")?,
         error: row.try_get("error")?,
-        progress_rows_done: row.try_get("progress_rows_done")?,
-        progress_rows_total: row.try_get("progress_rows_total")?,
-        progress_phase: row.try_get("progress_phase")?,
+        progress: row
+            .try_get::<JobPhase>("progress_phase")?
+            .map(
+                |phase| -> std::result::Result<_, super::backend::BackendError> {
+                    let count = |column: &str| {
+                        row.try_get::<i64>(column)?
+                            .map(|count| {
+                                u64::try_from(count).map_err(|e| {
+                                    super::backend::BackendError::TypeConversion {
+                                        column: column.to_string(),
+                                        detail: e.to_string(),
+                                    }
+                                })
+                            })
+                            .transpose()
+                    };
+                    Ok(JobProgress {
+                        phase,
+                        done: count("progress_done")?,
+                        total: count("progress_total")?,
+                    })
+                },
+            )
+            .transpose()?,
         cancel_requested: row.get("cancel_requested")?,
         model_ref: row.try_get("model_ref")?,
         output_model_id: row.try_get("output_model_id")?,
@@ -666,7 +749,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
 #[derive(Debug, Clone)]
 pub struct SubmitJobParams<'a> {
     pub job_id: &'a str,
-    pub kind: &'a str,
+    pub kind: JobKind,
     /// `Queued` — claimable by the poll loop. `Inline` — claimed once, by id,
     /// in the submitting call itself; every job is inserted `status =
     /// 'queued'` regardless (the row's very first claim, whichever path
@@ -1041,19 +1124,18 @@ impl AttachedModel {
 
 /// A row from the `workers` table joined with its owning `instances` row —
 /// `ListWorkers`' wire shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct WorkerRecord {
     pub instance_id: String,
     pub label: Option<String>,
     pub host: Option<String>,
-    pub kinds: String,
-    /// The claim loop's lifecycle state as the row carries it — one of
-    /// [`WorkerState`]'s spellings (`warming` / `claiming` / `draining`),
-    /// written by the loop task in that order (`upsert_worker` with
-    /// `warming` as its first statement and again at each transition —
-    /// every lifecycle write is an upsert) so no reader ever sees
-    /// `claiming` before the row exists.
-    pub state: String,
+    /// The job kinds this worker claims.
+    pub kinds: JobKinds,
+    /// The claim loop's lifecycle state, written by the loop task in order
+    /// (`upsert_worker` with `warming` as its first statement and again at
+    /// each transition — every lifecycle write is an upsert) so no reader
+    /// ever sees `claiming` before the row exists.
+    pub state: WorkerState,
     pub started_at: String,
     pub last_seen_at: String,
     /// This worker's device inventory, as `Catalog::upsert_worker` wrote
@@ -1091,8 +1173,8 @@ fn parse_worker_row(
 struct GangCandidateRow {
     instance_id: String,
     peer_addr: String,
-    kinds: String,
-    state: String,
+    kinds: JobKinds,
+    state: WorkerState,
 }
 
 /// One `instances` ring candidate row for [`Catalog::list_ring_members`] —
@@ -1132,6 +1214,16 @@ impl WorkerState {
 impl std::fmt::Display for WorkerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.pad(self.as_db_str())
+    }
+}
+
+impl std::str::FromStr for WorkerState {
+    type Err = JammiError;
+    fn from_str(s: &str) -> Result<Self> {
+        [Self::Warming, Self::Claiming, Self::Draining]
+            .into_iter()
+            .find(|state| state.as_db_str() == s)
+            .ok_or_else(|| JammiError::Catalog(format!("Unknown worker state: '{s}'")))
     }
 }
 
@@ -1405,7 +1497,7 @@ impl Catalog {
     pub async fn claim_next(
         &self,
         instance_id: &str,
-        kinds: &[&str],
+        kinds: &[JobKind],
         lease: Duration,
     ) -> Result<Option<JobRecord>> {
         if kinds.is_empty() {
@@ -1427,7 +1519,7 @@ impl Catalog {
         ];
         let mut kind_placeholders = Vec::with_capacity(kinds.len());
         for k in kinds {
-            params.push(SqlValue::TextOwned((*k).to_string()));
+            params.push(SqlValue::TextOwned(k.to_string()));
             kind_placeholders.push(format!("${}", params.len()));
         }
         let kind_in = kind_placeholders.join(", ");
@@ -1900,20 +1992,18 @@ impl Catalog {
     /// when the attempt guard misses.
     pub async fn progress_job(
         &self,
-        job_id: &str,
-        instance_id: &str,
-        attempts: u32,
-        rows_done: Option<i64>,
-        rows_total: Option<i64>,
-        phase: Option<&str>,
+        attempt: super::result_repo::JobAttempt<'_>,
+        progress: JobProgress,
     ) -> Result<bool> {
         let running = JobStatus::Running.to_string();
-        let job_id = job_id.to_string();
-        let instance_id = instance_id.to_string();
-        let phase = phase.map(str::to_string);
-        let attempts = attempts as i64;
+        let job_id = attempt.job_id.to_string();
+        let instance_id = attempt.instance_id.to_string();
+        let phase = progress.phase.to_string();
+        let done = progress.done.map(|count| count as i64);
+        let total = progress.total.map(|count| count as i64);
+        let attempts = attempt.attempts as i64;
         let now = canonical_stamp_now();
-        let sql = "UPDATE jobs SET progress_rows_done = $1, progress_rows_total = $2, \
+        let sql = "UPDATE jobs SET progress_done = $1, progress_total = $2, \
                    progress_phase = $3, updated_at = $4 \
                    WHERE job_id = $5 AND claimed_by = $6 AND status = $7 AND attempts = $8";
         let updated = self
@@ -1923,9 +2013,9 @@ impl Catalog {
                     tx.execute(
                         sql,
                         &[
-                            SqlValue::from(rows_done),
-                            SqlValue::from(rows_total),
-                            SqlValue::from(phase),
+                            SqlValue::from(done),
+                            SqlValue::from(total),
+                            SqlValue::TextOwned(phase),
                             SqlValue::TextOwned(now),
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(instance_id),
@@ -2362,7 +2452,7 @@ impl Catalog {
         lease: Duration,
         max_attempts: u32,
     ) -> Result<Option<JobRecord>> {
-        if record.status != JobStatus::Running.to_string() {
+        if record.status != JobStatus::Running {
             return Ok(None);
         }
         let mut reclaimed = self
@@ -2950,7 +3040,7 @@ impl Catalog {
                                  devices = excluded.devices",
                             &[
                                 SqlValue::TextOwned(instance_id),
-                                SqlValue::TextOwned(w.kinds),
+                                SqlValue::TextOwned(w.kinds.to_string()),
                                 SqlValue::Text(w.state.as_db_str()),
                                 SqlValue::TextOwned(devices_json),
                             ],
@@ -3157,8 +3247,8 @@ impl Catalog {
                             Ok(GangCandidateRow {
                                 instance_id: row.get::<String>("instance_id")?,
                                 peer_addr: row.get::<String>("peer_addr")?,
-                                kinds: row.get::<String>("kinds")?,
-                                state: row.get::<String>("state")?,
+                                kinds: row.get("kinds")?,
+                                state: row.get("state")?,
                             })
                         })
                         .await
@@ -3167,20 +3257,11 @@ impl Catalog {
             )
             .await?;
 
-        let claiming = WorkerState::Claiming.as_db_str();
         let mut members = Vec::new();
         for row in rows {
-            if row.instance_id == listing.self_instance {
-                continue;
-            }
-            if row.state != claiming {
-                continue;
-            }
-            if !row
-                .kinds
-                .split(',')
-                .map(str::trim)
-                .any(|token| token == listing.kind)
+            if row.instance_id == listing.self_instance
+                || row.state != WorkerState::Claiming
+                || !row.kinds.contains(listing.kind)
             {
                 continue;
             }
@@ -3298,7 +3379,7 @@ impl Catalog {
     pub async fn upsert_worker(
         &self,
         instance_id: &str,
-        kinds: &str,
+        kinds: &JobKinds,
         state: WorkerState,
         devices: &[DeviceFact],
     ) -> Result<()> {

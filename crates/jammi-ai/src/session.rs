@@ -12,9 +12,10 @@ use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 
 use crate::eval::runner::EvalRunner;
+use crate::fine_tune::spec::fine_tuned_model_id;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::jobs::JobHandle;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
 use crate::model::hub::HubSource;
@@ -130,7 +131,7 @@ impl InferenceSession {
 
     /// Build a session behind an `Arc` with the compound-query SQL functions
     /// registered (`annotate`, …). This is the canonical constructor for any
-    /// long-lived shared session — the embedded `Database`, the OSS server, and
+    /// long-lived shared session — the embedded `Database`, the server, and
     /// the `Jammi::open` local arm — so the in-process `sql` surface and the
     /// Flight SQL lane both expose the same SQL functions. Sessions that never
     /// run compound SQL (short-lived CLI commands) can still use the plain
@@ -740,8 +741,8 @@ impl InferenceSession {
         self.inner.catalog()
     }
 
-    /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
-    /// handle clones to poll its job after the submitting call returns.
+    /// The shared catalog handle behind an `Arc` — the form a [`JobHandle`]
+    /// clones to poll its job after the submitting call returns.
     pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
     }
@@ -993,7 +994,7 @@ impl InferenceSession {
         self.inner.config()
     }
 
-    /// Shared handle to the engine's tenant binding. The OSS server's
+    /// Shared handle to the engine's tenant binding. The server's
     /// Flight SQL `TenantBoundProvider` updates this for the duration of
     /// each query so the analyzer rule scopes rows to the bound tenant.
     pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {
@@ -1565,22 +1566,15 @@ impl InferenceSession {
     ) -> Result<(String, Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
         // Validate content columns are not empty
         if content_columns.is_empty() {
-            return Err(JammiError::Inference(
-                "At least one content column is required".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "columns".into(),
+                reason: "At least one content column is required".into(),
+            });
         }
 
         let table_name = self.find_table_name(source_id).await?;
         let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
-
-        let df = self.inner.context().sql(&query).await.map_err(|e| {
-            JammiError::Inference(format!("Failed to scan source '{source_id}': {e}"))
-        })?;
-
-        let input_plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        let input_plan = self.plan_source_query(&query).await?;
         // Describe the model for the schema and the definition: its width,
         // its regression head's form, and the identity the environment
         // records. Nothing is loaded here — the executing process
@@ -1726,6 +1720,9 @@ impl InferenceSession {
     }
 
     /// Build a SELECT query for the key + content columns from a source table.
+    /// Each column is selected once, wherever it appears: a key that is also
+    /// a content column (a table keyed by its own text) is one column the
+    /// plan reads by name in both roles.
     pub(crate) fn build_source_query(
         &self,
         source_id: &str,
@@ -1733,9 +1730,13 @@ impl InferenceSession {
         key_column: &str,
         content_columns: &[String],
     ) -> String {
-        let all_columns: Vec<&str> = std::iter::once(key_column)
-            .chain(content_columns.iter().map(|s| s.as_str()))
-            .collect();
+        let mut all_columns: Vec<&str> = Vec::with_capacity(content_columns.len() + 1);
+        for column in std::iter::once(key_column).chain(content_columns.iter().map(String::as_str))
+        {
+            if !all_columns.contains(&column) {
+                all_columns.push(column);
+            }
+        }
         let select_list = all_columns
             .iter()
             .map(|c| quote_ident(c))
@@ -1759,6 +1760,29 @@ impl InferenceSession {
         )
     }
 
+    /// Plan a [`Self::build_source_query`] scan. A key or content column the
+    /// source does not have, or of a type the scan cannot read, is the caller's
+    /// `columns` argument; any other failure is the classifier's to name.
+    pub(crate) async fn plan_source_query(
+        &self,
+        query: &str,
+    ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        fn scan_error(e: datafusion::error::DataFusionError) -> JammiError {
+            use datafusion::error::DataFusionError;
+            match e.find_root() {
+                DataFusionError::SchemaError(..) | DataFusionError::Plan(_) => {
+                    JammiError::InvalidArgument {
+                        argument: "columns".into(),
+                        reason: e.to_string(),
+                    }
+                }
+                _ => JammiError::from(e),
+            }
+        }
+        let df = self.inner.context().sql(query).await.map_err(scan_error)?;
+        df.create_physical_plan().await.map_err(scan_error)
+    }
+
     /// The first table a source serves, resolved through the catalog's
     /// `sources` row ([`JammiSession::source_table_names`]) — a source
     /// registered on any replica resolves here, and a missing one is
@@ -1769,8 +1793,9 @@ impl InferenceSession {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                JammiError::Inference(format!("No tables found in source '{source_id}'"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "source".into(),
+                reason: format!("No tables found in source '{source_id}'"),
             })
     }
 
@@ -1939,7 +1964,7 @@ impl InferenceSession {
     /// Submit a LoRA fine-tuning job on a registered source.
     ///
     /// Persists a self-describing [`TrainingSpec::FineTune`] into a `queued`
-    /// catalog job and returns a [`TrainingJob`] handle immediately — the
+    /// catalog job and returns a [`JobHandle`] immediately — the
     /// training runs later under a [`crate::fine_tune::worker::JobWorker`]
     /// that claims the job under a lease, reconstructs the data loader from the
     /// persisted source + columns, and trains while heartbeating. Call
@@ -1953,9 +1978,8 @@ impl InferenceSession {
         method: FineTuneMethod,
         task: ModelTask,
         config: Option<FineTuneConfig>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let config = config.unwrap_or_default();
-        config.validate()?;
 
         let spec = TrainingSpec::FineTune {
             source: source.to_string(),
@@ -1998,7 +2022,7 @@ impl InferenceSession {
     pub async fn submit_fine_tune(
         &self,
         request: jammi_wire::request::FineTuneRequest,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let jammi_wire::request::FineTuneRequest {
             source,
             base_model,
@@ -2010,7 +2034,6 @@ impl InferenceSession {
             cache,
         } = request;
         let config = config.unwrap_or_default();
-        config.validate()?;
 
         let spec = TrainingSpec::FineTune {
             source,
@@ -2035,7 +2058,7 @@ impl InferenceSession {
     /// from the persisted spec. The row's `model_ref`/`output_model_id` come
     /// from [`Self::training_job_links`], the one derivation `enqueue` and
     /// the context-predictor submit share.
-    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<TrainingJob> {
+    async fn submit_fine_tune_spec(&self, spec: TrainingSpec) -> Result<JobHandle> {
         self.submit_fine_tune_spec_deduped(spec, None).await
     }
 
@@ -2054,7 +2077,7 @@ impl InferenceSession {
         &self,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         // The ONE admission (per-kind validation, rank admission) is
         // applied HERE, before anything durable
         // exists: this method is one of the durable submit edges for a
@@ -2076,39 +2099,43 @@ impl InferenceSession {
         // place that construction happens.
         let admitted = crate::fine_tune::spec::admit_training_spec(self.inner.config(), spec)?;
         let job_id = uuid::Uuid::new_v4().to_string();
+        self.submit_training(&admitted, job_id, 0, idempotency_key)
+            .await
+    }
+
+    /// Submit an admitted training spec as job `job_id` and hand back its
+    /// handle — the one tail every durable training submit edge shares. The
+    /// row's links come from [`Self::training_job_links`]. When
+    /// `idempotency_key` collides with a still-known prior submission, the
+    /// handle is THAT job's, attached by id: the row of record, never this
+    /// call's unused id.
+    pub(crate) async fn submit_training(
+        &self,
+        admitted: &crate::fine_tune::spec::AdmittedTrainingSpec,
+        job_id: String,
+        priority: i32,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobHandle> {
         let links = self.training_job_links(admitted.spec(), &job_id).await?;
         let submitted = crate::fine_tune::spec::submit_admitted_training(
-            self.inner.catalog(),
-            &admitted,
+            self.catalog(),
+            admitted,
             &job_id,
             links.model_ref.as_deref(),
             &links.output_model_id,
-            0,
+            priority,
             idempotency_key,
         )
         .await?;
-        let recorded_job_id = submitted.recorded_job_id;
-
-        if recorded_job_id == job_id {
-            Ok(TrainingJob::new(
+        if submitted.recorded_job_id == job_id {
+            Ok(JobHandle::new(
                 job_id,
-                "queued".into(),
-                links.output_model_id,
-                Arc::clone(self.inner.catalog()),
+                admitted.spec().kind(),
+                Some(links.output_model_id),
+                Arc::clone(self.catalog_arc()),
             ))
         } else {
-            // A concurrent or prior call already holds this idempotency key
-            // — the durable row of record, not this call's own (unused)
-            // job_id. Re-read its current state rather than guessing
-            // `"queued"`: a racing caller may observe it already claimed.
-            let record = self.inner.catalog().get_job(&recorded_job_id).await?;
-            let model_id = resolve_model_id(&recorded_job_id, &record)?;
-            Ok(TrainingJob::new(
-                recorded_job_id,
-                record.status,
-                model_id,
-                Arc::clone(self.inner.catalog()),
-            ))
+            JobHandle::attach(Arc::clone(self.catalog_arc()), &submitted.recorded_job_id).await
         }
     }
 
@@ -2184,9 +2211,9 @@ impl InferenceSession {
             .get_model(&canonical_name)
             .await?
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Base model '{canonical_name}' not registered in catalog"
-                ))
+                JammiError::NotFound(jammi_db::error::Missing::Model {
+                    model_id: canonical_name.clone(),
+                })
             })?
             .catalog_pk)
     }
@@ -2214,10 +2241,8 @@ impl InferenceSession {
         base_model: &str,
         sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
         config: Option<FineTuneConfig>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         let config = config.unwrap_or_default();
-        config.validate()?;
-        sample_config.validate_for_training()?;
 
         // The job record's `source` field records the node source — the model is
         // fine-tuned on that source's text, the edges only supervise the pairing.
@@ -2249,7 +2274,7 @@ impl InferenceSession {
     /// [`TrainingSpec`] and submit it here, so an identical decode yields an
     /// identical job on either transport. The dispatch lives once, beside the
     /// entry points it calls, rather than being re-written per transport.
-    pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<TrainingJob> {
+    pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<JobHandle> {
         self.run_training_spec_deduped(spec, None).await
     }
 
@@ -2271,7 +2296,7 @@ impl InferenceSession {
         self: &Arc<Self>,
         spec: TrainingSpec,
         idempotency_key: Option<&str>,
-    ) -> Result<TrainingJob> {
+    ) -> Result<JobHandle> {
         match spec {
             TrainingSpec::ContextPredictor {
                 source,
@@ -2291,9 +2316,9 @@ impl InferenceSession {
     // Evaluation
     // =====================================================================
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     ///
-    /// The request's `cohorts` map a golden-set `query_id` to an opaque
+    /// The request's `cohorts` map a ground truth `query_id` to an opaque
     /// `{key: value}` segment map persisted alongside that query's per-query
     /// metrics (`_jammi_eval_per_query`); its `method` ranks each query as a
     /// search's does.
@@ -2314,14 +2339,14 @@ impl InferenceSession {
         self.catalog().get_eval_per_query(eval_run_id).await
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: crate::eval::EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<crate::eval::InferenceEvalReport> {
         EvalRunner { session: self }
@@ -2330,7 +2355,7 @@ impl InferenceSession {
                 source_id,
                 columns,
                 task,
-                golden_source,
+                ground_truth,
                 label_column,
             )
             .await
@@ -2346,7 +2371,7 @@ impl InferenceSession {
 
     /// Evaluate whether a predictor's uncertainty is honest.
     ///
-    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// `ground_truth` is a held-out set pairing a predictive distribution with
     /// its realised `outcome`; `shape` selects the predictor's output family
     /// (parametric Gaussian or ensemble) and the columns read. `cohorts` maps a
     /// `record_id` to an opaque `{key: value}` segment map persisted alongside
@@ -2356,12 +2381,12 @@ impl InferenceSession {
     pub async fn eval_calibration(
         &self,
         source_id: &str,
-        golden_source: &str,
+        ground_truth: &str,
         shape: crate::eval::EvalCalibrationShape,
         cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     ) -> Result<crate::eval::CalibrationEvalReport> {
         EvalRunner { session: self }
-            .eval_calibration(source_id, golden_source, shape, cohorts)
+            .eval_calibration(source_id, ground_truth, shape, cohorts)
             .await
     }
 }

@@ -33,11 +33,11 @@ MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 work = Path(tempfile.mkdtemp())
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
-patents = pq.read_table(fixtures.path("tiny_corpus.parquet")).select(["id", "title", "content"])
-pq.write_table(patents, work / "patents.parquet")
-db.add_source("patents", url=str(work / "patents.parquet"), format="parquet")
-table = db.generate_embeddings(source="patents", model=MODEL, columns=["content"], key="id")
-print(f"{patents.num_rows} patents embedded into {table[:48]}…")
+papers = pq.read_table(fixtures.path("tiny_corpus.parquet")).select(["id", "title", "content"])
+pq.write_table(papers, work / "papers.parquet")
+db.add_source("papers", url=str(work / "papers.parquet"), format="parquet")
+table = db.generate_embeddings(source="papers", model=MODEL, columns=["content"], key="id")
+print(f"{papers.num_rows} papers embedded into {table[:48]}…")
 ```
 
 ## The segment set — asked of the engine itself
@@ -55,7 +55,7 @@ for s in segments:
 
 ```{python}
 claim("a fresh table's index is one segment holding every row",
-      [s["segment_id"] for s in segments] == [0] and segments[0]["row_count"] == patents.num_rows)
+      [s["segment_id"] for s in segments] == [0] and segments[0]["row_count"] == papers.num_rows)
 claim("its bundle is named after the table and the segment",
       Path(urlparse(segments[0]["index_path"]).path).name.startswith(f"{table}__seg0"))
 ```
@@ -76,11 +76,11 @@ no rescore, so it must return the same ranking. Every row, as a query by example
 
 ```{python}
 K = 5
-keys = [str(k) for k in patents.column("id").to_pylist()]
+keys = [str(k) for k in papers.column("id").to_pylist()]
 
 
 def ranked(key: str, exact: bool) -> list[str]:
-    hits = db.search("patents", row_key=key, k=K, embedding_table=table, exact=exact)
+    hits = db.search("papers", row_key=key, k=K, embedding_table=table, exact=exact)
     return hits.column("_row_id").to_pylist()
 
 
@@ -97,7 +97,7 @@ claim("over one small segment the approximate search ranks exactly as the exact 
 
 A source change reaches the table through `refresh_embeddings`, which embeds only what
 changed and publishes a new version. The new rows' vectors go into a **new** segment;
-segment 0 is not rebuilt. Four patents are added to the source; the refresh appends one
+segment 0 is not rebuilt. Four papers are added to the source; the refresh appends one
 segment for them, and segment 0's bundle — its path, its row count, its bytes — is
 exactly what it was.
 
@@ -123,7 +123,7 @@ added = pa.table({
         "Graph kernels over molecular graphs predict reaction yields in organic chemistry.",
     ],
 })
-pq.write_table(pa.concat_tables([patents, added.cast(patents.schema)]), work / "patents.parquet")
+pq.write_table(pa.concat_tables([papers, added.cast(papers.schema)]), work / "papers.parquet")
 report = db.refresh_embeddings(table)
 after = db.list_index_segments(table)
 for s in after:

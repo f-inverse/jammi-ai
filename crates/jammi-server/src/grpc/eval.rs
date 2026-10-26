@@ -114,7 +114,7 @@ impl EvalService for EvalServer {
                 &args.source_id,
                 &args.columns,
                 args.task,
-                &args.golden_source,
+                &args.ground_truth,
                 &args.label_column,
             )
         })
@@ -158,7 +158,7 @@ impl EvalService for EvalServer {
             self.session
                 .eval_calibration(
                     &args.source_id,
-                    &args.golden_source,
+                    &args.ground_truth,
                     args.shape,
                     &args.cohorts,
                 )

@@ -5,7 +5,10 @@
 //! (migration 029) via [`CatalogClient::list_workers`].
 
 use clap::Subcommand;
-use jammi_admin::{CatalogClient, WorkerSummary};
+use jammi_admin::CatalogClient;
+use jammi_db::catalog::instance::DeviceFact;
+use jammi_db::catalog::status::JobKinds;
+use jammi_wire::WorkerSummary;
 
 #[derive(Subcommand)]
 pub enum WorkerAction {
@@ -45,9 +48,9 @@ fn print_row(w: &WorkerSummary) {
     println!(
         "{:<38} {:<16} {:<20} {:<12} {:<9} {:<26} {:<26} {}",
         w.instance_id,
-        if w.label.is_empty() { "—" } else { &w.label },
-        w.host,
-        w.kinds,
+        w.label.as_deref().unwrap_or("—"),
+        w.host.as_deref().unwrap_or("—"),
+        format_kinds(&w.kinds),
         w.state,
         w.started_at,
         w.last_seen_at,
@@ -55,9 +58,18 @@ fn print_row(w: &WorkerSummary) {
     );
 }
 
+/// `all` for a worker that claims every kind, else the kinds it claims.
+fn format_kinds(kinds: &JobKinds) -> String {
+    if *kinds == JobKinds::all() {
+        "all".to_string()
+    } else {
+        kinds.to_string()
+    }
+}
+
 /// `kind0, kind1, ...` in rank order (the configured `[gpu] devices` order), `—` for an empty device list —
 /// matching the empty-label convention above.
-fn format_devices(devices: &[jammi_admin::DeviceFact]) -> String {
+fn format_devices(devices: &[DeviceFact]) -> String {
     if devices.is_empty() {
         return "—".to_string();
     }

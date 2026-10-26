@@ -261,9 +261,10 @@ impl<'a> NeighborGraphPipeline<'a> {
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
         if params.k == 0 {
-            return Err(JammiError::Config(
-                "build_neighbor_graph requires k >= 1".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "k".into(),
+                reason: "must be >= 1".into(),
+            });
         }
 
         let source_table = self
@@ -398,12 +399,15 @@ impl<'a> NeighborGraphPipeline<'a> {
 
         if params.exact || index.is_none() {
             if params.exact && nodes.len() > params.exact_max_rows {
-                return Err(JammiError::Config(format!(
-                    "exact neighbor-graph build over {} rows exceeds the ceiling of {}; \
+                return Err(JammiError::InvalidArgument {
+                    argument: "exact".into(),
+                    reason: format!(
+                        "exact neighbor-graph build over {} rows exceeds the ceiling of {}; \
                      run with exact = false to use the index-assisted driver",
-                    nodes.len(),
-                    params.exact_max_rows
-                )));
+                        nodes.len(),
+                        params.exact_max_rows
+                    ),
+                });
             }
             return Ok(Box::new(Exact {
                 nodes: Arc::new(clone_nodes(nodes)),
@@ -645,7 +649,7 @@ fn edges_to_batch(edges: Vec<Edge>, schema: SchemaRef) -> Result<RecordBatch> {
             Arc::new(similarity),
         ],
     )
-    .map_err(|e| JammiError::Other(format!("Edge RecordBatch build: {e}")))
+    .map_err(|e| JammiError::Internal(format!("Edge RecordBatch build: {e}")))
 }
 
 #[cfg(test)]

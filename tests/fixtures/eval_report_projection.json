@@ -281,11 +281,9 @@
       {
         "gold": [
           {
-            "confidence": 0.0,
-            "end": 5,
             "label": "PER",
             "start": 0,
-            "text": ""
+            "end": 5
           }
         ],
         "predicted": [

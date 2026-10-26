@@ -378,7 +378,7 @@ default:** an authenticating resolver returns `Tenant`/`Err` and NEVER
 interceptor-in-front form, binding `None`) on a failed check runs the request
 unscoped, which for a `tenant_id IS NULL`-bearing catalog is a global read, so a
 rejected caller must fail the request. `TenantScope::Global` is the *explicit*
-unscoped choice the default (OSS-cooperative) resolver returns when no tenant is
+unscoped choice the default (cooperative) resolver returns when no tenant is
 bound — never a value a rejection falls through to. That framing rule is the
 defect `grpc_byo_auth.rs`'s `missing_credential_is_rejected_not_run_unscoped` and
 the seam mirror `resolver_seam_binds_the_engine_and_rejects_missing_credential`
@@ -388,8 +388,8 @@ guard against.
 
 The engine's dependency tree is gated in CI by `cargo deny` against the RustSec
 advisory database, plus a license allowlist and the source/ban guards that
-formalize the engine's one-way dependency direction (no proprietary or
-non-crates.io crate in the OSS closure). The advisory lane runs the live RustSec
+formalize the engine's one-way dependency direction (no crate from outside crates.io
+in the engine's dependency closure). The advisory lane runs the live RustSec
 DB on every PR. An advisory is fixed by moving the dependency to the fixed
 version. `deny.toml` excepts one only when no release of the crate that pulls it
 in accepts that version, and each exception states why the engine does not reach

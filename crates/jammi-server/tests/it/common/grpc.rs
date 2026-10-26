@@ -312,7 +312,7 @@ async fn engine_chain_from_config(
 ) -> (jammi_server::runtime::GrpcChain, Arc<InferenceSession>) {
     // `open` (not `new`) so the engine-backed server registers the compound
     // query SQL functions (`annotate`, …) on its context — the same shape the
-    // production `OssServer` builds, and what the Flight SQL `annotate` test
+    // production `Server` builds, and what the Flight SQL `annotate` test
     // exercises.
     let session = InferenceSession::open(cfg).await.expect("session");
     chain_over_session(addr, tiers, session, admin_authorizer)
@@ -338,7 +338,7 @@ pub fn chain_over_session(
         });
 
     let engine = Arc::clone(&session);
-    // Same source production reads (`OssServer::build_grpc_chain`): the
+    // Same source production reads (`Server::build_grpc_chain`): the
     // config the session was actually opened with, so a test that varies
     // `[server.limits]` through `test_config`/its own override sees that
     // value reach the wire, not a hardcoded default.
@@ -720,7 +720,7 @@ pub async fn start_engine_server_with_limits(
 // ---------------------------------------------------------------------------
 
 /// Guards for an in-process server started through the PRODUCTION
-/// [`jammi_server::runtime::OssServer`] path — `new` → `bind` →
+/// [`jammi_server::runtime::Server`] path — `new` → `bind` →
 /// `serve_with_shutdown` — with `[server] peer_bind` set, so the third
 /// (internal `PeerService`) listener is the real plumbing, not a fixture's
 /// re-implementation of it. All three listeners are ephemeral (`:0`).
@@ -772,15 +772,15 @@ pub fn peer_bind_config(artifact_dir: &std::path::Path) -> jammi_db::config::Jam
     cfg
 }
 
-/// Start a server from `cfg` through the production `OssServer` path. `cfg`
+/// Start a server from `cfg` through the production `Server` path. `cfg`
 /// must set `peer_bind` (the fixture asserts the third listener bound).
 pub async fn start_engine_server_from_config(
     cfg: jammi_db::config::JammiConfig,
     dir: Option<TempDir>,
 ) -> PeerEngineServer {
-    let server = jammi_server::runtime::OssServer::new(cfg)
+    let server = jammi_server::runtime::Server::new(cfg)
         .await
-        .expect("oss server");
+        .expect("server");
     let engine = server.session();
     let metrics = server.metrics();
     let bound = server.bind().await.expect("bind all listeners");
@@ -802,7 +802,7 @@ pub async fn start_engine_server_from_config(
                 let _ = shutdown_rx.await;
             })
             .await
-            .expect("oss server serve");
+            .expect("server serve");
     });
     PeerEngineServer {
         public_addr,

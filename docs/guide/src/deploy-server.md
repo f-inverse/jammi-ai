@@ -535,7 +535,7 @@ for what this widens in the peer listener's own trust boundary.
 
 ## Deploying as a container
 
-The OSS server ships as two public Docker images on GHCR:
+The server ships as two public Docker images on GHCR:
 
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).

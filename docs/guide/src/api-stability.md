@@ -47,13 +47,10 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the thirteen `jammi.v1.*` proto packages
+The gRPC/Flight SQL wire surface is the twelve `jammi.v1.*` proto packages
 (ten served on the public listener; two, `jammi.v1.peer` and `jammi.v1.gang`,
 served **only on the internal `[server] peer_bind` listener** — the public
-listener answers `UNIMPLEMENTED` for their rpcs; `jammi.v1.lifecycle` is a
-**contract-only** surface — defined in the wire descriptor so the candle-free
-client can call a platform server that implements it, but answered by no OSS
-handler):
+listener answers `UNIMPLEMENTED` for their rpcs):
 
 | Package | Surface |
 |---|---|
@@ -65,17 +62,15 @@ handler):
 | `jammi.v1.gang` | the coordinator-to-member gang-admission seam for a multi-host training run (`GangService.RunRank`) — served **only on `peer_bind`**, never on the public listener; the caller's tenant is never read — the member derives it from the verified `jobs` row and resolves a multi-host job's training set under it alone (see [Security Posture](./security.md#the-gang-listener-i-gang)) |
 | `jammi.v1.inference` | bulk inference + predict |
 | `jammi.v1.job` | the durable job queue: submit / status / wait / list / cancel / list-workers / prune (`JobService`) |
-| `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
 | `jammi.v1.peer` | the engine-internal segment-search seam between replicas (`PeerService.SegmentSearch` / `ExactRescore`) — served **only on `peer_bind`**, never on the public listener; deliberately tenant-free (the coordinator enforces tenant scope; see [Security Posture](./security.md#the-peer-listener-i-peer)) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
-| `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own since `TrainingService` folded into `JobService` |
+| `jammi.v1.training` | the training spec message vocabulary `JobService.SubmitJob`'s oneof carries (`FineTuneSpec`/`GraphFineTuneSpec`/`ContextPredictorSpec`/`FineTuneConfig`/…) — no rpcs of its own |
 | `jammi.v1.trigger` | topic publish + subscribe |
 
 The contract is the full set of `(Service, Method)` rpc paths these packages
 *define* — decoded from the compiled `FILE_DESCRIPTOR_SET`, the authoritative
-machine-readable description of the frozen wire surface, which may exceed what a
-given build mounts (`jammi.v1.lifecycle` is defined here yet served by no OSS
-handler), not a hand-maintained list. The `v1` in the package path is the wire-stability stamp:
+machine-readable description of the frozen wire surface, not a hand-maintained
+list. The `v1` in the package path is the wire-stability stamp:
 a breaking change to a message or an rpc shape requires a `jammi.v2.*` package,
 not an in-place edit of `v1`.
 

@@ -265,6 +265,36 @@ pub struct JobAttempt<'a> {
     pub attempts: u32,
 }
 
+impl JobAttempt<'_> {
+    /// This attempt, owned — for a holder that outlives the borrow.
+    pub fn to_buf(&self) -> JobAttemptBuf {
+        JobAttemptBuf {
+            job_id: self.job_id.to_string(),
+            instance_id: self.instance_id.to_string(),
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// An owned [`JobAttempt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobAttemptBuf {
+    job_id: String,
+    instance_id: String,
+    attempts: u32,
+}
+
+impl JobAttemptBuf {
+    /// The attempt this holds, borrowed.
+    pub fn as_attempt(&self) -> JobAttempt<'_> {
+        JobAttempt {
+            job_id: &self.job_id,
+            instance_id: &self.instance_id,
+            attempts: self.attempts,
+        }
+    }
+}
+
 /// The catalog name of a result table, carried as an IDENTITY — what a reuse
 /// reports, what a caller compares — and never as a SQL relation: the type
 /// has no `Display`, so it cannot be interpolated into a query by accident,

@@ -1,14 +1,11 @@
-"""Conformal coverage under covariate shift — the consumer-side numerics the
-book measures the engine's marginal conformal against.
+"""Covariate-shift helpers the conformal chapters build on: the weights a caller
+estimates and the yardstick a coverage is read against.
 
-The engine ships the marginal split-conformal surface (``conformalize``,
-``conformalize_interval``, ``conformalize_cqr``). Whether a covariate shift can
-be repaired by *weighting* the calibration set toward the test distribution
-(Tibshirani et al. 2019) is the consumer's question, so it is answered here,
-in plain numpy: one weighted split-conformal quantile for both the marginal
-and the weighted passes — the marginal pass is the uniform-weight case, so a
-coverage change is attributable to the weights alone — the kNN density-ratio
-weights, and the diagnostics that explain a no-op.
+The engine applies weighted split-conformal (``weights=``/``test_weights=`` on
+``conformalize``, ``conformalize_interval`` and ``conformalize_cqr``);
+*estimating* the likelihood ratios is the caller's, so the kNN density-ratio
+estimate lives here, beside the APS nonconformity the chapters correlate with a
+shift and the binomial band a measured coverage is held to.
 """
 
 from __future__ import annotations
@@ -52,62 +49,8 @@ def aps_nonconformity(scores: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return out
 
 
-def quantiles(
-    cal: np.ndarray, n_test: int, *, weights: Weights | None, alpha: float
-) -> np.ndarray:
-    """Each test row's split-conformal ``1−α`` quantile of the calibration
-    nonconformity ``cal`` (Tibshirani et al. 2019): calibration row ``i`` holds
-    mass ``w_i / (Σw + w_test)`` and the test row its own ``w_test`` at +∞, so
-    the quantile is +∞ when the calibration mass cannot reach ``1−α``. With no
-    weights every row weighs one and this is the ⌈(n+1)(1−α)⌉-th smallest — the
-    marginal quantile."""
-    w = np.ones(len(cal)) if weights is None else np.asarray(weights.cal, dtype=float)
-    w_test = np.ones(n_test) if weights is None else np.asarray(weights.test, dtype=float)
-    order = np.argsort(cal)
-    sorted_cal = np.append(np.asarray(cal, dtype=float)[order], np.inf)
-    reach = np.searchsorted(np.cumsum(w[order]), (1 - alpha) * (w.sum() + w_test))
-    return sorted_cal[np.minimum(reach, len(cal))]
-
-
 def binomial_band(alpha: float, n: int) -> float:
     """Three binomial standard errors of a ``1 − alpha`` coverage measured over
     ``n`` test points: the band a valid split-conformal coverage lands within on
     all but a rare draw."""
     return 3 * float(np.sqrt(alpha * (1 - alpha) / n))
-
-
-def score_coverage(
-    cal: np.ndarray, test: np.ndarray, *, weights: Weights | None, alpha: float
-) -> float:
-    """The share of test rows whose nonconformity is within their conformal
-    quantile — the coverage of any split-conformal set or interval built on
-    this score (an absolute residual's ``ŷ ± q̂``, an APS set)."""
-    return float(np.mean(test <= quantiles(cal, len(test), weights=weights, alpha=alpha)))
-
-
-def aps_coverage(
-    cal_scores: np.ndarray,
-    cal_labels: np.ndarray,
-    test_scores: np.ndarray,
-    test_labels: np.ndarray,
-    *,
-    weights: Weights | None,
-    alpha: float,
-) -> tuple[float, float]:
-    """Split-APS coverage and mean set size, marginal (``weights=None``) or
-    weighted. A class is admitted while the cumulative mass up to and including
-    it stays ≤ q̂ — the class that crosses q̂ is excluded; ties break by class
-    index. One convention for both passes, so only the weights differ."""
-    q = quantiles(
-        aps_nonconformity(cal_scores, cal_labels), len(test_labels), weights=weights, alpha=alpha
-    )
-    covered = size = 0
-    for scores, label, q_row in zip(test_scores, test_labels, q, strict=True):
-        cum, admitted = 0.0, set()
-        for c in sorted(range(len(scores)), key=lambda c: (-scores[c], c)):
-            cum += scores[c]
-            if cum <= q_row:
-                admitted.add(c)
-        covered += int(label in admitted)
-        size += len(admitted)
-    return covered / len(test_labels), size / len(test_labels)

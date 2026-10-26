@@ -243,7 +243,7 @@ async fn a_hit_completes_the_job_against_the_newest_published_match(backend: Bac
     ));
 
     let job = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(job.status, JobStatus::Completed.to_string());
+    assert_eq!(job.status, JobStatus::Completed);
     assert_eq!(
         job.result.as_deref(),
         Some(format!(r#"{{"reused":"{newer}"}}"#).as_str())
@@ -290,7 +290,7 @@ async fn a_miss_writes_nothing(backend: BackendKind) {
         let job_id = job_id.clone();
         async move {
             let job = catalog.get_job(&job_id).await.unwrap();
-            assert_eq!(job.status, JobStatus::Running.to_string(), "{label}");
+            assert_eq!(job.status, JobStatus::Running, "{label}");
             assert!(job.result.is_none(), "{label}");
             assert!(
                 catalog
@@ -437,7 +437,7 @@ async fn a_lost_lease_hit_writes_nothing_and_leaves_the_bytes_intact(backend: Ba
         ReuseFinish::LostLease
     );
     let job = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(job.status, JobStatus::Running.to_string());
+    assert_eq!(job.status, JobStatus::Running);
     assert_eq!(job.claimed_by.as_deref(), Some("successor"));
     assert!(catalog
         .get_model(&output_name(&job_id))

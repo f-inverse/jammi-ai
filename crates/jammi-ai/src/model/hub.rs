@@ -328,7 +328,7 @@ fn build_client(
         .connect_timeout(idle)
         .read_timeout(idle)
         .build()
-        .map_err(|e| JammiError::Config(format!("Hugging Face Hub client init failed: {e}")))
+        .map_err(|e| JammiError::Internal(format!("Hugging Face Hub client init failed: {e}")))
 }
 
 /// One Hub repository, read through its [`HubSource`]: its files into the

@@ -305,7 +305,7 @@ fn hidden_rows(mask: &DeletionMask, version: i64, index: &SidecarIndex) -> usize
 /// error naming the poisoned SEGMENT rather than a ladder failure.
 fn admissible_or_err(segment: SegmentId, hits: Vec<(String, f32)>) -> Result<Vec<(String, f32)>> {
     if let Some((row_id, distance)) = first_inadmissible_hit(&hits) {
-        return Err(JammiError::Other(format!(
+        return Err(JammiError::AnnIndex(format!(
             "segment {}: row '{row_id}' has a non-finite distance ({distance:?}) — the index or \
              its stored vectors are corrupt; a distance is the merge's sort key and the \
              user-visible similarity, so it is refused rather than ranked",
@@ -369,7 +369,7 @@ pub fn rescore(
     let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
     for (row_id, _approx) in candidates {
         let vector = exact(&row_id)?.ok_or_else(|| {
-            JammiError::Other(format!(
+            JammiError::AnnIndex(format!(
                 "rescore: candidate '{row_id}' has no exact vector in its segment's rescore \
                  companion (corrupted or torn sidecar bundle)"
             ))
@@ -449,7 +449,7 @@ impl SegmentedIndex {
     ) -> Result<Self> {
         let mut iter = segments.into_iter();
         let (first_id, first_version, first) = iter.next().ok_or_else(|| {
-            JammiError::Other("SegmentedIndex requires at least one segment".into())
+            JammiError::Internal("SegmentedIndex requires at least one segment".into())
         })?;
         let storage_precision = first.storage_precision();
         let dead = hidden_rows(&mask, first_version, &first);
@@ -461,7 +461,7 @@ impl SegmentedIndex {
         }];
         for (id, version, index) in iter {
             if index.storage_precision() != storage_precision {
-                return Err(JammiError::Other(format!(
+                return Err(JammiError::Internal(format!(
                     "SegmentedIndex: segment {} loaded at {:?} but the set is {:?} — \
                      mixed-precision segment sets are unsearchable (distances are not comparable)",
                     id.0,

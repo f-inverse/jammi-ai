@@ -5,9 +5,11 @@ with none falls back to the class its gRPC code maps to."""
 from __future__ import annotations
 
 import grpc
+import pyarrow as pa
+import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 from google.protobuf import any_pb2
 
-from jammi._database import _rpc_to_jammi
+from jammi._database import _flight_to_jammi, _rpc_to_jammi
 from jammi._generated.jammi.v1 import error_pb2
 from jammi.errors import (
     AlreadyExists,
@@ -78,3 +80,33 @@ def test_without_a_detail_the_code_decides() -> None:
     assert isinstance(
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.INVALID_ARGUMENT, "m")), InvalidArgument
     )
+
+
+def _envelope(code, detail: error_pb2.JammiErrorDetail) -> bytes:
+    packed = any_pb2.Any()
+    packed.Pack(detail)
+    return error_pb2.RpcStatus(code=code.value[0], message="m", details=[packed]).SerializeToString()
+
+
+def test_a_statement_refused_on_the_flight_lane_raises_the_typed_lanes_class() -> None:
+    """The Flight SQL lane keeps the engine's status envelope as the Flight
+    error's extra info, so a missing relation is `NotFound` and a missing model
+    `ModelNotFound` there too, never a flattened `BackendError`."""
+    relation = error_pb2.JammiErrorDetail(not_found=error_pb2.NotFoundError(relation="notes"))
+    model = error_pb2.JammiErrorDetail(not_found=error_pb2.NotFoundError(model_id="m"))
+    missing = pa.flight.FlightInternalError("m", _envelope(grpc.StatusCode.NOT_FOUND, relation))
+    raised = _flight_to_jammi(missing)
+    assert type(raised) is NotFound
+    assert raised.code is grpc.StatusCode.NOT_FOUND
+    assert isinstance(
+        _flight_to_jammi(pa.flight.FlightInternalError("m", _envelope(grpc.StatusCode.NOT_FOUND, model))),
+        ModelNotFound,
+    )
+
+
+def test_a_flight_transport_failure_with_no_envelope_is_classified_by_the_transport() -> None:
+    """With no envelope the failure is the transport's own: an unreachable
+    server is retryable, anything else a backend fault — and pyarrow's lossy
+    code table (`NOT_FOUND` → `ArrowKeyError`) is never read as a class."""
+    assert type(_flight_to_jammi(pa.flight.FlightUnavailableError("down"))) is Unavailable
+    assert type(_flight_to_jammi(pa.ArrowKeyError("gRPC returned not found error"))) is BackendError

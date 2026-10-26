@@ -44,20 +44,17 @@ use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// The filter every layer a host installs reads: `RUST_LOG` when set, else
-/// `[logging] level`, else `host_default`. One filter for the formatter and
+/// `[logging] level`, else `host_default` — a filter directive, as
+/// `RUST_LOG` spells one. One filter for the formatter and
 /// the export layer, so a span or event a host does not log is not exported
 /// either — a layer with no filter of its own is interested in every
 /// callsite in the process, transport internals included. Every layer reads
 /// it as a per-layer filter, so each is [`EventsDecidedAtDispatch`].
-fn log_filter(logging: &LoggingConfig, host_default: LevelFilter) -> EventsDecidedAtDispatch {
-    EventsDecidedAtDispatch(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            logging
-                .level
-                .clone()
-                .unwrap_or_else(|| host_default.to_string()),
-        )
-    }))
+fn log_filter(logging: &LoggingConfig, host_default: &str) -> EventsDecidedAtDispatch {
+    EventsDecidedAtDispatch(
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(logging.level.as_deref().unwrap_or(host_default))),
+    )
 }
 
 /// The log formatter a host installs over `writer`, filtered by `RUST_LOG`
@@ -65,7 +62,7 @@ fn log_filter(logging: &LoggingConfig, host_default: LevelFilter) -> EventsDecid
 /// per `[logging] format`. `ansi` colours the output — for a terminal only.
 pub fn fmt_layer<W>(
     logging: &LoggingConfig,
-    host_default: LevelFilter,
+    host_default: &str,
     writer: W,
     ansi: bool,
 ) -> Box<dyn Layer<Registry> + Send + Sync>
@@ -240,7 +237,7 @@ mod otlp {
         pub fn force_flush(&self) -> Result<()> {
             self.0
                 .force_flush()
-                .map_err(|e| JammiError::Config(format!("OTLP force_flush failed: {e}")))
+                .map_err(|e| JammiError::Internal(format!("OTLP force_flush failed: {e}")))
         }
 
         /// Flush, then stop the exporter for good (releases the batch
@@ -249,7 +246,7 @@ mod otlp {
         pub fn shutdown(&self) -> Result<()> {
             self.0
                 .shutdown()
-                .map_err(|e| JammiError::Config(format!("OTLP shutdown failed: {e}")))
+                .map_err(|e| JammiError::Internal(format!("OTLP shutdown failed: {e}")))
         }
     }
 
@@ -406,7 +403,7 @@ pub type HostLayer = Box<dyn Layer<Registry> + Send + Sync>;
 /// `.with()` calls could not name.
 pub fn layers<W>(
     config: &JammiConfig,
-    host_default: LevelFilter,
+    host_default: &str,
     writer: W,
     ansi: bool,
 ) -> Result<Vec<HostLayer>>
@@ -435,7 +432,7 @@ static OTLP_PROVIDER: std::sync::OnceLock<OtlpProviderHandle> = std::sync::OnceL
 fn export_layer(
     config: &ObservabilityConfig,
     logging: &LoggingConfig,
-    host_default: LevelFilter,
+    host_default: &str,
 ) -> Result<Option<HostLayer>> {
     Ok(otlp_layer(config)?.map(|otlp| {
         OTLP_PROVIDER.get_or_init(|| otlp.provider_handle());
@@ -445,7 +442,7 @@ fn export_layer(
 
 /// `layer` behind the host's log filter.
 #[cfg(feature = "telemetry-otlp")]
-fn filtered_export<L>(layer: L, logging: &LoggingConfig, host_default: LevelFilter) -> HostLayer
+fn filtered_export<L>(layer: L, logging: &LoggingConfig, host_default: &str) -> HostLayer
 where
     L: Layer<Registry> + Send + Sync + 'static,
 {
@@ -458,7 +455,7 @@ where
 fn export_layer(
     _config: &ObservabilityConfig,
     _logging: &LoggingConfig,
-    _host_default: LevelFilter,
+    _host_default: &str,
 ) -> Result<Option<HostLayer>> {
     Ok(None)
 }
@@ -490,7 +487,16 @@ mod tests {
 
     /// What `fmt_layer` over `logging` and `host_default` writes for one
     /// `info!` and one `warn!`, captured through a scoped subscriber.
-    fn emitted(logging: &LoggingConfig, host_default: LevelFilter) -> String {
+    fn emitted(logging: &LoggingConfig, host_default: &str) -> String {
+        emitted_with(logging, host_default, || {
+            tracing::info!("routine progress");
+            tracing::warn!("needs attention");
+        })
+    }
+
+    /// What `fmt_layer` over `logging` and `host_default` writes for the
+    /// events `emit` raises, captured through a scoped subscriber.
+    fn emitted_with(logging: &LoggingConfig, host_default: &str, emit: impl FnOnce()) -> String {
         #[derive(Clone)]
         struct Buffer(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buffer {
@@ -505,10 +511,7 @@ mod tests {
         let buffer = Buffer(Arc::default());
         let sink = buffer.clone();
         let layer = fmt_layer(logging, host_default, move || sink.clone(), false);
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
-            tracing::info!("routine progress");
-            tracing::warn!("needs attention");
-        });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
         let bytes = buffer.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
     }
@@ -516,17 +519,31 @@ mod tests {
     #[test]
     fn an_unset_level_takes_the_hosts_default_and_a_configured_one_overrides_it() {
         let unset = LoggingConfig::default();
-        let quiet = emitted(&unset, LevelFilter::WARN);
+        let quiet = emitted(&unset, "warn");
         assert!(quiet.contains("needs attention") && !quiet.contains("routine progress"));
-        let chatty = emitted(&unset, LevelFilter::INFO);
+        let chatty = emitted(&unset, "info");
         assert!(chatty.contains("needs attention") && chatty.contains("routine progress"));
 
         let configured = LoggingConfig {
             level: Some("info".into()),
             ..LoggingConfig::default()
         };
-        let overridden = emitted(&configured, LevelFilter::WARN);
+        let overridden = emitted(&configured, "warn");
         assert!(overridden.contains("routine progress"));
+    }
+
+    /// A default that names the engine's crates alone keeps a dependency's
+    /// own log line out of the host's output, whatever its level, and keeps
+    /// the engine's.
+    #[test]
+    fn a_default_naming_the_engine_silences_its_dependencies() {
+        let unset = LoggingConfig::default();
+        let output = emitted_with(&unset, "off,jammi=warn", || {
+            tracing::warn!("needs attention");
+            tracing::error!(target: "symphonia_core::probe", "probe reach EOF at 34 bytes");
+        });
+        assert!(output.contains("needs attention"), "{output}");
+        assert!(!output.contains("probe reach EOF"), "{output}");
     }
 
     /// With no endpoint the host installs the formatter alone, and the
@@ -534,8 +551,8 @@ mod tests {
     #[test]
     fn layers_without_an_endpoint_are_the_formatter_alone() {
         let config = JammiConfig::default();
-        let layers = layers(&config, LevelFilter::WARN, std::io::sink, false)
-            .expect("no endpoint must not error");
+        let layers =
+            layers(&config, "warn", std::io::sink, false).expect("no endpoint must not error");
         assert_eq!(layers.len(), 1, "no otlp_endpoint -> the formatter alone");
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layers), || {
             tracing::warn!("layers_without_an_endpoint_are_the_formatter_alone");
@@ -550,7 +567,7 @@ mod tests {
     async fn layers_with_an_endpoint_add_the_otlp_export_layer() {
         let mut config = JammiConfig::default();
         config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
-        let layers = layers(&config, LevelFilter::WARN, std::io::sink, false)
+        let layers = layers(&config, "warn", std::io::sink, false)
             .expect("a well-formed endpoint must build");
         assert_eq!(
             layers.len(),
@@ -591,7 +608,7 @@ mod tests {
             level: Some("info".into()),
             ..LoggingConfig::default()
         };
-        let layer = filtered_export(otel, &logging, LevelFilter::WARN);
+        let layer = filtered_export(otel, &logging, "warn");
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
             tracing::info_span!("request").in_scope(|| {
                 tracing::debug_span!("detail").in_scope(|| {});
@@ -610,7 +627,7 @@ mod tests {
     fn layers_refuse_an_endpoint_this_build_cannot_honour() {
         let mut config = JammiConfig::default();
         config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
-        let refused = layers(&config, LevelFilter::WARN, std::io::sink, false)
+        let refused = layers(&config, "warn", std::io::sink, false)
             .map(|_| ())
             .expect_err("the endpoint cannot be honoured");
         assert!(refused.to_string().contains("telemetry-otlp"), "{refused}");

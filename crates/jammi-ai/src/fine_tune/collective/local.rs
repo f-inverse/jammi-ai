@@ -38,7 +38,8 @@ use candle_core::{Device, Tensor};
 use super::round::{self, Contribution};
 use super::transport::{self, Transport};
 use super::{
-    checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
+    checked_gather_counts, checked_root, reason_of, BlockingCall, Collective, Descriptor,
+    TensorSignature,
 };
 
 /// How long a rank waits at a rendezvous before the round is declared failed.
@@ -357,18 +358,6 @@ impl Shared {
             Some(refusal) => Err(refusal),
             None => Ok(()),
         }
-    }
-}
-
-/// The words to record as a gang's fault for `error`.
-///
-/// A [`JammiError::FineTune`]'s own message rather than its `Display`, so a
-/// fault quoted inside a later refusal does not carry a second copy of the
-/// "Fine-tune error" prefix.
-fn reason_of(error: &JammiError) -> String {
-    match error {
-        JammiError::FineTune(message) => message.clone(),
-        other => other.to_string(),
     }
 }
 

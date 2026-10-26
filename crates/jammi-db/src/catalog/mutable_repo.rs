@@ -55,8 +55,8 @@ impl Catalog {
                     Ok(())
                 })
             })
-            .await?;
-        Ok(())
+            .await
+            .map_err(|e| MutableTableError::from_insert(e, &def.id))
     }
 
     /// Look up a mutable table by id, scoped to the catalog's current tenant.

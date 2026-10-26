@@ -214,7 +214,7 @@ async fn a_won_finalize_publishes_and_attaches_in_one_transaction(backend: Backe
 
     assert_eq!(
         catalog.get_job(&job_id).await.unwrap().status,
-        JobStatus::Completed.to_string()
+        JobStatus::Completed
     );
     let model = catalog.get_model(&name).await.unwrap().unwrap();
     assert_eq!(
@@ -335,7 +335,7 @@ async fn a_lost_lease_finalize_writes_nothing_and_its_sweep_reclaims_its_bytes(
         .unwrap();
     assert!(won.is_none(), "a stale attempt does not finalize");
     let job = catalog.get_job(&job_id).await.unwrap();
-    assert_eq!(job.status, JobStatus::Running.to_string());
+    assert_eq!(job.status, JobStatus::Running);
     assert_eq!(job.claimed_by.as_deref(), Some("successor"));
     assert!(catalog.get_model(&name).await.unwrap().is_none());
     assert!(catalog.get_model(&checkpoint_name).await.unwrap().is_none());
@@ -471,7 +471,7 @@ async fn a_finalize_over_an_artifact_no_longer_staged_rolls_back_whole(backend: 
 
     assert_eq!(
         catalog.get_job(&job_id).await.unwrap().status,
-        JobStatus::Running.to_string()
+        JobStatus::Running
     );
     assert!(catalog.get_model(&name).await.unwrap().is_none());
     assert!(catalog.get_model(&checkpoint_name).await.unwrap().is_none());
@@ -565,7 +565,7 @@ async fn a_name_occupied_checkpoint_is_retired_with_the_jobs_unpublished_checkpo
     assert_eq!(state_of(&catalog, &skipped_ref).await, None);
     assert_eq!(
         catalog.get_job(&job_id).await.unwrap().status,
-        JobStatus::Completed.to_string()
+        JobStatus::Completed
     );
     assert!(catalog
         .staged_artifacts_of_attempt(&job_id, attempt)

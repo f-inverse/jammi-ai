@@ -1,6 +1,6 @@
 [package]
 name = "jammi-server"
-description = "OSS Jammi server binary: Arrow Flight SQL, SessionService, TriggerService, and health/metrics endpoints"
+description = "The Jammi server binary: Arrow Flight SQL, the typed gRPC services, and health/metrics endpoints"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,6 +29,8 @@ jammi-numerics.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
+# Decodes a Flight descriptor's `Any` to plan its statement through the engine.
+prost.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -68,7 +70,7 @@ reqwest.workspace = true
 # `jammi-ai`'s own `telemetry-otlp` feature (same precedent as `cuda`/
 # `metal`/`flash-attn` below). Default-on: every published `jammi-server`
 # binary and image carries it, so `[observability] otlp_endpoint` works with
-# no rebuild -- the OSS engine's "emit vendor-neutral, the stack is yours"
+# no rebuild -- the engine's "emit vendor-neutral, the stack is yours"
 # line (philosophy.md) applies to traces the same way it already does to
 # `/metrics` and structured logs. `--no-default-features` (or explicitly
 # `--features -telemetry-otlp`, which cargo does not support removing a
@@ -167,7 +169,6 @@ parquet.workspace = true
 # hand to exercise the wire surface end-to-end; the server's own code reaches
 # these only through `jammi_ai::wire`, so they are test-only deps.
 arrow-ipc.workspace = true
-prost.workspace = true
 prost-types.workspace = true
 # The bring-your-own-auth worked example (`grpc_byo_auth`) mints and verifies a
 # generic signed bearer token to drive its custom authenticating interceptor.

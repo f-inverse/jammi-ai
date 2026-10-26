@@ -94,7 +94,7 @@ pub fn result_table_url(root: &StorageUrl, seg: &str, table_name: &str) -> Resul
 pub fn sibling_url(parquet_url: &StorageUrl, name: &str) -> Result<StorageUrl> {
     let s = parquet_url.as_str();
     let (parent, _) = s.rsplit_once('/').ok_or_else(|| {
-        JammiError::Config(format!("result-table URL '{s}' has no parent prefix"))
+        JammiError::Internal(format!("result-table URL '{s}' has no parent prefix"))
     })?;
     Ok(StorageUrl::parse(&format!("{parent}/{name}"))?)
 }
@@ -106,7 +106,7 @@ fn parquet_stem(parquet_url: &StorageUrl) -> Result<&str> {
     let s = parquet_url.as_str();
     let name = s.rsplit('/').next().unwrap_or(s);
     name.strip_suffix(".parquet").ok_or_else(|| {
-        JammiError::Config(format!(
+        JammiError::Internal(format!(
             "result-table URL '{s}' does not name a `.parquet` object"
         ))
     })
@@ -124,7 +124,7 @@ fn any_stem(url: &StorageUrl) -> Result<&str> {
     let name = s.rsplit('/').next().unwrap_or(s);
     name.rsplit_once('.')
         .map(|(stem, _)| stem)
-        .ok_or_else(|| JammiError::Config(format!("URL '{s}' has no extension to swap")))
+        .ok_or_else(|| JammiError::Internal(format!("URL '{s}' has no extension to swap")))
 }
 
 /// The key of ANN segment `n`'s index bundle base, derived from the table's

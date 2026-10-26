@@ -11,7 +11,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::{ModelLocation, ModelRecord};
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::status::JobExecution;
+use jammi_db::catalog::status::{JobExecution, JobKind};
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result as JammiResult};
 use jammi_db::storage::StorageUrl;
@@ -709,7 +709,7 @@ pub async fn finalize_fine_tuned_model(
     catalog
         .submit_job(SubmitJobParams {
             job_id: &job_id,
-            kind: "fine_tune",
+            kind: JobKind::FineTune,
             execution: JobExecution::Queued,
             spec: "{}",
             model_ref: Some(&base_pk),
@@ -720,7 +720,11 @@ pub async fn finalize_fine_tuned_model(
         .await
         .unwrap();
     let attempt = catalog
-        .claim_next(WORKER, &["fine_tune"], std::time::Duration::from_secs(3600))
+        .claim_next(
+            WORKER,
+            &[JobKind::FineTune],
+            std::time::Duration::from_secs(3600),
+        )
         .await
         .unwrap()
         .expect("the queued job is claimable")
@@ -794,18 +798,18 @@ pub async fn submit_and_claim(
 }
 
 /// An approximate retrieval evaluation of `source_id`'s `embedding_table` (its
-/// most-recent table when `None`) against `golden_source` at cutoff `k`, with
+/// most-recent table when `None`) against `ground_truth` at cutoff `k`, with
 /// no cohort tags.
 pub fn retrieval_eval(
     source_id: &str,
     embedding_table: Option<&str>,
-    golden_source: &str,
+    ground_truth: &str,
     k: usize,
 ) -> jammi_ai::EmbeddingEvalRequest {
     jammi_ai::EmbeddingEvalRequest {
         source_id: source_id.into(),
         embedding_table: embedding_table.map(Into::into),
-        golden_source: golden_source.into(),
+        ground_truth: ground_truth.into(),
         k,
         cohorts: Default::default(),
         method: jammi_ai::SearchMethod::default(),
@@ -813,17 +817,17 @@ pub fn retrieval_eval(
 }
 
 /// An approximate comparison of `embedding_tables` (the baseline first) over
-/// `source_id` against `golden_source` at cutoff `k`.
+/// `source_id` against `ground_truth` at cutoff `k`.
 pub fn compare_eval(
     embedding_tables: &[String],
     source_id: &str,
-    golden_source: &str,
+    ground_truth: &str,
     k: usize,
 ) -> jammi_ai::CompareEvalRequest {
     jammi_ai::CompareEvalRequest {
         embedding_tables: embedding_tables.to_vec(),
         source_id: source_id.into(),
-        golden_source: golden_source.into(),
+        ground_truth: ground_truth.into(),
         k,
         method: jammi_ai::SearchMethod::default(),
     }

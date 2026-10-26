@@ -42,6 +42,7 @@ import tempfile
 import pyarrow as pa
 
 import jammi
+from jammi_cookbook import fixtures
 
 TENANT = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
@@ -52,7 +53,8 @@ db.set_tenant(TENANT)
 ## What outlives the request
 
 Only lineage is durable: the hashes of the uploaded images go in an ordinary
-mutable table. The images themselves are the throwaway working set.
+mutable table. The images themselves — here two PNGs from the cookbook's
+image corpus — are the throwaway working set.
 
 ```{python}
 db.create_mutable_table(
@@ -61,49 +63,63 @@ db.create_mutable_table(
     primary_key=["image_hash"],
 )
 
-uploads = {"img-1": b"...image one bytes...", "img-2": b"...image two bytes..."}
+uploads = {
+    path.stem: path.read_bytes()
+    for path in sorted(fixtures.path("tiny_image_corpus").glob("img_*.png"))[:2]
+}
 hashes = {iid: "sha256:" + hashlib.sha256(data).hexdigest() for iid, data in uploads.items()}
 ```
 
 ## Work in an ephemeral session
 
-Tables created in the session belong to it. `ephem.sql` replaces `{table}`
-with the tenant-scoped reference to the named ephemeral table. The lineage
-is written to the persistent table before the session closes, while the
-working data still exists; leaving the block closes the session, which drops
-its tables and publishes a `closed` event.
+Tables created in the session belong to it: here, the uploaded bytes. `ephem.sql`
+replaces `{table}` with the tenant-scoped reference to the named ephemeral
+table, which `physical_table_ref` also returns. The lineage — each image's
+hash, computed from the bytes the session holds — is written to the persistent
+table before the session closes; leaving the block closes the session, which
+drops its tables and publishes a `closed` event.
 
 ```{python}
 images_schema = pa.schema(
     [
         pa.field("image_id", pa.string(), nullable=False),
-        pa.field("image_hash", pa.string(), nullable=False),
+        pa.field("image", pa.binary(), nullable=False),
     ]
 )
 
 with db.ephemeral_session(timeout_seconds=3600) as ephem:
     ephem.create_ephemeral_table("query_images", schema=images_schema, primary_key=["image_id"])
     batch = pa.table(
-        {"image_id": list(hashes), "image_hash": list(hashes.values())}, schema=images_schema
+        {"image_id": list(uploads), "image": list(uploads.values())}, schema=images_schema
     )
     inserted = ephem.insert("query_images", batch=batch)
-    assert inserted == 2, "two rows stored in the ephemeral table"
-    assert ephem.count_rows("query_images") == 2
+    assert inserted == 2, "two images stored in the ephemeral table"
+    working_table = ephem.physical_table_ref("query_images")
 
-    stored = ephem.sql("query_images", "SELECT image_hash FROM {table}")
-    for h in stored.column("image_hash").to_pylist():
-        db.sql(f"INSERT INTO mutable.public.query_lineage (image_hash) VALUES ('{h}')")
-    print("ephemeral rows during session:", ephem.count_rows("query_images"))
+    stored = ephem.sql("query_images", "SELECT image_id, image FROM {table}")
+    for row in stored.to_pylist():
+        digest = "sha256:" + hashlib.sha256(row["image"]).hexdigest()
+        assert digest == hashes[row["image_id"]], "the session holds the uploaded bytes"
+        db.sql(f"INSERT INTO mutable.public.query_lineage (image_hash) VALUES ('{digest}')")
+    held = sum(len(b) for b in stored.column("image").to_pylist())
+    print(f"session holds {stored.num_rows} images ({held:,} bytes) in {working_table}")
 ```
 
 ## After the session
 
-The persistent lineage survives, referring to the hashes, never to the
-deleted working data.
+The working table is gone: reading it now fails as a missing relation. The
+persistent lineage survives, referring to the hashes, never to the deleted
+working data.
 
 ```{python}
+try:
+    db.sql(f"SELECT COUNT(*) FROM {working_table}")
+    raise AssertionError("the ephemeral table outlived its session")
+except jammi.errors.NotFound as gone:
+    print(f"after close, {working_table}: {type(gone).__name__}")
+
 lineage = db.sql("SELECT image_hash FROM mutable.public.query_lineage")
-assert lineage.num_rows == 2, "hash lineage persists after session close"
+assert sorted(lineage.column("image_hash").to_pylist()) == sorted(hashes.values())
 print("persistent lineage rows after close:", lineage.num_rows)
 ```
 

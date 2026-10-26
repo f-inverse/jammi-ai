@@ -26,19 +26,21 @@ The model has exactly two genuine isolation layers and one honest caveat:
    lives above it.
 
 The two tenants are an honest, disjoint partition of the papers: every paper
-belongs to exactly one tenant by its subject class. The tenant ids are opaque UUIDs — the
+belongs to exactly one tenant by its subject class, the subjects dealt out so the
+two tenants hold about as many papers each. The tenant ids are opaque UUIDs — the
 engine validates the form, never who the tenant is.
 
 ## The setup — two tenants over one corpus
 
-We reuse `jammi_cookbook.rails` verbatim — `tenant` (the bind-in-place/restore context
-manager), `assert_listing_isolated`, and `assert_rows_isolated`, the corrected helpers,
-not a re-implementation. `set_tenant` binds the scope to the connection *in place*; the
+The book's tenancy helpers come from `jammi_cookbook.rails`: `tenant` (the
+bind-in-place/restore context manager), `assert_listing_isolated`, and
+`assert_rows_isolated`. `set_tenant` binds the scope to the connection *in place*; the
 bound scope drives both isolation layers (`tenant_scope` is the block-scoped form the
 `tenant` helper delegates to).
 
 ```{python}
 import tempfile
+from collections import Counter
 
 import jammi
 import pyarrow as pa
@@ -58,8 +60,13 @@ papers = db.sql(
     f"SELECT paper_id, title, abstract, subject FROM {arxiv.papers}.public.{arxiv.papers}"
 ).to_pylist()
 subject = {p["paper_id"]: p["subject"] for p in papers}
-subjects = sorted({p["subject"] for p in papers})
-a_subjects = set(subjects[::2])
+# Largest subject first, each to whichever tenant holds fewer papers so far.
+a_subjects, held = set(), {"a": 0, "b": 0}
+for name, count in sorted(Counter(subject.values()).items(), key=lambda kv: (-kv[1], kv[0])):
+    side = "a" if held["a"] <= held["b"] else "b"
+    held[side] += count
+    if side == "a":
+        a_subjects.add(name)
 a_papers = sorted(pid for pid in subject if subject[pid] in a_subjects)
 b_papers = sorted(pid for pid in subject if subject[pid] not in a_subjects)
 
@@ -144,7 +151,7 @@ print(f"tenant A reads B's discriminator-less source: {caveat_visible} of {len(b
 print("the engine does not authenticate — access-gating lives above it")
 ```
 
-This is the claim that is easy to overstate and that this chapter must not re-break: a
+This is the claim that is easy to overstate: a
 *separate per-tenant source* is hidden from the **listing** (Property 1), but its rows are
 **not** hidden from a direct named read. Data isolation is the discriminator column
 (Property 2), not source separation.
@@ -160,7 +167,7 @@ claim("a source with no discriminator is globally readable: A reads every one of
 
 The consequence worth measuring directly: the **same recipe** run under each tenant
 gives that tenant its own answer, over only its own rows. The recipe is the book's
-retrieval measurement — embed the papers, build the same-subject golden, and
+retrieval measurement — embed the papers, build the same-subject ground truth, and
 score it with `eval_embeddings` — run once inside each tenant's scope. Each embedding
 table is built from, and each search reads, only the rows the discriminator lets that
 tenant see; an unscoped session sees none of them.
@@ -175,12 +182,12 @@ def scoped_precision(tenant_id: str) -> tuple[float, int, int]:
             source="papers_tagged", model=encoders.text(SCALE),
             columns=["title", "abstract"], key="paper_id",
         )
-        golden = datasets.same_label_golden(
+        truth = datasets.same_label_relevance(
             db, rows, key="paper_id", label="subject", text="title", queries=100,
-            name=f"golden_{tenant_id[:8]}",
+            name=f"truth_{tenant_id[:8]}",
         )
         report = db.eval_embeddings(
-            source="papers_tagged", golden_source=golden, embedding_table=embedded, k=10,
+            source="papers_tagged", ground_truth=truth, embedding_table=embedded, k=10,
         )
     return report["aggregate"]["precision_at_k"], len(rows), len(report["per_query"])
 

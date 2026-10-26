@@ -46,15 +46,20 @@ print(table)
 
 ### Query embedding tables
 
-Embedding tables are registered in DataFusion and queryable via SQL:
+Embedding tables are registered in DataFusion and queryable via SQL. The Jammi client
+lists them: each `list_sources` entry carries the result tables built on its source, and
+`describe_source` adds the tables the source itself serves, with their columns.
 
 ```python
-# List all embedding tables
-info = client.get_flight_info(
-    FlightDescriptor.for_command(b"SELECT table_name FROM information_schema.tables WHERE table_schema = 'jammi'")
-)
+import jammi
 
-# Query vectors directly
+db = jammi.connect("grpc://localhost:8081")
+for source in db.list_sources():
+    print(source["source_id"], [t["table_name"] for t in source["result_tables"]])
+```
+
+```python
+# Query an embedding table's rows
 info = client.get_flight_info(
     FlightDescriptor.for_command(b"SELECT _row_id, _model_id FROM \"jammi.patents__embedding__all-MiniLM-L6-v2__20260325\" LIMIT 10")
 )

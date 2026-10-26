@@ -93,6 +93,25 @@ pub async fn postgres_database_url(dir: &Path) -> String {
     with_database(&server, &database)
 }
 
+/// [`postgres_database_url`]'s database for `dir`, holding what `script`
+/// creates — the database a Postgres source under test reads.
+///
+/// # Panics
+/// As [`postgres_database_url`], and when `script` fails.
+pub async fn postgres_database_holding(dir: &Path, script: &str) -> String {
+    use sqlx::{Connection, Executor};
+
+    let url = postgres_database_url(dir).await;
+    let mut db = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("connect to the test database");
+    db.execute(script)
+        .await
+        .unwrap_or_else(|e| panic!("set up the test database: {e}"));
+    db.close().await.expect("close the setup connection");
+    url
+}
+
 /// The database name recorded in `<dir>/catalog.postgres`, minting and
 /// recording one when the file is absent. The name is written whole to a
 /// scratch file and linked into place, so a concurrent reader sees either no

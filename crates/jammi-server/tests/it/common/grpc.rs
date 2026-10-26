@@ -149,6 +149,15 @@ pub struct EngineServer {
 }
 
 impl EngineServer {
+    /// Shut the server down and wait for its task to end. A server that
+    /// stopped before it was asked to, or whose task panicked, fails the test.
+    pub async fn stop(self) {
+        self.shutdown
+            .send(())
+            .expect("the server runs until it is stopped");
+        self.handle.await.expect("the server task ends cleanly");
+    }
+
     /// Start a training worker over the SAME engine session this server drives,
     /// returning the RAII guard that owns its loop (dropping the guard stops it).
     ///

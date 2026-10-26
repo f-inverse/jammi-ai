@@ -1259,19 +1259,15 @@ fn catalog_names(session: &JammiSession) -> Vec<String> {
 #[tokio::test]
 async fn a_postgres_database_registered_by_its_url_joins_a_file() {
     use jammi_db::source::SourceDefinition;
-    use sqlx::{Connection, Executor, PgConnection};
 
     // The source is a database holding exactly this test's table.
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute(
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
         "CREATE TABLE ratings (id BIGINT PRIMARY KEY, stars INTEGER NOT NULL); \
          INSERT INTO ratings VALUES (1, 5), (2, 3), (3, 4);",
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;

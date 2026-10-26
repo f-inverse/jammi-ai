@@ -7,14 +7,12 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{SourceDefinition, SourceTable};
 use jammi_test_utils::{make_test_session, unique_suffix};
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::{tempdir, TempDir};
 
 async fn session() -> (JammiSession, String, [TempDir; 2]) {
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute(
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
         "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1), (2); \
          CREATE VIEW v AS SELECT id FROM t; \
          CREATE MATERIALIZED VIEW mv AS SELECT id FROM t; \
@@ -23,9 +21,7 @@ async fn session() -> (JammiSession, String, [TempDir; 2]) {
          CREATE SCHEMA \"Analytics\"; CREATE TABLE \"Analytics\".\"Daily Totals\" (id INTEGER); \
          INSERT INTO \"Analytics\".\"Daily Totals\" VALUES (7);",
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
     let source = format!("pg_{}", unique_suffix());

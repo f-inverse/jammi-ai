@@ -64,9 +64,9 @@ _CASCADE = {
 # `SourceType` serialises to, so a descriptor dict is shaped identically whether
 # it crossed the gRPC wire or came back from the in-process engine.
 _SOURCE_KIND_NAME = {
-    catalog_pb2.SourceKind.SOURCE_KIND_FILE: "File",
-    catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES: "Postgres",
-    catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "MySql",
+    catalog_pb2.SourceKind.SOURCE_KIND_FILE: "file",
+    catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES: "postgres",
+    catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "mysql",
 }
 
 # Wire `ResultTableKind` enum value → the string the embed wheel's

@@ -364,7 +364,9 @@ class EmbeddedBackend:
         return self._native.list_sources()
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
-        """Describe one registered source by id, or ``None`` if not visible."""
+        """Describe one registered source by id, or ``None`` if not visible: the
+        `list_sources` entry plus ``tables``, every table the source serves as
+        ``{"schema", "table", "columns"}`` with ``columns`` a `pyarrow.Schema`."""
         return self._native.describe_source(source_id)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:

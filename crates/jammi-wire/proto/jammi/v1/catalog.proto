@@ -82,16 +82,15 @@ service CatalogService {
 
   // List a `SourceDescriptor` for every source registered to the calling
   // tenant. Peer of the abstraction's `list_sources`; registry introspection,
-  // not a SQL query. `ListSources` is `DescribeSource` applied over every
-  // registered source — one descriptor shape, one operator, no per-source
-  // special-casing.
+  // not a SQL query: it reads the catalog alone and reaches no source.
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
 
-  // Describe one registered source: its registry identity (id / kind /
-  // lifecycle status) plus the result tables embedded out of it (each carrying
-  // its own status / row_count / dimensions). Peer of the abstraction's
-  // `describe_source`.
-  rpc DescribeSource(DescribeSourceRequest) returns (SourceDescriptor);
+  // Describe one registered source: its `SourceDescriptor` and every table it
+  // serves, each with its schema, name and columns. Peer of the abstraction's
+  // `describe_source`. It reaches the source to read its tables, so a database
+  // that cannot be reached is `UNAVAILABLE`; a source the caller does not see
+  // is `NOT_FOUND`.
+  rpc DescribeSource(DescribeSourceRequest) returns (SourceDescription);
 
   // List a `Model` record for every model registered to the calling tenant.
   // Peer of the abstraction's `list_models`; registry introspection, not a SQL
@@ -356,6 +355,26 @@ message SourceDescriptor {
   // self-describing `ResultTable` record — the same shape `GenerateEmbeddings`
   // returns — so the descriptor carries one source-of-truth for those numbers.
   repeated jammi.v1.embedding.ResultTable result_tables = 4;
+}
+
+// One registered source described whole.
+message SourceDescription {
+  SourceDescriptor source = 1;
+  // Every table the source serves: `public` first, then every other schema
+  // by name, each schema's tables by name.
+  repeated SourceTableDescription tables = 2;
+}
+
+// One table a source serves. SQL names it `"<source>"."<schema>"."<table>"`.
+message SourceTableDescription {
+  // The schema the table sits in; `public` for a source with no schemas of
+  // its own.
+  string schema = 1;
+  string table = 2;
+  // The table's columns as the engine reads them: an Arrow schema encoded as
+  // an Arrow IPC schema message (the framing `MutableTableDefinition.schema`
+  // uses).
+  bytes columns = 3;
 }
 
 message ListModelsRequest {}

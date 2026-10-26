@@ -10,7 +10,6 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::session::JammiSession;
 use jammi_db::source::SourceDefinition;
 use jammi_test_utils::{make_test_session, unique_suffix};
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::{tempdir, TempDir};
 
 /// A session with a Postgres source `pg_<suffix>` holding
@@ -18,17 +17,14 @@ use tempfile::{tempdir, TempDir};
 /// negative and a NULL — and `labels(id INTEGER, label TEXT)` naming them.
 async fn session_with_prices() -> (JammiSession, String, [TempDir; 2]) {
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute(
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
         "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount MONEY); \
          INSERT INTO prices VALUES (1, 12.34), (2, 0.50), (3, -7.25), (4, NULL); \
          CREATE TABLE labels (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
          INSERT INTO labels VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');",
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;

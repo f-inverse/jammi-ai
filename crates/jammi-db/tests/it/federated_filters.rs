@@ -14,7 +14,6 @@ use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition, SourceType};
 use jammi_test_utils::{make_test_session, unique_suffix};
 use parquet::arrow::ArrowWriter;
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::{tempdir, TempDir};
 
 const CUSTOMERS: [(i32, &str); 5] = [(1, "SP"), (2, "SP"), (3, "SP"), (4, "RJ"), (5, "RJ")];
@@ -58,23 +57,19 @@ struct Sources {
 
 async fn sources() -> Sources {
     let pg_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(pg_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
     let values = CUSTOMERS
         .iter()
         .map(|(id, state)| format!("({id}, '{state}')"))
         .collect::<Vec<_>>()
         .join(", ");
-    db.execute(
-        format!(
+    let url = jammi_test_utils::postgres_database_holding(
+        pg_dir.path(),
+        &format!(
             "CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, state TEXT NOT NULL); \
              INSERT INTO customers VALUES {values};"
-        )
-        .as_str(),
+        ),
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let files = tempdir().unwrap();
     let customers_path = files.path().join("customers.parquet");

@@ -26,7 +26,9 @@ use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
-use crate::source::{SourceConnection, SourceDefinition, SourceTable, SourceType};
+use crate::source::{
+    SourceConnection, SourceDefinition, SourceDescription, SourceTable, SourceType,
+};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::rewrite::RowRewritePlanner;
@@ -566,6 +568,19 @@ impl JammiSession {
         );
 
         Ok(())
+    }
+
+    /// Describe one registered source: its registry descriptor and every table
+    /// it serves with its columns, or `None` when the caller's scope sees no
+    /// source of that id. The tables are the source's providers, built when no
+    /// cache holds them — so a database source is reached, and an unreachable
+    /// one is the error that says so.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescription>> {
+        let Some(descriptor) = self.catalog.describe_source(source_id).await? else {
+            return Ok(None);
+        };
+        let tables = self.sources.resolve(source_id).await?.described();
+        Ok(Some(SourceDescription { descriptor, tables }))
     }
 
     /// The tables a source serves, in its order ([`SourceTable`]'s) —

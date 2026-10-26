@@ -680,6 +680,15 @@ impl InferenceSession {
             .await
     }
 
+    /// Describe one registered source: its descriptor and every table it serves
+    /// with its columns ([`JammiSession::describe_source`]).
+    pub async fn describe_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<jammi_db::source::SourceDescription>> {
+        self.inner.describe_source(source_id).await
+    }
+
     /// Remove a source and all associated state (result tables, disk files,
     /// ANN cache, DataFusion registration). Eval runs are preserved.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {

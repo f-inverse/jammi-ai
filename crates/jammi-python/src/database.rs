@@ -20,7 +20,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
-use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
+use crate::convert::{batches_to_pyarrow, serializable_to_pydict, source_description_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
 use crate::job::PyJob;
 
@@ -596,17 +596,17 @@ impl PyDatabase {
     }
 
     /// Describe one registered source by id, or `None` when no source with
-    /// that id is visible to the current tenant. Returns the same dict shape
-    /// `list_sources` yields per entry.
+    /// that id is visible to the current tenant: the dict `list_sources`
+    /// yields per entry, plus `tables` — every table the source serves, each
+    /// `{"schema": str, "table": str, "columns": pyarrow.Schema}`. Reaches the
+    /// source to read its tables, where `list_sources` reads the registry
+    /// alone.
     fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
         self.check_open()?;
-        let descriptor = crate::released(
-            &self.runtime,
-            self.session.catalog().describe_source(source_id),
-        )
-        .map_err(to_pyerr)?;
-        descriptor
-            .map(|d| serializable_to_pydict(py, &d))
+        let description = crate::released(&self.runtime, self.session.describe_source(source_id))
+            .map_err(to_pyerr)?;
+        description
+            .map(|d| source_description_to_pydict(py, d))
             .transpose()
     }
 

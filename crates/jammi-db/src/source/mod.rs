@@ -274,6 +274,21 @@ impl SourceTable {
     }
 }
 
+/// One table a source serves, with the columns it reads as.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTableDescription {
+    pub table: SourceTable,
+    pub columns: arrow::datatypes::SchemaRef,
+}
+
+/// One registered source described whole: its registry descriptor and every
+/// table it serves, in the source's order ([`SourceTable`]'s).
+#[derive(Debug, Clone)]
+pub struct SourceDescription {
+    pub descriptor: crate::catalog::source_repo::SourceDescriptor,
+    pub tables: Vec<SourceTableDescription>,
+}
+
 /// The table as SQL names it: `"source"."schema"."table"`, each part quoted.
 impl std::fmt::Display for SourceTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

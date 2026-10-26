@@ -77,10 +77,14 @@ pub use local_session::{
 
 /// Engine introspection shapes the [`Session`] surface returns: a per-source
 /// [`SourceDescriptor`] (registry identity joined with its embedding result
-/// tables) and the build's capabilities [`ServerInfo`]. Both originate in the
-/// `jammi-db` substrate (the catalog and the compile-time capability facts) and
-/// are re-exported here so SDK consumers reach them as `jammi_ai::*`.
+/// tables), one source's [`SourceDescription`] (its descriptor and every table
+/// it serves, each a [`SourceTableDescription`] with its columns) and the
+/// build's capabilities [`ServerInfo`]. They originate in the `jammi-db`
+/// substrate (the catalog, the source registry and the compile-time capability
+/// facts) and are re-exported here so SDK consumers reach them as
+/// `jammi_ai::*`.
 pub use jammi_db::catalog::source_repo::SourceDescriptor;
+pub use jammi_db::source::{SourceDescription, SourceTableDescription};
 pub use jammi_db::ServerInfo;
 
 /// The SDK front door: [`jammi::Jammi::open`] opens an embedded [`Session`] from

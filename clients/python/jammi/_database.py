@@ -280,6 +280,24 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _source_description_to_dict(d: catalog_pb2.SourceDescription) -> Dict[str, Any]:
+    """Project a wire `SourceDescription` into the embed wheel's `describe_source`
+    dict: the descriptor's keys, as `list_sources` yields them, plus ``tables`` —
+    each ``{"schema", "table", "columns"}``, ``columns`` a `pyarrow.Schema` decoded
+    from its IPC framing — so a caller reads the same keys regardless of transport.
+    """
+    description = _source_descriptor_to_dict(d.source)
+    description["tables"] = [
+        {
+            "schema": t.schema,
+            "table": t.table,
+            "columns": pa.ipc.open_stream(t.columns).schema,
+        }
+        for t in d.tables
+    ]
+    return description
+
+
 def _present(message, field: str) -> Optional[str]:
     """A `jammi.v1` optional field's value, or ``None`` when the peer left it
     absent."""
@@ -1343,17 +1361,20 @@ class RemoteDatabase:
     def list_sources(self) -> List[Dict[str, Any]]:
         """A descriptor for every source registered to the current tenant.
 
-        Maps to `CatalogService.ListSources`; same dict shape per entry as
-        :meth:`describe_source`.
+        Maps to `CatalogService.ListSources`; each entry is :meth:`describe_source`'s
+        dict without ``tables``, read from the registry alone.
         """
         resp = self._call(self._catalog.ListSources, catalog_pb2.ListSourcesRequest())
         return [_source_descriptor_to_dict(d) for d in resp.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
-        """Describe one registered source by id, or ``None`` if not visible.
+        """Describe one registered source by id, or ``None`` if not visible: the
+        :meth:`list_sources` entry plus ``tables``, every table the source serves
+        as ``{"schema", "table", "columns"}`` with ``columns`` a `pyarrow.Schema`.
 
-        Maps to `CatalogService.DescribeSource`. The engine returns a NotFound
-        status when no such source exists; that is surfaced here as ``None``.
+        Maps to `CatalogService.DescribeSource`, which reaches the source to read
+        its tables. The engine returns a NotFound status when no such source
+        exists; that is surfaced here as ``None``.
         """
         try:
             d = self._call(
@@ -1364,7 +1385,7 @@ class RemoteDatabase:
             if getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return None
             raise
-        return _source_descriptor_to_dict(d)
+        return _source_description_to_dict(d)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.

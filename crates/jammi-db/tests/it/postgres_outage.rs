@@ -8,7 +8,6 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::error::ErrorClass;
 use jammi_db::source::SourceDefinition;
 use jammi_test_utils::{make_test_session, unique_suffix};
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::tempdir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -42,12 +41,11 @@ async fn proxy(target: (String, u16)) -> (u16, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn a_query_over_a_stopped_database_fails_at_once_naming_it() {
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
-        .await
-        .unwrap();
-    db.close().await.unwrap();
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
+        "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);",
+    )
+    .await;
 
     let mut through = Url::parse(&url).unwrap();
     let target = (

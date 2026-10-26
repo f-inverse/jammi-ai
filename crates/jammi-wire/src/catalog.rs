@@ -2,9 +2,11 @@
 //! that names sources, models, and topics.
 //!
 //! Sources / models: maps the wire `SourceKind` / `FileFormat` /
-//! `SourceConnection` / `SourceDescriptor` / `Model` onto the engine's
-//! [`SourceType`], [`FileFormat`], [`SourceConnection`], [`SourceDescriptor`],
-//! and [`ModelDescriptor`]. Only the URL + format cross the wire on a connection —
+//! `SourceConnection` / `SourceDescriptor` / `SourceDescription` / `Model` onto
+//! the engine's [`SourceType`], [`FileFormat`], [`SourceConnection`],
+//! [`SourceDescriptor`], [`SourceDescription`] and [`ModelDescriptor`]. A
+//! source table's columns ride as a schema-only Arrow IPC stream, like a
+//! topic's schema. Only the URL + format cross the wire on a connection —
 //! cloud credentials are server-side, so the connection decode fills the rest
 //! from `Default`.
 //!
@@ -27,7 +29,10 @@ use std::time::Duration;
 use jammi_db::catalog::model_repo::{ModelBackendKind, ModelDescriptor};
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{
+    FileFormat, SourceConnection, SourceDescription, SourceTable, SourceTableDescription,
+    SourceType,
+};
 use jammi_db::store::{ReconcileOptions, ReconcileReport};
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TopicDefinition;
@@ -189,6 +194,53 @@ pub fn source_descriptor_from_proto(
             .map(result_table_from_proto)
             .collect::<Result<_, Status>>()?,
     })
+}
+
+/// Encode one source's [`SourceDescription`] into the wire message: its
+/// descriptor, and each table's schema, name and columns. Fallible only on a
+/// column schema's encode.
+impl TryFrom<SourceDescription> for pb::SourceDescription {
+    type Error = Status;
+
+    fn try_from(description: SourceDescription) -> Result<Self, Status> {
+        Ok(pb::SourceDescription {
+            source: Some(description.descriptor.into()),
+            tables: description
+                .tables
+                .into_iter()
+                .map(|t| {
+                    Ok(pb::SourceTableDescription {
+                        columns: encode_ipc_stream(&t.columns, &[])?,
+                        schema: t.table.schema,
+                        table: t.table.table,
+                    })
+                })
+                .collect::<Result<_, Status>>()?,
+        })
+    }
+}
+
+/// Reconstruct the engine's [`SourceDescription`] from the wire message — the
+/// inverse of the encode above, so a remote `describe_source` returns what a
+/// local one does. A description without its descriptor, or a table whose
+/// columns do not decode, is `invalid_argument`.
+pub fn source_description_from_proto(
+    description: pb::SourceDescription,
+) -> Result<SourceDescription, Status> {
+    let descriptor = source_descriptor_from_proto(description.source.ok_or_else(|| {
+        Status::invalid_argument("a source description carries its source's descriptor")
+    })?)?;
+    let tables = description
+        .tables
+        .into_iter()
+        .map(|t| {
+            Ok(SourceTableDescription {
+                columns: decode_ipc_schema(&t.columns)?,
+                table: SourceTable::new(&descriptor.source_id, &t.schema, &t.table),
+            })
+        })
+        .collect::<Result<_, Status>>()?;
+    Ok(SourceDescription { descriptor, tables })
 }
 
 /// Encode the engine's [`ModelDescriptor`] onto the wire `Model` — the client-

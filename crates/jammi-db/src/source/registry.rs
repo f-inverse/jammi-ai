@@ -60,7 +60,9 @@ use datafusion::execution::session_state::SessionState;
 use parking_lot::RwLock;
 
 use super::file_format;
-use super::{table_name_from_url, SourceDefinition, SourceTable, SourceType};
+use super::{
+    table_name_from_url, SourceDefinition, SourceTable, SourceTableDescription, SourceType,
+};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageRegistry, StorageUrl};
@@ -99,6 +101,17 @@ impl ResolvedSource {
     /// The tables the source serves, in its order.
     pub(crate) fn tables(&self) -> Vec<SourceTable> {
         self.tables.iter().map(|(table, _)| table.clone()).collect()
+    }
+
+    /// The tables the source serves with their columns, in its order.
+    pub(crate) fn described(&self) -> Vec<SourceTableDescription> {
+        self.tables
+            .iter()
+            .map(|(table, provider)| SourceTableDescription {
+                table: table.clone(),
+                columns: provider.schema(),
+            })
+            .collect()
     }
 
     /// The schemas the source serves its tables in, in its order.

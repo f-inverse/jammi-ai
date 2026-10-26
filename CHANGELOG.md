@@ -230,6 +230,18 @@ The dependency audit is green again on the live advisory database, and database 
   another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
   owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
   the catalogs a query sees and `information_schema` list the same set.
+- **A client lists a source's tables and their columns, on either transport.** A remote client
+  had no way to: `list_sources` and `describe_source` carried no tables, and `information_schema`
+  is off on a server, where a `SET` does not carry from one request to the next (#751).
+  `describe_source` now returns the source's descriptor and every table it serves, each with its
+  schema, name and columns as the engine reads them, reaching the source to read them;
+  `list_sources` still reads the registry alone. The server guide lists embedding tables through
+  `list_sources`, where it queried `information_schema`. **BREAKING** (wire, Rust API, Python):
+  `DescribeSource` returns a `SourceDescription`, and so does `describe_source` in `jammi_db`,
+  `jammi_ai` and `jammi_admin`; Python's dict gains `tables`, each `{"schema", "table",
+  "columns"}` with `columns` a `pyarrow.Schema`, and a remote descriptor's `source_type` reads
+  `file`, `postgres` or `mysql`, as the embedded one does, where it read `File`, `Postgres` or
+  `MySql`.
 - **A mutable table has no chunk size.** `MutableTableDefinition.chunk_size`, its builder
   method, `MutableTableDefinition.chunk_size` on the wire and the Python `chunk_size=` argument
   set a value no read consulted: `scan_after` returns its rows whole and a trigger replay steps

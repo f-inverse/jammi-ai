@@ -19,7 +19,6 @@ use jammi_db::session::{JammiSession, QueryFunction};
 use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition, SourceType};
 use jammi_test_utils::{make_test_session, unique_suffix};
 use parquet::arrow::ArrowWriter;
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::{tempdir, TempDir};
 
 /// One row: `(id, status, qty, ratio, amount in cents, bought, delivered, tags)`.
@@ -164,8 +163,6 @@ struct Sources {
 
 async fn sources() -> Sources {
     let pg_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(pg_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
     let values = ROWS
         .iter()
         .map(|r| {
@@ -183,17 +180,15 @@ async fn sources() -> Sources {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    db.execute(
-        format!(
+    let url = jammi_test_utils::postgres_database_holding(
+        pg_dir.path(),
+        &format!(
             "CREATE TABLE orders (id INTEGER NOT NULL, status TEXT, qty INTEGER, \
              ratio DOUBLE PRECISION, amount NUMERIC(10, 2), bought DATE, delivered DATE, \
              tags TEXT); INSERT INTO orders VALUES {values};"
-        )
-        .as_str(),
+        ),
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let files = tempdir().unwrap();
     let path = files.path().join("orders.parquet");

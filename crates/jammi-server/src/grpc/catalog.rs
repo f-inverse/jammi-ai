@@ -252,7 +252,7 @@ impl CatalogService for CatalogServer {
     async fn describe_source(
         &self,
         request: Request<pb::DescribeSourceRequest>,
-    ) -> Result<Response<pb::SourceDescriptor>, Status> {
+    ) -> Result<Response<pb::SourceDescription>, Status> {
         let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
@@ -260,15 +260,15 @@ impl CatalogService for CatalogServer {
 
         // An absent source returns NotFound — the truthful "no such source for
         // this tenant" the remote arm maps back to `None`, never a faked empty
-        // descriptor.
-        let descriptor = scoped(self.engine()?, tenant, || {
+        // description.
+        let description = scoped(self.engine()?, tenant, || {
             session.describe_source(&req.source_id)
         })
         .await
         .map_err(map_engine_error)?
         .ok_or_else(|| Status::not_found(format!("source '{}' not found", req.source_id)))?;
 
-        Ok(Response::new(pb::SourceDescriptor::from(descriptor)))
+        Ok(Response::new(pb::SourceDescription::try_from(description)?))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

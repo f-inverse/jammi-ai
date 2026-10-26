@@ -23,8 +23,8 @@ db = jammi.connect(engine)
 #
 # `get_server_info` reports the engine's version, its features and the storage
 # backends it can write results to. `describe_source` reports one registered
-# source and the result tables built on it, and `None` for a name that is not
-# registered.
+# source: the tables it serves, each with its columns, and the result tables
+# built on it; and `None` for a name that is not registered.
 
 # %%
 info = db.get_server_info()
@@ -33,6 +33,10 @@ print(f"engine {info['version']}; storage backends: {info['storage_backends']}")
 db.add_source("training", url=str(fixtures.path("tiny_pairs.csv")), format="csv")
 source = db.describe_source("training")
 print(f"source {source['source_id']}: {source['status']}")
+for table in source["tables"]:
+    print(f"  {table['schema']}.{table['table']}: {', '.join(table['columns'].names)}")
+assert [(t["schema"], t["table"]) for t in source["tables"]] == [("public", "tiny_pairs")]
+assert source["tables"][0]["columns"].names == ["text_a", "text_b", "score"]
 assert db.describe_source("no_such_source") is None
 
 # %% [markdown]

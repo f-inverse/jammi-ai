@@ -164,7 +164,7 @@ timing knob every leased catalog row shares across the fleet — see
 **Sources are fleet-wide the moment they are registered.** The catalog's
 `sources` table is the truth; the DataFusion providers a replica builds for
 a source are a cache of that row, revalidated on every resolution. A SQL
-reference to `<source>.public.<table>`, `describe_source`, and every verb
+reference to `<source>.<schema>.<table>`, `describe_source`, and every verb
 that names a source read the row through the shared catalog, so a source
 registered through one replica resolves on every other at its next
 reference, a source re-registered under the same id with a different

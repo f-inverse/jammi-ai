@@ -33,6 +33,17 @@ connecting role may use, each under its own schema: `pg_data.public.articles`,
 grants; the system schemas are never served. A MySQL source serves the tables of the
 database its URL names under `public`: `mysql_data.public.assignees`.
 
+`describe_source` lists what a source serves: each table's schema, its name and its
+columns as the engine reads them, a `pyarrow.Schema` in Python. A remote session gets the
+same answer as the embedded engine, so a client finds a database's tables without holding
+its credentials. `list_sources` reads the registry alone; `describe_source` reaches the
+database, so a database it cannot reach fails it.
+
+```python
+for table in db.describe_source("pg_data")["tables"]:
+    print(f"{table['schema']}.{table['table']}", table["columns"].names)
+```
+
 A query over a Postgres source whose database has stopped answering fails at once — an
 `Unavailable` error (gRPC `UNAVAILABLE`, the retryable class) naming the database's address
 and why it was not reached — and answers again, with no re-registration, once the database

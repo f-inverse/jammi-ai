@@ -13,16 +13,14 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::session::{JammiSession, QueryFunction};
 use jammi_db::source::SourceDefinition;
 use jammi_test_utils::{make_test_session, unique_suffix};
-use sqlx::{Connection, Executor, PgConnection};
 use tempfile::{tempdir, TempDir};
 
 /// A database holding `plain(id)` and `kinds`, one column of every type the
 /// driver does not read as stored, and the session reading it.
 async fn session() -> (JammiSession, String, [TempDir; 2]) {
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute(
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
         "CREATE EXTENSION IF NOT EXISTS citext; \
          CREATE DOMAIN year AS integer; \
          CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy'); \
@@ -41,9 +39,7 @@ async fn session() -> (JammiSession, String, [TempDir; 2]) {
              (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
               '1973-07-01 00:00:00', NULL, NULL, NULL, NULL, NULL);",
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;

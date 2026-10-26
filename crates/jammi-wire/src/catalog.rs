@@ -182,6 +182,18 @@ impl From<SourceDescriptor> for pb::SourceDescriptor {
     }
 }
 
+/// The `ListSources` reply for `descriptors`, each encoded as above.
+impl From<Vec<SourceDescriptor>> for pb::ListSourcesResponse {
+    fn from(descriptors: Vec<SourceDescriptor>) -> Self {
+        pb::ListSourcesResponse {
+            sources: descriptors
+                .into_iter()
+                .map(pb::SourceDescriptor::from)
+                .collect(),
+        }
+    }
+}
+
 /// Reconstruct the engine's [`SourceDescriptor`] from the wire message — the
 /// inverse of the encode above, for the the remote client receive side.
 /// The kind decodes through the shared [`source_type_from_proto`] (an

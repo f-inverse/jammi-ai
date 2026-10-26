@@ -20,7 +20,7 @@ use jammi_db::source::{CaCertificate, FileFormat, SourceConnection, SourceDefini
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
-use crate::convert::{batches_to_pyarrow, serializable_to_pydict, source_description_to_pydict};
+use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
 use crate::job::PyJob;
 
@@ -588,33 +588,39 @@ impl PyDatabase {
         .map_err(to_pyerr)
     }
 
-    /// List a descriptor for every source registered to the current tenant.
-    /// Each is a dict carrying `source_id`, `source_type`, `status`, and
-    /// `result_tables` (the embedding result tables produced from it, each
-    /// with its own `status` / `row_count` / `dimensions`). Registry
-    /// introspection, not a SQL query.
-    fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// The serialized `ListSourcesResponse` for every source registered to
+    /// the current tenant — the reply the remote client receives, projected
+    /// by the one projection both transports share. Registry introspection,
+    /// not a SQL query.
+    fn _list_sources_proto(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let descriptors = crate::released(
             &self.runtime,
             self.session.catalog().list_source_descriptors(),
         )
         .map_err(to_pyerr)?;
-        serializable_to_pydict(py, &descriptors)
+        let bytes = jammi_ai::wire::source_descriptors_to_bytes(descriptors);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
 
-    /// Describe one registered source by id, or `None` when no source with
-    /// that id is visible to the current tenant: the dict `list_sources`
-    /// yields per entry, plus `tables` — every table the source serves, each
-    /// `{"schema": str, "table": str, "columns": pyarrow.Schema}`. Reaches the
-    /// source to read its tables, where `list_sources` reads the registry
+    /// The serialized `SourceDescription` of one registered source, or `None`
+    /// when no source with that id is visible to the current tenant. Reaches
+    /// the source to read its tables, where the listing reads the registry
     /// alone.
-    fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
+    fn _describe_source_proto(
+        &self,
+        py: Python<'_>,
+        source_id: &str,
+    ) -> PyResult<Option<Py<PyAny>>> {
         self.check_open()?;
         let description = crate::released(&self.runtime, self.session.describe_source(source_id))
             .map_err(to_pyerr)?;
         description
-            .map(|d| source_description_to_pydict(py, d))
+            .map(|d| {
+                let bytes =
+                    jammi_ai::wire::source_description_to_bytes(d).map_err(status_to_pyerr)?;
+                Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+            })
             .transpose()
     }
 

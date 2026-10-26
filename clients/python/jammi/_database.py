@@ -30,8 +30,6 @@ from ._assembly import (
     _EDGE_DIRECTION,
     _FILE_FORMAT,
     _MODEL_TASK_NAME,
-    _RESULT_TABLE_KIND_NAME,
-    _SOURCE_KIND_NAME,
     _database_source_kind,
     _local_source_url,
     build_add_channel_columns_request,
@@ -62,6 +60,8 @@ from ._assembly import (
     build_search_request,
     build_subscribe_request,
     recompute_report_to_dict,
+    source_description_to_dict,
+    source_descriptor_to_dict,
     build_refresh_embeddings_request,
     build_compact_embeddings_request,
     build_expire_versions_request,
@@ -238,64 +238,6 @@ def _flight_to_jammi(exc: "pa.ArrowException") -> JammiError:
         if isinstance(exc, flight_error):
             return _status_to_jammi(code, str(exc), None)
     return _status_to_jammi(grpc.StatusCode.UNKNOWN, str(exc), None)
-
-
-def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
-    """Project a wire `ResultTable` into the embed wheel's result-table dict.
-
-    `model_id`, `key_column` and `derived_from` round-trip as `None` when the
-    engine did not record one (a derivation runs no model) — the same shape the embedded `Option<String>` serialises
-    to — and `kind` is spelled the same string the embedded `ResultTableKind`
-    serialises to, so a derived (neighbor-graph / as-of-join) table's
-    provenance reads identically regardless of transport. `RESULT_TABLE_KIND_
-    UNSPECIFIED` (never emitted for a genuine result table — every persisted
-    row has a concrete kind) falls back to `"Unspecified"`, the same
-    unrecognised-enum fallback `_source_descriptor_to_dict` uses for `kind`.
-    """
-    return {
-        "table_name": rt.table_name,
-        "source_id": rt.source_id,
-        "model_id": rt.model_id if rt.HasField("model_id") else None,
-        "dimensions": rt.dimensions,
-        "row_count": rt.row_count,
-        "status": rt.status,
-        "key_column": rt.key_column or None,
-        "kind": _RESULT_TABLE_KIND_NAME.get(rt.kind, "Unspecified"),
-        "derived_from": rt.derived_from if rt.HasField("derived_from") else None,
-    }
-
-
-def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any]:
-    """Project a wire `SourceDescriptor` into the embed wheel's descriptor dict.
-
-    The descriptor shape matches the embed wheel's `list_sources` /
-    `describe_source` entries — `source_id`, `source_type`, `status`, and
-    `result_tables` — so a caller reads the same keys regardless of transport.
-    """
-    return {
-        "source_id": d.source_id,
-        "source_type": _SOURCE_KIND_NAME.get(d.kind, "Unspecified"),
-        "status": d.status,
-        "result_tables": [_result_table_to_dict(rt) for rt in d.result_tables],
-    }
-
-
-def _source_description_to_dict(d: catalog_pb2.SourceDescription) -> Dict[str, Any]:
-    """Project a wire `SourceDescription` into the embed wheel's `describe_source`
-    dict: the descriptor's keys, as `list_sources` yields them, plus ``tables`` —
-    each ``{"schema", "table", "columns"}``, ``columns`` a `pyarrow.Schema` decoded
-    from its IPC framing — so a caller reads the same keys regardless of transport.
-    """
-    description = _source_descriptor_to_dict(d.source)
-    description["tables"] = [
-        {
-            "schema": t.schema,
-            "table": t.table,
-            "columns": pa.ipc.open_stream(t.columns).schema,
-        }
-        for t in d.tables
-    ]
-    return description
 
 
 def _present(message, field: str) -> Optional[str]:
@@ -1374,7 +1316,7 @@ class RemoteDatabase:
         dict without ``tables``, read from the registry alone.
         """
         resp = self._call(self._catalog.ListSources, catalog_pb2.ListSourcesRequest())
-        return [_source_descriptor_to_dict(d) for d in resp.sources]
+        return [source_descriptor_to_dict(d) for d in resp.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Describe one registered source by id, or ``None`` if not visible: the
@@ -1394,7 +1336,7 @@ class RemoteDatabase:
             if getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return None
             raise
-        return _source_description_to_dict(d)
+        return source_description_to_dict(d)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.

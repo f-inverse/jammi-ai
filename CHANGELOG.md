@@ -248,7 +248,10 @@ The dependency audit is green again on the live advisory database, and database 
   `jammi_ai` and `jammi_admin`; Python's dict gains `tables`, each `{"schema", "table",
   "columns"}` with `columns` a `pyarrow.Schema`, and a remote descriptor's `source_type` reads
   `file`, `postgres` or `mysql`, as the embedded one does, where it read `File`, `Postgres` or
-  `MySql`.
+  `MySql`. Both transports project the one serialized reply, so an embedded descriptor's
+  `result_tables` carry the remote keys (`table_name`, `source_id`, `model_id`, `dimensions`,
+  `row_count`, `status`, `key_column`, `kind`, `derived_from`), where they carried the whole
+  catalog row.
 - **A database source verifies its server against a CA the client hands over.** A remote client
   had no way to: a server whose certificate a private CA signed was reachable only unverified
   (`sslmode=preferred` skips verification) or with the CA added to the server's own trust store

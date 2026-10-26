@@ -1,8 +1,6 @@
 use arrow::array::RecordBatch;
-use jammi_db::source::SourceDescription;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
-use pyo3_arrow::{PySchema, PyTable};
+use pyo3_arrow::PyTable;
 use serde::Serialize;
 
 /// Convert `Vec<RecordBatch>` to a `pyarrow.Table` via zero-copy PyCapsule protocol.
@@ -31,28 +29,4 @@ pub fn serializable_to_pydict<T: Serialize>(py: Python<'_>, value: &T) -> PyResu
     let json_mod = py.import("json")?;
     let dict = json_mod.call_method1("loads", (json_str,))?;
     Ok(dict.unbind())
-}
-
-/// One source's description as the dict `describe_source` returns: the
-/// descriptor's keys, plus `tables` — each table the source serves as
-/// `{"schema": str, "table": str, "columns": pyarrow.Schema}`, in the
-/// source's order.
-pub fn source_description_to_pydict(
-    py: Python<'_>,
-    description: SourceDescription,
-) -> PyResult<Py<PyAny>> {
-    let dict = serializable_to_pydict(py, &description.descriptor)?;
-    let tables = PyList::empty(py);
-    for described in description.tables {
-        let entry = PyDict::new(py);
-        entry.set_item("schema", described.table.schema)?;
-        entry.set_item("table", described.table.table)?;
-        entry.set_item(
-            "columns",
-            PySchema::new(described.columns).into_pyarrow(py)?,
-        )?;
-        tables.append(entry)?;
-    }
-    dict.bind(py).set_item("tables", tables)?;
-    Ok(dict)
 }

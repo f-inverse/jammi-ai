@@ -2227,6 +2227,7 @@ def test_struct_projection_shapes_are_proto_anchored():
     """Each non-oneof projection's output key-set == its proto message's field
     set, minus a DECLARED drop-set, with DECLARED renames — read off the live
     descriptor, so a proto change breaks this until the projection tracks it."""
+    from jammi import _assembly as A
     from jammi import _database as D
     from jammi._generated.jammi.v1 import catalog_pb2, embedding_pb2, eval_pb2
 
@@ -2244,8 +2245,8 @@ def test_struct_projection_shapes_are_proto_anchored():
 
     # (projection, proto message, {output_key: proto_field} renames, {dropped fields}, fixture)
     specs = [
-        (D._result_table_to_dict, embedding_pb2.ResultTable, {}, {"task", "cache_outcome"}, embedding_pb2.ResultTable),
-        (D._source_descriptor_to_dict, catalog_pb2.SourceDescriptor, {"source_type": "kind"}, set(), catalog_pb2.SourceDescriptor),
+        (A.result_table_to_dict, embedding_pb2.ResultTable, {}, {"task", "cache_outcome"}, embedding_pb2.ResultTable),
+        (A.source_descriptor_to_dict, catalog_pb2.SourceDescriptor, {"source_type": "kind"}, set(), catalog_pb2.SourceDescriptor),
         (D._model_to_dict, catalog_pb2.Model, {}, set(), _model),
         (D._mutable_table_definition_to_dict, catalog_pb2.MutableTableDefinition, {}, {"user_metadata"}, _mutable),
         (D._aggregate_metrics_to_dict, eval_pb2.AggregateMetrics, {}, set(), eval_pb2.AggregateMetrics),
@@ -2272,6 +2273,16 @@ def test_struct_projection_shapes_are_proto_anchored():
             f"got {sorted(got)} != proto-anchored {sorted(expected)} "
             f"(proto fields {sorted(proto_fields)}, dropped {sorted(dropped)}, renames {renames})"
         )
+
+    # A description is its descriptor's projection plus `tables`, each table's
+    # keys the `SourceTableDescription` message's fields.
+    description = catalog_pb2.SourceDescription()
+    description.tables.add(columns=_ipc_schema_bytes())
+    got = A.source_description_to_dict(description)
+    assert set(got) == set(A.source_descriptor_to_dict(description.source)) | {"tables"}
+    assert set(got["tables"][0]) == {
+        f.name for f in catalog_pb2.SourceTableDescription.DESCRIPTOR.fields
+    }
 
     # The list projection: each edge dict reconciles with the `DerivesFromEdge`
     # message's fields, anchored the same way.

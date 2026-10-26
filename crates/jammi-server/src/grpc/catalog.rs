@@ -241,11 +241,7 @@ impl CatalogService for CatalogServer {
             .await
             .map_err(map_engine_error)?;
 
-        let sources = descriptors
-            .into_iter()
-            .map(pb::SourceDescriptor::from)
-            .collect();
-        Ok(Response::new(pb::ListSourcesResponse { sources }))
+        Ok(Response::new(pb::ListSourcesResponse::from(descriptors)))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

@@ -85,13 +85,15 @@ from ._assembly import (
     build_register_topic_request,
     build_search_request,
     recompute_report_to_dict,
+    source_description_to_dict,
+    source_descriptor_to_dict,
     build_refresh_embeddings_request,
     build_compact_embeddings_request,
     build_expire_versions_request,
     refresh_report_to_dict,
     expiry_report_to_dict,
 )
-from ._generated.jammi.v1 import embedding_pb2, pipeline_pb2
+from ._generated.jammi.v1 import catalog_pb2, embedding_pb2, pipeline_pb2
 
 
 class _TenantScope:
@@ -369,14 +371,22 @@ class EmbeddedBackend:
         )
 
     def list_sources(self) -> List[Dict[str, Any]]:
-        """A descriptor for every source registered to the current tenant."""
-        return self._native.list_sources()
+        """A descriptor for every source registered to the current tenant, the
+        dict the remote client returns for the same reply."""
+        reply = catalog_pb2.ListSourcesResponse()
+        reply.ParseFromString(self._native._list_sources_proto())
+        return [source_descriptor_to_dict(d) for d in reply.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Describe one registered source by id, or ``None`` if not visible: the
         `list_sources` entry plus ``tables``, every table the source serves as
         ``{"schema", "table", "columns"}`` with ``columns`` a `pyarrow.Schema`."""
-        return self._native.describe_source(source_id)
+        body = self._native._describe_source_proto(source_id)
+        if body is None:
+            return None
+        description = catalog_pb2.SourceDescription()
+        description.ParseFromString(body)
+        return source_description_to_dict(description)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.

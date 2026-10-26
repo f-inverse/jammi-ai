@@ -1,8 +1,10 @@
 //! A database source answers as the engine does: every query here runs over
-//! a Postgres table and over the same rows held in a Parquet file, and both
-//! answer the same — whatever of it federation sends Postgres and whatever
-//! it keeps in the engine. Each construct the Postgres allowlist admits is
-//! here, and so is each it keeps out because Postgres reads it otherwise.
+//! a database's table and over the same rows held in a Parquet file, and both
+//! answer the same — whatever of it federation sends the database and
+//! whatever it keeps in the engine. Each construct the Postgres allowlist
+//! admits is here, and so is each it keeps out because Postgres reads it
+//! otherwise; MySQL, which reads more of them otherwise, answers every one
+//! too.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -147,22 +149,67 @@ fn literal<T: ToString>(value: Option<T>, quote: bool) -> String {
     }
 }
 
-/// The date `days` after the epoch, as a Postgres literal.
+/// The date `days` after the epoch, as a SQL literal every database reads.
 fn date(days: Option<i32>) -> String {
-    days.map_or("NULL".into(), |d| format!("DATE '1970-01-01' + {d}"))
+    days.map_or("NULL".into(), |d| {
+        let date = chrono::NaiveDate::default() + chrono::Days::new(d as u64);
+        format!("DATE '{date}'")
+    })
 }
 
-/// The same rows in Postgres (`pg_*`) and in a file (`f_*`), and the session
-/// reading both, with `is_even` installed.
+/// A database a source reads, each under the feature that provides its
+/// server.
+#[derive(Clone, Copy)]
+enum Database {
+    #[cfg(feature = "live-postgres-tests")]
+    Postgres,
+    #[cfg(feature = "live-mysql-tests")]
+    MySql,
+}
+
+impl Database {
+    /// The URL of a fresh database holding `orders` with `values`, its rows
+    /// as SQL literals.
+    async fn holding(self, values: &str) -> String {
+        match self {
+            #[cfg(feature = "live-postgres-tests")]
+            Self::Postgres => {
+                // The directory only names the database for a reopen; the
+                // database itself lives on the server.
+                let dir = tempdir().unwrap();
+                jammi_test_utils::postgres_database_holding(
+                    dir.path(),
+                    &format!(
+                        "CREATE TABLE orders (id INTEGER NOT NULL, status TEXT, qty INTEGER, \
+                         ratio DOUBLE PRECISION, amount NUMERIC(10, 2), bought DATE, delivered DATE, \
+                         tags TEXT); INSERT INTO orders VALUES {values};"
+                    ),
+                )
+                .await
+            }
+            #[cfg(feature = "live-mysql-tests")]
+            Self::MySql => {
+                crate::common::mysql::mysql_database_holding(&format!(
+                    "CREATE TABLE orders (id INT NOT NULL, status TEXT, qty INT, ratio DOUBLE, \
+                     amount DECIMAL(10, 2), bought DATE, delivered DATE, tags TEXT); \
+                     INSERT INTO orders VALUES {values};"
+                ))
+                .await
+            }
+        }
+    }
+}
+
+/// The same rows in a database (`db_*`) and in a file (`f_*`), and the
+/// session reading both, with `is_even` installed.
 struct Sources {
     session: JammiSession,
-    postgres: String,
+    database: String,
     file: String,
-    _dirs: [TempDir; 3],
+    _dirs: [TempDir; 2],
 }
 
-async fn sources() -> Sources {
-    let pg_dir = tempdir().unwrap();
+async fn sources(database: Database) -> Sources {
     let values = ROWS
         .iter()
         .map(|r| {
@@ -180,15 +227,7 @@ async fn sources() -> Sources {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let url = jammi_test_utils::postgres_database_holding(
-        pg_dir.path(),
-        &format!(
-            "CREATE TABLE orders (id INTEGER NOT NULL, status TEXT, qty INTEGER, \
-             ratio DOUBLE PRECISION, amount NUMERIC(10, 2), bought DATE, delivered DATE, \
-             tags TEXT); INSERT INTO orders VALUES {values};"
-        ),
-    )
-    .await;
+    let url = database.holding(&values).await;
 
     let files = tempdir().unwrap();
     let path = files.path().join("orders.parquet");
@@ -198,10 +237,10 @@ async fn sources() -> Sources {
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
     session.install_functions([QueryFunction::Scalar(is_even())]);
     let suffix = unique_suffix();
-    let (postgres, file) = (format!("pg_{suffix}"), format!("f_{suffix}"));
+    let (database, file) = (format!("db_{suffix}"), format!("f_{suffix}"));
     let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
     session
-        .add_source(&postgres, definition.source_type, definition.connection)
+        .add_source(&database, definition.source_type, definition.connection)
         .await
         .unwrap();
     session
@@ -218,9 +257,9 @@ async fn sources() -> Sources {
         .unwrap();
     Sources {
         session,
-        postgres,
+        database,
         file,
-        _dirs: [pg_dir, files, dir],
+        _dirs: [files, dir],
     }
 }
 
@@ -249,7 +288,7 @@ fn is_even() -> datafusion::logical_expr::ScalarUDF {
 }
 
 impl Sources {
-    /// `sql` with `{T}` naming the table, run over Postgres and over the
+    /// `sql` with `{T}` naming the table, run over the database and over the
     /// file, each rendered as a table.
     async fn both(&self, sql: &str) -> (String, String) {
         let run = |source: &str| {
@@ -263,15 +302,21 @@ impl Sources {
                 pretty_format_batches(&batches).unwrap().to_string()
             }
         };
-        (run(&self.postgres).await, run(&self.file).await)
+        (run(&self.database).await, run(&self.file).await)
+    }
+
+    /// Every query of `constructs` answers over the database as over the
+    /// file.
+    async fn answer_alike(&self, constructs: &[&str]) {
+        for sql in constructs {
+            let (database, engine) = self.both(sql).await;
+            assert_eq!(database, engine, "{sql}");
+        }
     }
 }
 
-/// Every construct the Postgres allowlist admits answers as the engine does.
-#[tokio::test]
-async fn what_postgres_is_sent_it_answers_as_the_engine_does() {
-    let sources = sources().await;
-    for sql in [
+/// Every construct the Postgres allowlist admits.
+const POSTGRES_RUNS: &[&str] = &[
         // String equality is byte equality: 'SP' is not 'sp'.
         "SELECT id FROM {T} WHERE status = 'SP' ORDER BY id",
         "SELECT id FROM {T} WHERE status <> 'SP' ORDER BY id",
@@ -305,34 +350,55 @@ async fn what_postgres_is_sent_it_answers_as_the_engine_does() {
         "SELECT id FROM {T} WHERE bought BETWEEN DATE '2018-01-02' AND DATE '2018-01-05' ORDER BY id",
         "SELECT id FROM {T} WHERE delivered > bought AND qty >= 0 ORDER BY id",
         "SELECT id, CAST(qty AS BIGINT) * 3 - id AS e FROM {T} ORDER BY id",
-    ] {
-        let (postgres, engine) = sources.both(sql).await;
-        assert_eq!(postgres, engine, "{sql}");
-    }
-}
+];
 
 /// What Postgres reads otherwise — strings ordered by collation, a decimal
-/// `AVG`, DataFusion's own functions and the session's — stays in the
-/// engine, and the answer is the engine's.
+/// `AVG`, DataFusion's own functions and the session's — so it stays in the
+/// engine.
+const POSTGRES_READS_OTHERWISE: &[&str] = &[
+    "SELECT id FROM {T} WHERE status < 'm' ORDER BY id",
+    "SELECT id, status FROM {T} ORDER BY status, id",
+    "SELECT MIN(status) AS lo, MAX(status) AS hi FROM {T}",
+    "SELECT AVG(amount) AS a FROM {T}",
+    "SELECT approx_distinct(status) AS n FROM {T}",
+    "SELECT id FROM {T} WHERE is_even(id) ORDER BY id",
+    "SELECT id FROM {T} WHERE is_even(id) AND status = 'SP' ORDER BY id",
+    "SELECT date_trunc('month', bought) AS m, COUNT(*) AS n FROM {T} GROUP BY 1 ORDER BY 1",
+    "SELECT delivered - bought AS d FROM {T} ORDER BY id",
+    "SELECT amount / 3 AS third FROM {T} ORDER BY id",
+    "SELECT upper(status) AS u FROM {T} ORDER BY id",
+    "SELECT unnest(string_to_array(tags, ',')) AS item, COUNT(*) AS n FROM {T} \
+         GROUP BY unnest(string_to_array(tags, ',')) ORDER BY 1",
+];
+
+/// Every construct the Postgres allowlist admits answers as the engine does.
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test]
+async fn what_postgres_is_sent_it_answers_as_the_engine_does() {
+    sources(Database::Postgres)
+        .await
+        .answer_alike(POSTGRES_RUNS)
+        .await;
+}
+
+/// What Postgres reads otherwise stays in the engine, and the answer is the
+/// engine's.
+#[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn what_postgres_reads_otherwise_answers_as_the_engine_does() {
-    let sources = sources().await;
-    for sql in [
-        "SELECT id FROM {T} WHERE status < 'm' ORDER BY id",
-        "SELECT id, status FROM {T} ORDER BY status, id",
-        "SELECT MIN(status) AS lo, MAX(status) AS hi FROM {T}",
-        "SELECT AVG(amount) AS a FROM {T}",
-        "SELECT approx_distinct(status) AS n FROM {T}",
-        "SELECT id FROM {T} WHERE is_even(id) ORDER BY id",
-        "SELECT id FROM {T} WHERE is_even(id) AND status = 'SP' ORDER BY id",
-        "SELECT date_trunc('month', bought) AS m, COUNT(*) AS n FROM {T} GROUP BY 1 ORDER BY 1",
-        "SELECT delivered - bought AS d FROM {T} ORDER BY id",
-        "SELECT amount / 3 AS third FROM {T} ORDER BY id",
-        "SELECT upper(status) AS u FROM {T} ORDER BY id",
-        "SELECT unnest(string_to_array(tags, ',')) AS item, COUNT(*) AS n FROM {T} \
-         GROUP BY unnest(string_to_array(tags, ',')) ORDER BY 1",
-    ] {
-        let (postgres, engine) = sources.both(sql).await;
-        assert_eq!(postgres, engine, "{sql}");
-    }
+    sources(Database::Postgres)
+        .await
+        .answer_alike(POSTGRES_READS_OTHERWISE)
+        .await;
+}
+
+/// MySQL reads strings case-insensitively, `||` as OR, a date difference as
+/// a number and sorts NULLs first, so its allowlist keeps most of these in
+/// the engine; every one answers as the engine does.
+#[cfg(feature = "live-mysql-tests")]
+#[tokio::test]
+async fn a_mysql_source_answers_every_construct_as_the_engine_does() {
+    let sources = sources(Database::MySql).await;
+    sources.answer_alike(POSTGRES_RUNS).await;
+    sources.answer_alike(POSTGRES_READS_OTHERWISE).await;
 }

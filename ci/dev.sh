@@ -7,6 +7,7 @@
 #   ci/dev.sh cargo clippy --workspace --all-targets
 #   ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it
 #   ci/dev.sh --with pg,s3 cargo test -p jammi-ai --features live-distributed-tests --test distributed
+#   ci/dev.sh --with mysql cargo nextest run -p jammi-db --features live-mysql-tests -E 'test(/mysql/)'
 #   ci/dev.sh --scratch rebase cargo test --workspace     # a target volume that dies with the command
 #   ci/dev.sh --gc                                        # remove what earlier runs left behind
 #   ci/dev.sh --build-image cargo test -p jammi-db        # after a change to the CI image's inputs
@@ -16,14 +17,14 @@
 #
 # A backend `--with` provides is the one the workflows declare, reachable
 # under the same host name and passed through the same variables, and it
-# belongs to THIS run alone: Postgres is a sidecar on the run's own network,
-# removed when the run exits; the S3-class store runs inside the run's
+# belongs to THIS run alone: Postgres and MySQL are sidecars on the run's own
+# network, removed when the run exits; the S3-class store runs inside the run's
 # container from the pinned binary `ci/scripts/s3_test_store.sh` defines (the
 # same definition the distributed lane and a GPU pod use) — two runs never share
 # a catalog or a bucket, and nothing a run starts outlives it.
 #
-#   --with pg[,s3]         the backends a live lane needs (Postgres 16; the
-#                          S3-class store holding the lane's bucket)
+#   --with pg[,mysql][,s3] the backends a live lane needs (Postgres 16; MySQL
+#                          8.4; the S3-class store holding the lane's bucket)
 #   --scratch NAME         build into the volume jammi-dev-target-NAME instead
 #                          of the shared one, and remove it on exit
 #   --build-image          build this tree's CPU CI image for the host's arch
@@ -55,8 +56,9 @@ min_free_gib="${JAMMI_DEV_MIN_FREE_GIB:-20}"
 # keeps exactly these.
 kept_volumes=(jammi-dev-target jammi-dev-cargo-registry jammi-dev-cargo-git jammi-dev-sccache)
 
-# The sidecar the workflows declare, by the image the workflows pin.
+# The sidecars the workflows declare, by the images the workflows pin.
 pg_image="$(sed -n 's/^postgres=//p' <<<"$refs")"
+mysql_image="$(sed -n 's/^mysql=//p' <<<"$refs")"
 
 with=()
 scratch=""
@@ -183,13 +185,21 @@ for service in "${with[@]}"; do
       until docker exec "$run-postgres" pg_isready -U jammi -d jammi_test >/dev/null 2>&1; do sleep 1; done
       args+=(-e JAMMI_TEST_PG_URL=postgres://jammi:jammi@postgres:5432/jammi_test)
       ;;
+    mysql)
+      docker run -d --name "$run-mysql" --network "$run" --network-alias mysql \
+        -e MYSQL_ROOT_PASSWORD=jammi -e MYSQL_DATABASE=jammi_test "$mysql_image" >/dev/null
+      # The image initializes on a server it then restarts; the TCP listener
+      # answers only once the final server is up.
+      until docker exec "$run-mysql" mysqladmin ping -h 127.0.0.1 -pjammi --silent >/dev/null 2>&1; do sleep 1; done
+      args+=(-e JAMMI_TEST_MYSQL_URL=mysql://root:jammi@mysql:3306/jammi_test)
+      ;;
     s3)
       # Started inside the run's container (below), so the harness and the
       # processes it spawns reach it on localhost exactly as the workflow's
       # job does; the binary is cached in the target volume.
       store=1
       ;;
-    *) echo "ci/dev.sh: unknown backend '$service' (pg, s3)" >&2; exit 64 ;;
+    *) echo "ci/dev.sh: unknown backend '$service' (pg, mysql, s3)" >&2; exit 64 ;;
   esac
 done
 

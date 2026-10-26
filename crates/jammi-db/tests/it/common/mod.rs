@@ -1,5 +1,8 @@
 pub use jammi_test_utils::*;
 
+#[cfg(feature = "live-mysql-tests")]
+pub mod mysql;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

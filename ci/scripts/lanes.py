@@ -61,6 +61,9 @@ ARTIFACT_RUN_ENV = "JAMMI_ARTIFACT_RUN"
 # The test-backend credentials every lane that provisions Postgres shares.
 PG_USER, PG_PASSWORD, PG_DB = "jammi", "jammi", "jammi_test"
 PG_URL = f"postgres://{PG_USER}:{PG_PASSWORD}@postgres:5432/{PG_DB}"
+# The MySQL test server's: its root account creates a database per test.
+MYSQL_PASSWORD, MYSQL_DB = "jammi", "jammi_test"
+MYSQL_URL = f"mysql://root:{MYSQL_PASSWORD}@mysql:3306/{MYSQL_DB}"
 
 # What a lane may need of its host beyond the image: the permission it widens,
 # or the provisioning it renders. A secret enters a job only through a need.
@@ -72,7 +75,7 @@ PERMISSION_NEEDS = {
     "pages": {"pages": "write", "id-token": "write"},
     "actions-read": {"actions": "read"},
 }
-PROVISION_NEEDS = ("postgres", "s3", "cutlass", "nccl", "kubeconform", "full-history", "hub-token", "runpod", "audit-key", "python", "maturin", "node")
+PROVISION_NEEDS = ("postgres", "mysql", "s3", "cutlass", "nccl", "kubeconform", "full-history", "hub-token", "runpod", "audit-key", "python", "maturin", "node")
 NEEDS = (*PERMISSION_NEEDS, *PROVISION_NEEDS)
 # Step text that publishes: allowed only in a lane that declares what it promotes.
 PUBLISH_PRIMITIVES = (
@@ -773,20 +776,30 @@ def render_job(table: Table, wf: Workflow, lane: Lane, refs: dict[str, str], has
         job["timeout-minutes"] = lane.timeout
     if lane.legs:
         job["strategy"] = {"fail-fast": False, "matrix": {"include": [_leg(lane, leg, refs, mixed, "container" in job, len(hosts & set(BARE_HOSTS)) not in (0, len(hosts))) for leg in lane.legs]}}
+    services = {}
     if "postgres" in lane.needs:
-        job["services"] = {
-            "postgres": {
-                "image": refs["postgres"],
-                "env": {"POSTGRES_USER": PG_USER, "POSTGRES_PASSWORD": PG_PASSWORD, "POSTGRES_DB": PG_DB},
-                "options": f'--health-cmd "pg_isready -U {PG_USER} -d {PG_DB}" --health-interval 5s --health-timeout 5s --health-retries 12',
-                "ports": ["5432:5432"],
-            }
+        services["postgres"] = {
+            "image": refs["postgres"],
+            "env": {"POSTGRES_USER": PG_USER, "POSTGRES_PASSWORD": PG_PASSWORD, "POSTGRES_DB": PG_DB},
+            "options": f'--health-cmd "pg_isready -U {PG_USER} -d {PG_DB}" --health-interval 5s --health-timeout 5s --health-retries 12',
+            "ports": ["5432:5432"],
         }
+    if "mysql" in lane.needs:
+        services["mysql"] = {
+            "image": refs["mysql"],
+            "env": {"MYSQL_ROOT_PASSWORD": MYSQL_PASSWORD, "MYSQL_DATABASE": MYSQL_DB},
+            "options": f'--health-cmd "mysqladmin ping -h 127.0.0.1 -p{MYSQL_PASSWORD} --silent" --health-interval 5s --health-timeout 5s --health-retries 24',
+            "ports": ["3306:3306"],
+        }
+    if services:
+        job["services"] = services
     env: dict = {}
     if lane.rust:
         env.update({"CARGO_TERM_COLOR": "always", "RUST_BACKTRACE": "1"})
     if "postgres" in lane.needs:
         env["JAMMI_TEST_PG_URL"] = PG_URL
+    if "mysql" in lane.needs:
+        env["JAMMI_TEST_MYSQL_URL"] = MYSQL_URL
     if "hub-token" in lane.needs:
         env["HF_TOKEN"] = "${{ secrets.HF_TOKEN }}"
     if "runpod" in lane.needs:
@@ -1137,6 +1150,9 @@ def run_lane(table: Table, lane_id: str, root: Path = REPO_ROOT) -> int:
     if "postgres" in lane.needs and "JAMMI_TEST_PG_URL" not in env:
         print("lanes: this lane needs Postgres: run it through `ci/dev.sh --with pg`", file=sys.stderr)
         return 2
+    if "mysql" in lane.needs and "JAMMI_TEST_MYSQL_URL" not in env:
+        print("lanes: this lane needs MySQL: run it through `ci/dev.sh --with mysql`", file=sys.stderr)
+        return 2
     for step in lane.steps:
         if step.kind != "run":
             print(f"lanes: skipping a `{step.kind}` step ({step.raw.get(step.kind)}); only `run` steps run here", file=sys.stderr)
@@ -1217,7 +1233,7 @@ def self_test() -> int:
     expect("an unpinned action", base.replace("checkout@0000000000000000000000000000000000000000 # v4", "checkout@v4"), "40-hex sha")
 
     table = parse(base + '\n[lane.c]\nwhy = "W."\nhost = "ubuntu"\nconsumes = ["a"]\nsteps = [{download = "a", path = "in"}, {run = "ls"}]\n[lane.pub]\nwhy = "W."\nworkflow = "rel"\nhost = "ubuntu"\nwhen = ["tag:v"]\npublishes = "release"\nconsumes = ["a"]\nsteps = [{run = "npm publish"}]\n')
-    fake_refs = {"cpu": "img:cpu", "cuda": "img:cuda", "postgres": "pg", "colab": "py"}
+    fake_refs = {"cpu": "img:cpu", "cuda": "img:cuda", "postgres": "pg", "mysql": "my", "colab": "py"}
     ci = render_workflow(table, table.workflows["ci"], fake_refs)
     if ci["jobs"]["c"]["needs"] != ["build"] or ci["jobs"]["c"]["env"][ARTIFACT_RUN_ENV] != "${{ github.run_id }}":
         failures.append(f"an in-workflow consumer needs its producer and its own run: {ci['jobs']['c']}")

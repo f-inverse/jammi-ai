@@ -399,7 +399,7 @@ name = "Clippy (gated: {surface})"
 rust = true
 legs = [
   { surface = "jammi-ai host resources", cmd = "cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings" },
-  { surface = "jammi-db host resources", cmd = "cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings" },
+  { surface = "jammi-db host resources", cmd = "cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,live-mysql-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings" },
   { surface = "jammi-server host resources", cmd = "cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings" },
   { surface = "jammi-bench fleet", cmd = "cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings" },
   { surface = "jammi-ai live hub", cmd = "cargo clippy -p jammi-ai --all-targets --features live-hub-tests -- -D warnings" },
@@ -487,6 +487,16 @@ rust = true
 needs = ["postgres"]
 steps = [
   { run = "cargo nextest run --profile postgres -p jammi-db -p jammi-server --features jammi-db/live-postgres-tests,jammi-server/live-postgres-tests -E '(package(jammi-db) & (kind(lib) | binary(it))) | (package(jammi-server) & binary(it))'" },
+]
+
+[lane.test-mysql]
+why = "The MySQL source's tests against a live MySQL: every construct a query can hold answers over MySQL as over the same rows in a file."
+name = "Test (MySQL)"
+when = ["pr"]
+rust = true
+needs = ["mysql"]
+steps = [
+  { run = "cargo nextest run --profile ci -p jammi-db --features live-mysql-tests -E 'package(jammi-db) & binary(it) & test(/mysql/)'" },
 ]
 
 [lane.test-live]

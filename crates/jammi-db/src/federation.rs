@@ -12,6 +12,10 @@
 //! too: [`FederatedScanPlanner`] plans each sub-plan behind a
 //! [`FederatedScanExec`], which takes no filter from the plan above it.
 
+//! The same holds for what a database source would read differently from the
+//! engine ([`remote`]): a node a source's SQL would carry with another
+//! meaning is not federated, and its inputs are federated on their own.
+
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -30,6 +34,9 @@ use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdo
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub(crate) mod remote;
 
 /// The names of the functions a session installed: what no remote can run.
 #[derive(Debug, Default)]
@@ -86,8 +93,20 @@ fn function_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Whether every database source `plan` scans runs it with the engine's
+/// meaning ([`remote::runs`]); a build without database sources has none.
+fn remotes_run(plan: &LogicalPlan) -> Result<bool> {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    return remote::runs(plan);
+    #[cfg(not(any(feature = "postgres", feature = "mysql")))]
+    {
+        let _ = plan;
+        Ok(true)
+    }
+}
+
 /// The federation optimizer rule, applied only to sub-plans that call no
-/// engine function.
+/// engine function and that their sources run with the engine's meaning.
 #[derive(Debug)]
 pub(crate) struct LocalFunctionFederation {
     functions: Arc<EngineFunctions>,
@@ -110,7 +129,7 @@ impl OptimizerRule for LocalFunctionFederation {
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_down(|node| {
-            if self.functions.called_by(&node)? {
+            if self.functions.called_by(&node)? || !remotes_run(&node)? {
                 return Ok(Transformed::no(node));
             }
             let federated = self.federation.rewrite(node, config)?;

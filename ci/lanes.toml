@@ -384,13 +384,12 @@ steps = [{ uses = "./.github/actions/build-image", with = { file = ".devcontaine
 # ============================================================================= ci: lint
 
 [lane.fmt-clippy]
-why = "The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles."
+why = "The workspace is formatted and lints clean; its database source drivers lint in the gated jammi-db leg, which compiles both."
 name = "Format & Lint"
 rust = true
 steps = [
   { name = "Check formatting", run = "cargo fmt --all -- --check" },
   { name = "Clippy", run = "cargo clippy --workspace --all-targets -- -D warnings" },
-  { name = "Clippy jammi-db postgres,mysql", run = "cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings" },
 ]
 
 [lane.clippy-gated]

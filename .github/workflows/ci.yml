@@ -195,7 +195,7 @@ jobs:
           context: .devcontainer
           cache-scope: devcontainer
 
-  # The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles.
+  # The workspace is formatted and lints clean; its database source drivers lint in the gated jammi-db leg, which compiles both.
   fmt-clippy:
     name: Format & Lint
     needs:
@@ -212,8 +212,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy jammi-db postgres,mysql
-        run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
 
   # Every test surface compiled only under a feature naming a host resource, or the live hub, lints clean (`check_lint_surface_closure.py` asserts every gated surface has a lane).
   clippy-gated:

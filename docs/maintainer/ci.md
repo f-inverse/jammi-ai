@@ -38,7 +38,7 @@ Fires on: pr, main.
 | `image-cuda-merge` | ubuntu | ghcr | pr, main | - | - | Promotes the CUDA image's leg to its one reference through the same merge every image goes through. |
 | `image-latest` | ubuntu | ghcr | main | - | - | Points the CI images' `:latest` alias, which the devcontainer builds FROM, at main's tree. |
 | `devcontainer-image` | ubuntu | - | pr | - | - | The devcontainer image builds; it is never published. |
-| `fmt-clippy` | cpu-image | - | pr, main | - | - | The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles. |
+| `fmt-clippy` | cpu-image | - | pr, main | - | - | The workspace is formatted and lints clean; its database source drivers lint in the gated jammi-db leg, which compiles both. |
 | `clippy-gated` | cpu-image x6 | - | pr, main | - | - | Every test surface compiled only under a feature naming a host resource, or the live hub, lints clean (`check_lint_surface_closure.py` asserts every gated surface has a lane). |
 | `clippy-cuda` | cuda-image x7 | cutlass, nccl | pr, main | - | - | Every CUDA-gated surface compiles and lints under nvcc with no device, one leg per feature graph; `flash-attn` stays unreachable from `cuda`, so jammi-ai is linted without it. |
 | `clippy-metal` | macos | - | pr, main | - | - | The Metal-gated surfaces lint clean; a hosted macOS runner cannot construct a Metal device, so they run on Apple-silicon hardware. |

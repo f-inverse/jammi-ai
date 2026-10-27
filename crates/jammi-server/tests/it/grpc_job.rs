@@ -96,6 +96,7 @@ async fn add_training_source(
             url: training_url(),
             format: FileFormat::Csv as i32,
             tenant_column: None,
+            ca_certificate: None,
         }),
     };
     match session {
@@ -207,8 +208,7 @@ async fn start_training_runs_to_completion_over_the_wire() {
     );
     assert!(resp.error.is_none(), "a completed job carries no error");
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// End to end: two `cache = USE` submissions of the same `FineTuneSpec` over
@@ -288,8 +288,7 @@ async fn a_repeated_fine_tune_cache_use_submission_reuses_over_the_wire() {
     );
     assert_ne!(first.model_id, second.model_id);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,8 +334,7 @@ async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
         resp.status
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `ListTrainingJobs` returns the lifecycle projection for every job visible to
@@ -447,8 +445,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
         "rows are ordered most recent first (created_at descending)"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -692,8 +689,7 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
         "the trained predictor is registered under tenant A"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// A `graph_fine_tune` job submitted under a tenant runs to completion over the
@@ -823,8 +819,7 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
         resp.error
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -850,8 +845,7 @@ async fn start_training_rejects_unspecified_method() {
         .expect_err("unspecified method must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -877,8 +871,7 @@ async fn start_training_rejects_missing_columns() {
         .expect_err("missing columns must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,8 +1108,7 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
         after.acceleration_report_json
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// NON-VACUITY CONTROL for the quiesced fixture above: under
@@ -1176,8 +1168,7 @@ async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
         terminal.acceleration_report_json
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// The `state` discriminant of an `acceleration_report_json` field, or `None`
@@ -1280,8 +1271,7 @@ async fn training_status_acceleration_report_determined_and_legacy_states_match_
         }
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Remote-visibility control: a REMOTE caller — reading nothing but
@@ -1387,8 +1377,7 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
         AccelerationState::Determined
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,8 +1515,7 @@ async fn worker_disabled_leaves_the_job_queued_and_pending_stable() {
         began.elapsed()
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// THE CONTROL for the oracle above: the same fixture, the same submission, the
@@ -1623,8 +1611,7 @@ async fn worker_enabled_lets_the_submitted_job_leave_queued() {
          [worker] enabled = false suppresses"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `ListWorkers` carries the claiming worker's device inventory over the
@@ -1693,8 +1680,7 @@ async fn list_workers_carries_the_claiming_workers_devices() {
          must agree for the same worker row"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Shutting a `[worker] enabled = false` server down must not await a worker that was
@@ -1737,7 +1723,10 @@ async fn worker_disabled_shutdown_does_not_await_a_worker_that_never_started() {
     // connection to wait on; what remains is the worker slot, which is `None`.
     drop(client);
 
-    let _ = server.shutdown.send(());
+    server
+        .shutdown
+        .send(())
+        .expect("the server runs until it is stopped");
     let joined = tokio::time::timeout(Duration::from_secs(30), server.handle)
         .await
         .expect(
@@ -1861,8 +1850,7 @@ async fn job_status_model_id_matches_the_attached_handle_before_completion() {
         "parity at the terminal state: the wire id and the embedded attach id agree"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Parity across the rest of the lifecycle: a `running` row and a `failed` row
@@ -1932,8 +1920,7 @@ async fn job_status_relays_the_stamped_model_id_for_running_and_failed_rows() {
         );
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Parity for a caller-chosen model id: a `context_predictor` job's id rides
@@ -2010,8 +1997,7 @@ async fn job_status_model_id_is_the_predictors_caller_chosen_id_before_completio
          derived from the job id"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // ─── acceptance: idempotency, WaitJob, cross-tenant NOT_FOUND ──────────────
@@ -2067,8 +2053,7 @@ async fn submit_job_with_the_same_idempotency_key_returns_the_same_handle() {
          the first key's"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `WaitJob` streams progress frames and ends the stream with exactly one
@@ -2126,8 +2111,7 @@ async fn wait_job_streams_to_exactly_one_terminal_frame() {
     );
     assert_eq!(terminal_status, Some(JobStatus::Completed));
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// A TRAINING kind honours a cancel request at its own checkpoint
@@ -2228,8 +2212,7 @@ async fn training_job_cancel_reports_cancelled_with_the_cancel_message_over_the_
         terminal.error
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `JobStatus` for a job submitted under tenant A, read back under tenant B's
@@ -2300,6 +2283,5 @@ async fn job_status_across_tenants_is_not_found_not_permission_denied() {
         .into_inner();
     assert_ne!(own.status(), WireJobStatus::Unspecified);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

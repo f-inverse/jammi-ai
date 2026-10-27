@@ -61,17 +61,10 @@ fn env_lock() -> &'static Mutex<()> {
 struct Fixture {
     addr: SocketAddr,
     engine: Arc<InferenceSession>,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Dropped with the fixture, which stops its server ([`super::common::grpc::stopped`]).
+    _shutdown: oneshot::Sender<()>,
     _dir: TempDir,
     _handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-    }
 }
 
 async fn start_fixture() -> Fixture {
@@ -91,7 +84,6 @@ async fn start_fixture() -> Fixture {
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: Some(trigger),
         engine: Some(session),
@@ -106,7 +98,7 @@ async fn start_fixture() -> Fixture {
     Fixture {
         addr,
         engine,
-        shutdown: Some(shutdown_tx),
+        _shutdown: shutdown_tx,
         _dir: dir,
         _handle: handle,
     }
@@ -151,7 +143,6 @@ async fn create_then_read_then_drop_mutable_table() {
                 primary_key: vec!["sku".into()],
                 indexes: vec![],
                 order_column: "seq".into(),
-                chunk_size: 0,
                 user_metadata: String::new(),
             }),
         })
@@ -204,7 +195,6 @@ async fn create_mutable_table_rejects_primary_key_not_in_schema() {
                 primary_key: vec!["does_not_exist".into()],
                 indexes: vec![],
                 order_column: String::new(),
-                chunk_size: 0,
                 user_metadata: String::new(),
             }),
         })

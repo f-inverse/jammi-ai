@@ -12,10 +12,9 @@ use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
-use datafusion_federation::FederatedPlanner;
 
 use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
@@ -24,11 +23,12 @@ use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
-use crate::federation::{EngineFunctions, LocalFunctionFederation};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
-use crate::source::{SourceConnection, SourceDefinition, SourceType};
+use crate::source::{
+    SourceConnection, SourceDefinition, SourceDescription, SourceTable, SourceType,
+};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::rewrite::RowRewritePlanner;
@@ -36,7 +36,9 @@ use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::store::statement::{MaterializationPlanner, StatementClass};
 use crate::tenant::{TenantContext, TenantId};
-use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
+use crate::tenant_scope::{
+    SourceTenantColumns, TenantBinding, TenantConfig, TenantScopeAnalyzerRule,
+};
 use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, TriggerBroker};
 
 /// Primary entry point for the Jammi query engine.
@@ -77,10 +79,6 @@ pub struct JammiSession {
     /// [`JammiSession::with_signing_key_store`], so the sign path routes through
     /// a caller-chosen store.
     signing_key_store: Arc<dyn SigningKeyStore>,
-    /// The functions [`JammiSession::install_functions`] installed, shared
-    /// with the federation rule so no sub-plan calling one is sent to a
-    /// remote source.
-    engine_functions: Arc<EngineFunctions>,
 }
 
 impl JammiSession {
@@ -233,27 +231,16 @@ impl JammiSession {
         let base_ctx = SessionContext::new_with_config(session_config);
         let base_state = base_ctx.state();
 
-        let mut rules = base_state.optimizer().rules.clone();
-        let insert_pos = rules
-            .iter()
-            .position(|r| r.name() == "scalar_subquery_to_join")
-            .map(|pos| pos + 1)
-            .unwrap_or(rules.len());
-        let engine_functions = Arc::new(EngineFunctions::default());
-        rules.insert(
-            insert_pos,
-            Arc::new(LocalFunctionFederation::new(Arc::clone(&engine_functions))),
-        );
+        let rules = optimizer_rules(base_state.optimizer().rules.clone());
 
-        // Tenant-scope analyzer rule injected before existing analyzer rules
-        // so the predicate is applied before federation, projection pruning,
-        // etc. Shares the binding with the catalog and the mutable-table
-        // registry so every read/write surface observes the same value.
+        // The tenant-scope analyzer rule, applied before federation,
+        // projection pruning and the rest. It reads each query's scope from
+        // the query's own configuration ([`TenantConfig`]), which the
+        // session's query context sets as the query enters.
         let source_tenant_columns = Arc::new(SourceTenantColumns::new());
-        let analyzer_rule = Arc::new(TenantScopeAnalyzerRule::new(
-            tenant_binding.clone(),
-            Arc::clone(&source_tenant_columns),
-        ));
+        let analyzer_rule = Arc::new(TenantScopeAnalyzerRule::new(Arc::clone(
+            &source_tenant_columns,
+        )));
 
         let mut analyzer_rules = base_state.analyzer().rules.clone();
         analyzer_rules.push(analyzer_rule);
@@ -329,7 +316,7 @@ impl JammiSession {
         ));
 
         let session = Self {
-            ctx: QueryContext::from(ctx),
+            ctx: QueryContext::new(ctx, tenant_binding.clone()),
             catalog,
             config,
             tenant: tenant_binding,
@@ -342,7 +329,6 @@ impl JammiSession {
             publisher,
             subscriber,
             signing_key_store,
-            engine_functions,
         };
         session.preload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -361,66 +347,52 @@ impl JammiSession {
     /// NULL`. Writes that target a different tenant are rejected by the
     /// write-side guard in [`crate::store::mutable::sink::MutableTableSink`].
     ///
-    /// This is the **sticky** binding form: it mutates session-shared state
-    /// and stays in effect until [`Self::unbind_tenant`] or another bind
-    /// call replaces it. For concurrent multi-tenant request handlers on
-    /// the same session, prefer [`Self::with_tenant_scoped`].
+    /// The session's own tenant: what every call it makes enters with until
+    /// [`Self::unbind_tenant`] or another bind replaces it. A session shared
+    /// between requests binds none; each request scopes itself with
+    /// [`Self::with_tenant_scoped`] or [`Self::with_request_scope`].
     pub fn with_tenant(self, t: TenantId) -> Self {
-        self.tenant.set_shared(TenantContext::Scoped(t));
+        self.tenant.bind(TenantContext::Scoped(t));
         self
     }
 
-    /// Return the tenant scope effective on this session for the current
-    /// task: the task-local override installed by [`Self::with_tenant_scoped`]
-    /// when called from inside such a closure, otherwise the sticky shared
-    /// value set by [`Self::with_tenant`] / [`Self::bind_tenant`].
+    /// The tenant a call entering now runs under: the scope installed by
+    /// [`Self::with_tenant_scoped`] / [`Self::with_request_scope`] when called
+    /// from inside one, otherwise the session's bound tenant
+    /// ([`Self::with_tenant`] / [`Self::bind_tenant`]).
     pub fn tenant(&self) -> Option<TenantId> {
         self.tenant.current_tenant()
     }
 
-    /// Shared handle to the underlying tenant binding. Used by server-side
-    /// composition (Flight SQL + gRPC) to plumb the per-session tenant value
-    /// from a `TenantBoundProvider` / interceptor (in the `jammi-server`
-    /// crate) into the engine without re-creating the binding for every
-    /// request.
+    /// The session's tenant binding: what a model load captures when a plan
+    /// is built, to re-enter around the load on the runner's own task.
     pub fn tenant_binding_arc(&self) -> crate::tenant_scope::TenantBinding {
         self.tenant.clone()
     }
 
-    /// Mutate the sticky bound tenant in place. Equivalent to
-    /// [`Self::with_tenant`] but does not consume `self` — needed for callers
-    /// that hold the session behind a shared reference (`Arc<JammiSession>`
-    /// in PyO3 / CLI wrappers, the per-request gRPC handler reading
-    /// `SessionTenant` from the request interceptor).
-    ///
-    /// Like [`Self::with_tenant`], this writes session-shared state and is
-    /// the wrong primitive for concurrent multi-tenant request handlers on
-    /// one shared session — see [`Self::with_tenant_scoped`].
+    /// Bind the session's own tenant in place, as [`Self::with_tenant`]
+    /// does: one embedded connection's tenant (the PyO3 and CLI wrappers
+    /// hold the session behind a shared reference). A query already planned
+    /// keeps the scope it was planned under.
     pub fn bind_tenant(&self, t: TenantId) {
-        self.tenant.set_shared(TenantContext::Scoped(t));
+        self.tenant.bind(TenantContext::Scoped(t));
     }
 
-    /// Clear the sticky bound tenant.
+    /// Clear the session's own tenant: its calls enter global.
     pub fn unbind_tenant(&self) {
-        self.tenant.set_shared(TenantContext::Unscoped);
+        self.tenant.bind(TenantContext::Unscoped);
     }
 
     /// Run `f` with `tenant` bound for the duration of the closure's future.
     ///
     /// The binding lives in a Tokio task-local installed for the executing
     /// task; concurrent invocations from different tasks each see their own
-    /// `tenant` with no shared-state mutation between them. Reads inside the
-    /// closure — analyzer-rule predicate injection, catalog
-    /// `tenant_id`-aware queries, mutable-table sink / provider — observe
-    /// `tenant` regardless of what any other concurrent caller has set on
-    /// the sticky shared binding.
+    /// `tenant`. Every call `f` makes into the engine enters under it: a
+    /// catalog verb reads it on this task, and a query reads it once, as it
+    /// is planned, into the [`TenantConfig`] the rest of the query reads on
+    /// whichever task runs it.
     ///
-    /// Use this from concurrent gRPC handlers that share one
-    /// `Arc<JammiSession>` across requests. The sticky
-    /// [`Self::bind_tenant`] / [`Self::with_tenant`] surface remains for
-    /// single-flight callers (CLI, single-tenant embedding), but does not
-    /// fix the race when two handlers from different tenants overlap on a
-    /// shared session.
+    /// This is how a session shared between requests scopes each one.
     ///
     /// # Example
     ///
@@ -437,30 +409,30 @@ impl JammiSession {
     ///         scope.sql("SELECT COUNT(*) FROM mutable.public.widgets").await
     ///     })
     ///     .await?;
-    /// # let _ = rows;
+    /// println!("{} batches", rows.len());
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// # Implementation note
-    ///
-    /// This is **Option β** from the design: rather than threading an
-    /// explicit `tenant` argument through every internal call (catalog,
-    /// mutable-table registry, analyzer rule), the binding's read path
-    /// consults a [`tokio::task_local`] override that
-    /// [`crate::tenant_scope::TenantBinding::scope`] installs for the
-    /// duration of `f`. The shared `Arc<RwLock<TenantContext>>` continues
-    /// to serve the sticky-binding path; the task-local shadows it for
-    /// concurrent scoped callers.
     pub async fn with_tenant_scoped<'a, F, Fut, T>(&'a self, tenant: TenantId, f: F) -> T
     where
         F: FnOnce(TenantScope<'a>) -> Fut,
         Fut: std::future::Future<Output = T> + 'a,
     {
         let scope = TenantScope { session: self };
-        self.tenant
-            .scope(TenantContext::Scoped(tenant), f(scope))
-            .await
+        TenantBinding::within(TenantContext::Scoped(tenant), f(scope)).await
+    }
+
+    /// Run `f` under one request's scope for the duration of the closure's
+    /// future: `tenant`'s, or global when the request names none — its calls
+    /// then read and write only rows that belong to no tenant, whatever
+    /// tenant the session itself is bound to. How a server scopes each
+    /// request.
+    pub async fn with_request_scope<F, Fut, T>(&self, tenant: Option<TenantId>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        TenantBinding::within(TenantContext::from_option(tenant), f()).await
     }
 
     /// Run `f` with the tenant analyzer rule disabled for the duration of
@@ -504,10 +476,10 @@ impl JammiSession {
     /// from the row.
     async fn preload_sources(&self) -> Result<()> {
         for record in self.catalog.list_all_sources().await? {
-            let source_id = record.source_id.clone();
+            let (source_id, owner) = (record.source_id.clone(), record.owner);
             if let Err(e) = self
                 .sources
-                .adopt(&source_id, record.into_definition())
+                .adopt(&source_id, record.into_definition(), owner)
                 .await
             {
                 tracing::warn!(source_id = %source_id, "Failed to build source at startup: {e}");
@@ -555,7 +527,7 @@ impl JammiSession {
                     continue;
                 };
                 return Err(JammiError::Schema {
-                    table: format!("{source_id}.public.{table}"),
+                    table: table.to_string(),
                     column: column.clone(),
                     expected: "the one tenant column of every table of the source".into(),
                     actual: actual.into(),
@@ -588,17 +560,35 @@ impl JammiSession {
                 &definition.connection,
             )
             .await?;
-        self.sources.admit(source_id, definition, built.tables);
+        self.sources.admit(
+            source_id,
+            definition,
+            self.catalog.current_tenant(),
+            built.tables,
+        );
 
         Ok(())
     }
 
-    /// The table names a source serves, in discovery order — resolved
-    /// through the catalog's `sources` row like every SQL reference to the
-    /// source is, so a source registered on another replica resolves here
-    /// and a source removed there is [`JammiError::NotFound`] here.
-    pub async fn source_table_names(&self, source_id: &str) -> Result<Vec<String>> {
-        Ok(self.sources.resolve(source_id).await?.table_names())
+    /// Describe one registered source: its registry descriptor and every table
+    /// it serves with its columns, or `None` when the caller's scope sees no
+    /// source of that id. The tables are the source's providers, built when no
+    /// cache holds them — so a database source is reached, and an unreachable
+    /// one is the error that says so.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescription>> {
+        let Some(descriptor) = self.catalog.describe_source(source_id).await? else {
+            return Ok(None);
+        };
+        let tables = self.sources.resolve(source_id).await?.described();
+        Ok(Some(SourceDescription { descriptor, tables }))
+    }
+
+    /// The tables a source serves, in its order ([`SourceTable`]'s) —
+    /// resolved through the catalog's `sources` row like every SQL reference
+    /// to the source is, so a source registered on another replica resolves
+    /// here and a source removed there is [`JammiError::NotFound`] here.
+    pub async fn source_tables(&self, source_id: &str) -> Result<Vec<SourceTable>> {
+        Ok(self.sources.resolve(source_id).await?.tables())
     }
 
     /// Remove a source and all associated state: catalog entries, result tables,
@@ -981,14 +971,8 @@ impl JammiSession {
         let ctx = self.ctx.inner();
         for function in functions {
             match function {
-                QueryFunction::Scalar(udf) => {
-                    self.engine_functions.insert(udf.name(), udf.aliases());
-                    ctx.register_udf(udf);
-                }
-                QueryFunction::Aggregate(udaf) => {
-                    self.engine_functions.insert(udaf.name(), udaf.aliases());
-                    ctx.register_udaf(udaf);
-                }
+                QueryFunction::Scalar(udf) => ctx.register_udf(udf),
+                QueryFunction::Aggregate(udaf) => ctx.register_udaf(udaf),
                 QueryFunction::Table { name, function } => ctx.register_udtf(&name, function),
             }
         }
@@ -1081,20 +1065,49 @@ impl JammiSession {
 ///
 /// [`JammiSession::context`] is the shared session's view. A context a
 /// caller builds and owns for itself (a fixture, a benchmark corpus) is
-/// viewed through [`From<SessionContext>`]; its names are that caller's.
+/// viewed through [`From<SessionContext>`]; its names are that caller's, and
+/// it plans global.
+///
+/// Every frame, state and task context this view hands out plans under the
+/// tenant scope effective as it is asked for ([`TenantConfig::current`]),
+/// carried in its configuration: a query's scope is fixed where it enters,
+/// never read again from the task that happens to run it.
 #[derive(Clone)]
-pub struct QueryContext(SessionContext);
+pub struct QueryContext {
+    ctx: SessionContext,
+    tenant: TenantBinding,
+}
 
 impl From<SessionContext> for QueryContext {
     fn from(ctx: SessionContext) -> Self {
-        Self(ctx)
+        Self::new(ctx, TenantBinding::unscoped())
     }
 }
 
 impl QueryContext {
+    pub(crate) fn new(ctx: SessionContext, tenant: TenantBinding) -> Self {
+        Self { ctx, tenant }
+    }
+
     /// The context itself, for this crate's own binding verbs.
     pub(crate) fn inner(&self) -> &SessionContext {
-        &self.0
+        &self.ctx
+    }
+
+    /// The scope a query entering now plans under.
+    fn scope(&self) -> TenantConfig {
+        TenantConfig::current(&self.tenant)
+    }
+
+    /// `frame`, planning under `scope`.
+    fn scoped(scope: TenantConfig, frame: DataFrame) -> DataFrame {
+        let (state, plan) = frame.into_parts();
+        DataFrame::new(scope.scoping(state), plan)
+    }
+
+    /// A context over `state` that keeps this one's binding.
+    fn derived(&self, state: SessionState) -> QueryContext {
+        Self::new(SessionContext::new_with_state(state), self.tenant.clone())
     }
 
     /// Plan `sql` into a [`DataFrame`], the one statement entry: the
@@ -1104,21 +1117,29 @@ impl QueryContext {
     /// streamed; a statement DataFusion executes on its own (a `CREATE
     /// TABLE … AS`, a `SET`) has executed when this returns, as
     /// `SessionContext::sql` has it.
+    ///
+    /// A statement DataFusion executes on its own runs against this context
+    /// itself, so a `SET` persists for the session; the frame a query
+    /// returns plans under the caller's scope.
     pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
-        let class = StatementClass::plan(&self.0.state(), sql).await?;
-        self.0.execute_logical_plan(class.into_plan()).await
+        let scope = self.scope();
+        let class = StatementClass::plan(&scope.scoping(self.ctx.state()), sql).await?;
+        let frame = self.ctx.execute_logical_plan(class.into_plan()).await?;
+        Ok(Self::scoped(scope, frame))
     }
 
     /// A [`DataFrame`] scanning the table `table_ref` resolves to.
     pub async fn table(&self, table_ref: impl Into<TableReference>) -> DfResult<DataFrame> {
-        self.0.table(table_ref).await
+        let scope = self.scope();
+        Ok(Self::scoped(scope, self.ctx.table(table_ref).await?))
     }
 
     /// A [`DataFrame`] scanning `provider` directly, under no name — how a
     /// reader consumes a provider the store built for it (a pinned version's
     /// masked provider) without binding it into the session.
     pub fn read_table(&self, provider: Arc<dyn TableProvider>) -> DfResult<DataFrame> {
-        self.0.read_table(provider)
+        let scope = self.scope();
+        Ok(Self::scoped(scope, self.ctx.read_table(provider)?))
     }
 
     /// A snapshot of the session state: the planner's input (schema
@@ -1128,37 +1149,44 @@ impl QueryContext {
     /// type's doc): a holder binds nothing through it by convention, not
     /// by type.
     pub fn state(&self) -> SessionState {
-        self.0.state()
+        self.state_under(self.scope())
+    }
+
+    /// The session state planning under `scope`: a request whose scope was
+    /// resolved outside this session's binding — a Flight SQL request's,
+    /// read from its credential — plans with it.
+    pub fn state_under(&self, scope: TenantConfig) -> SessionState {
+        scope.scoping(self.ctx.state())
     }
 
     /// The [`TaskContext`] an [`ExecutionPlan`] executes under.
     pub fn task_ctx(&self) -> Arc<TaskContext> {
-        self.0.task_ctx()
+        Arc::new(TaskContext::from(&self.state()))
     }
 
     /// The runtime this session executes in: its memory pool and its
     /// object-store registry. A distributed executor produces this as its
     /// own runtime so every task it runs is bounded by the same pool.
     pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
-        self.0.runtime_env()
+        self.ctx.runtime_env()
     }
 
     /// The session's unique id, the key a distributed plan is submitted
     /// under.
     pub fn session_id(&self) -> String {
-        self.0.session_id()
+        self.ctx.session_id()
     }
 
     /// A copy of the session configuration — what a distributed role
     /// derives its own configuration from.
     pub fn copied_config(&self) -> SessionConfig {
-        self.0.copied_config()
+        self.ctx.copied_config()
     }
 
     /// The scalar function installed under `name` — how a plan codec resolves
     /// a function it carries by name only.
     pub fn udf(&self, name: &str) -> DfResult<Arc<ScalarUDF>> {
-        self.0.udf(name)
+        self.ctx.udf(name)
     }
 
     /// Derive a single-`target_partitions` view from this one's own state —
@@ -1197,7 +1225,7 @@ impl QueryContext {
         // in place touches nothing else.
         let mut state = self.state();
         state.config_mut().options_mut().execution.target_partitions = 1;
-        Self(SessionContext::new_with_state(state))
+        self.derived(state)
     }
 
     /// A context sharing this one's catalog, functions, tenant scope and
@@ -1249,7 +1277,7 @@ impl QueryContext {
             .execution
             .sort_spill_reservation_bytes
             .min(Self::OUT_OF_CORE_MERGE_BATCHES * Self::OUT_OF_CORE_BATCH_BYTES);
-        Self(SessionContext::new_with_state(state))
+        self.derived(state)
     }
 
     /// The byte size an [`Self::out_of_core`] batch aims at.
@@ -1292,14 +1320,48 @@ impl QueryPlanner for JammiQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        DefaultPhysicalPlanner::with_extension_planners(vec![
-            Arc::new(FederatedPlanner::new()),
-            Arc::new(MaterializationPlanner),
-            Arc::new(RowRewritePlanner),
-        ])
-        .create_physical_plan(logical_plan, session_state)
-        .await
+        DefaultPhysicalPlanner::with_extension_planners(extension_planners())
+            .create_physical_plan(logical_plan, session_state)
+            .await
     }
+}
+
+/// The session's extension planners: [`MaterializationPlanner`],
+/// [`RowRewritePlanner`], and, in a build that carries a database source,
+/// federation's ([`crate::federation::RemotePlanner`]).
+fn extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+    let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+        Arc::new(MaterializationPlanner),
+        Arc::new(RowRewritePlanner),
+    ];
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    let planners = std::iter::once(Arc::new(crate::federation::RemotePlanner::new())
+        as Arc<dyn ExtensionPlanner + Send + Sync>)
+    .chain(planners)
+    .collect();
+    planners
+}
+
+/// The session's optimizer rules: DataFusion's, with, right after
+/// `scalar_subquery_to_join`, the lateral `unnest`'s decorrelation
+/// ([`crate::lateral_unnest::LateralUnnest`]) and then, in a build that
+/// carries a database source, federation
+/// ([`crate::federation::RemoteFederation`]) — so the sub-plans federation
+/// hands a remote are decorrelated.
+fn optimizer_rules(
+    mut rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
+) -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
+    let after = rules
+        .iter()
+        .position(|r| r.name() == "scalar_subquery_to_join")
+        .map_or(rules.len(), |pos| pos + 1);
+    let ours: [Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>; _] = [
+        Arc::new(crate::lateral_unnest::LateralUnnest),
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        Arc::new(crate::federation::RemoteFederation::default()),
+    ];
+    rules.splice(after..after, ours);
+    rules
 }
 
 /// Resolve the signing-key store selected by `config.signing_key`:

@@ -637,7 +637,10 @@ async fn expired_compute_attempt_re_materializes_on_the_successor() {
     // `failed` under another owner) and the abandoned attempt errors out
     // without touching the successor's result.
     parked.release();
-    let _ = attempt1.await.unwrap();
+    attempt1
+        .await
+        .unwrap()
+        .expect_err("the abandoned attempt's promote misses, and it errors out");
     assert_eq!(
         session.catalog().get_job(&job_id).await.unwrap().status,
         JobStatus::Completed

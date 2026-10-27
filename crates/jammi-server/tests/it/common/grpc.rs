@@ -80,9 +80,7 @@ pub async fn spawn_bound_chain(
     let addr = bound.addr();
     let handle = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("grpc server");
     });
@@ -148,7 +146,33 @@ pub struct EngineServer {
     pub metrics: Arc<jammi_server::routes::health::MetricsRegistry>,
 }
 
+/// Resolves when a test asks its server to stop through `signal`, or drops
+/// the sender: either way, no one is left to keep the server up.
+pub async fn stopped(signal: oneshot::Receiver<()>) {
+    match signal.await {
+        Ok(()) | Err(_) => {}
+    }
+}
+
+/// Shut a test server down through `shutdown` and wait for its task to end.
+/// A server that stopped before it was asked to, or whose task panicked,
+/// fails the test.
+pub async fn stop<T>(
+    shutdown: oneshot::Sender<()>,
+    task: impl std::future::Future<Output = Result<T, tokio::task::JoinError>>,
+) {
+    shutdown
+        .send(())
+        .expect("the server runs until it is stopped");
+    task.await.expect("the server task ends cleanly");
+}
+
 impl EngineServer {
+    /// Shut the server down and wait for its task to end ([`stop`]).
+    pub async fn stop(self) {
+        stop(self.shutdown, self.handle).await;
+    }
+
     /// Start a training worker over the SAME engine session this server drives,
     /// returning the RAII guard that owns its loop (dropping the guard stops it).
     ///
@@ -346,7 +370,6 @@ pub fn chain_over_session(
     let chain = jammi_server::runtime::GrpcChain {
         addr,
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger,
         engine: Some(session),
@@ -416,9 +439,7 @@ pub async fn start_engine_server_worker_quiesced() -> EngineServer {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .with_graceful_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("axum serve");
     });
@@ -752,6 +773,13 @@ pub struct PeerEngineServer {
     pub gang_refusal_handle: Option<jammi_server::grpc::gang::GangRefusalHandle>,
 }
 
+impl PeerEngineServer {
+    /// Shut the server down and wait for its task to end ([`stop`]).
+    pub async fn stop(self) {
+        stop(self.shutdown, self.handle).await;
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 impl PeerEngineServer {
     /// Which `GangRefusalReason` the most recent `RunRank` call actually
@@ -798,9 +826,7 @@ pub async fn start_engine_server_from_config(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("server serve");
     });

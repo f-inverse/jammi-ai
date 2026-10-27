@@ -147,7 +147,7 @@ REQUIRED: dict[str, list[str]] = {
     "add_channel_columns": ["columns"],
     "list_channels": [],
     # mutable companion tables
-    "create_mutable_table": ["schema", "primary_key", "indexes", "order_column", "chunk_size"],
+    "create_mutable_table": ["schema", "primary_key", "indexes", "order_column"],
     "drop_mutable_table": ["if_exists"],
     "list_mutable_tables": [],
     # trigger stream / topics

@@ -100,8 +100,7 @@ async fn serve_only_advertises_core_and_rejects_eval_verb_as_unimplemented() {
         "an unmounted tier's verb is Unimplemented, not a misleading success"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Job submission is core: a serve-only deployment (no optional tiers) still
@@ -124,8 +123,7 @@ async fn serve_only_still_mounts_the_job_submission_verb() {
          every deployment, never an unmounted-service Unimplemented"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,8 +152,7 @@ async fn serve_plus_eval_advertises_eval_and_mounts_the_verb() {
          not an unmounted-service Unimplemented"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -170,6 +167,5 @@ async fn event_only_advertises_core_and_event() {
         "an event box advertises core + event"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

@@ -257,8 +257,8 @@ mod gauges {
 
     impl Served {
         async fn release_and_finish(self) {
-            let _ = self.drain_tx.send(true);
-            let _ = self.release_tx.send(true);
+            self.drain_tx.send_replace(true);
+            self.release_tx.send_replace(true);
             tokio::time::timeout(Duration::from_secs(60), self.task)
                 .await
                 .expect("the serve task ends")
@@ -495,7 +495,9 @@ mod gauges {
         let m = scrape(&served.health_addr).await;
         assert_eq!(sample(&m, "jammi_worker_jobs_in_flight"), Some(0.0), "{m}");
         park.release();
-        let _ = run.await.unwrap();
+        run.await
+            .unwrap()
+            .expect_err("the run names a model that does not exist, so released, it fails");
         served.release_and_finish().await;
     }
 }

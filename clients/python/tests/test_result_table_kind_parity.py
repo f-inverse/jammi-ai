@@ -1,6 +1,6 @@
 """The remote `kind` string equals the embedded one for EVERY served kind.
 
-`_result_table_to_dict` spells a result table's `kind` by looking the wire
+`result_table_to_dict` spells a result table's `kind` by looking the wire
 `ResultTableKind` value up in `_assembly._RESULT_TABLE_KIND_NAME`, falling back
 to ``"Unspecified"`` for a value it does not carry. The embedded engine spells
 the same column off its own `jammi_db::catalog::result_repo::ResultTableKind` —
@@ -24,7 +24,7 @@ Hermetic: no server, no embedded engine — only constructed protos.
 from __future__ import annotations
 
 from jammi._assembly import _RESULT_TABLE_KIND_NAME
-from jammi._database import _result_table_to_dict
+from jammi._assembly import result_table_to_dict
 from jammi._generated.jammi.v1 import embedding_pb2
 
 # Proto value name → the string the embedded engine's `ResultTableKind`
@@ -96,7 +96,7 @@ def test_every_served_kind_renders_its_own_name_never_the_fallback():
             status="ready",
             kind=embedding_pb2.ResultTableKind.Value(name),
         )
-        assert _result_table_to_dict(table)["kind"] == _EXPECTED_KIND_NAME[name], (
+        assert result_table_to_dict(table)["kind"] == _EXPECTED_KIND_NAME[name], (
             f"{name} must project as {_EXPECTED_KIND_NAME[name]!r}, the string "
             "the embedded engine serialises for the same row"
         )
@@ -114,4 +114,4 @@ def test_unspecified_still_falls_back_to_unspecified():
         status="ready",
         kind=embedding_pb2.ResultTableKind.RESULT_TABLE_KIND_UNSPECIFIED,
     )
-    assert _result_table_to_dict(table)["kind"] == "Unspecified"
+    assert result_table_to_dict(table)["kind"] == "Unspecified"

@@ -42,7 +42,6 @@ async fn transport_only_chain() -> (GrpcChain, TempDir) {
     let chain = GrpcChain {
         addr: "127.0.0.1:0".parse().expect("loopback :0 parses"),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: None,
@@ -87,9 +86,7 @@ async fn bound_chain_holds_the_port_from_bind_through_serve() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("serve");
     });
@@ -102,8 +99,7 @@ async fn bound_chain_holds_the_port_from_bind_through_serve() {
         "an interposing bind during serve must fail with AddrInUse, got {err:?}"
     );
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }
 
 /// Control: the drop-then-rebind shape — bind `:0`, read the port, DROP the

@@ -10,7 +10,7 @@
 use jammi_db::catalog::result_repo::{JobAttempt, Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::LexicalAnalyzer;
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use jammi_db::store::{ResultTableOrigin, SinkKind};
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ pub async fn run(
             reason: "names no text column to index".into(),
         });
     }
-    let relation = source_relation(source_id, &session.find_table_name(source_id).await?);
+    let relation = session.first_table(source_id).await?;
     let text = params
         .columns
         .iter()

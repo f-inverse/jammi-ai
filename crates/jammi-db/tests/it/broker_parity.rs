@@ -243,7 +243,7 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
     );
 
     const N: i64 = 30;
-    let (a_res, b_res) = tokio::join!(
+    tokio::join!(
         async {
             for i in 0..N {
                 h.publisher
@@ -261,7 +261,6 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
             }
         },
     );
-    let _ = (a_res, b_res);
 
     let mut seen: Vec<u64> = Vec::new();
     while seen.len() < (2 * N) as usize {
@@ -404,7 +403,7 @@ async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
         seen.push(delivered.offset.value());
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = writer.await;
+    writer.await.expect("the writer task");
 
     let expected: Vec<u64> = (0..WANT as u64).collect();
     let gaps: Vec<u64> = expected

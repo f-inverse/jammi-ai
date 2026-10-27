@@ -105,14 +105,13 @@ async fn shape_a_embedded_library_exercises_all_primitives() {
     let mutables = session.mutable_tables().list(None).await.unwrap();
     assert!(mutables.iter().any(|d| d.id.as_str() == "shape_log"));
     // Topic was registered with tenant binding — look it up scoped.
-    let topic = session
+    // The unbound-then-bound binding may filter out the unbound topic; the
+    // embedded shape proves the *call* succeeded.
+    session
         .topic_repo()
         .lookup_by_name("shape_events", session.tenant())
         .await
         .unwrap();
-    // The unbound-then-bound binding may filter out the unbound topic;
-    // the embedded shape proves the *call* succeeded.
-    let _ = topic;
 }
 
 // ─── Shape B: single-tenant Flight SQL server ─────────────────────────────────
@@ -129,11 +128,12 @@ async fn shape_b_single_tenant_flight_server_exercises_primitives() {
     // released between picking a port and serving it.
     let ctx = session.context().clone();
     let handle = tokio::spawn(async move {
-        let _ = jammi_server::flight::serve_flight(
+        jammi_server::flight::serve_flight(
             &ctx,
             "127.0.0.1:0".parse().expect("loopback :0 parses"),
         )
-        .await;
+        .await
+        .expect("the Flight SQL server serves until the test ends it");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -170,7 +170,6 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
     let chain = jammi_server::runtime::GrpcChain {
         addr: "127.0.0.1:0".parse().expect("loopback :0 parses"),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: Some(trigger),
         engine: None,
@@ -188,8 +187,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
     // and the engine surface is reachable. Detailed tenant-isolation
     // assertions are covered by `grpc_session.rs` and
     // `flight_tenant.rs` — here we just prove Shape C composes.
-    let _ = shutdown_tx.send(());
-    let _ = grpc_handle.await;
+    crate::common::grpc::stop(shutdown_tx, grpc_handle).await;
 
     let listed = session.mutable_tables().list(None).await.unwrap();
     assert!(listed.iter().any(|d| d.id.as_str() == "shape_log"));

@@ -42,7 +42,7 @@ pub(crate) fn cuda_fwd(
     l3: &Layout,
 ) -> Result<(CudaStorage, Shape)> {
     const OP: &str = "rope_positions_fused";
-    let (total, h, d) = rope_positions_dims(l1, l2, l3, seq, arm)?;
+    let (_total, h, d) = rope_positions_dims(l1, l2, l3, seq, arm)?;
     let shape = l1.shape().clone();
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
@@ -90,7 +90,6 @@ pub(crate) fn cuda_fwd(
     let d_u32 = d as u32;
     let seq_u32 = seq as u32;
     let sign: f32 = if negate_sin { -1.0 } else { 1.0 };
-    let _ = total; // carried for readability/doc parity with rope_positions_dims's tuple
 
     match s1.dtype() {
         DType::F32 => {

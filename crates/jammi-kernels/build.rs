@@ -488,7 +488,7 @@ fn build_cuda() {
                 .and_then(|m| m.modified())
                 .is_ok_and(|ptx_modified| newest_source > ptx_modified);
             if ptx_is_stale {
-                let _ = std::fs::remove_file(&ptx);
+                std::fs::remove_file(&ptx).expect("remove the stale PTX");
             }
         }
     }
@@ -953,7 +953,11 @@ fn build_flash_attn() {
 
     // ---- Archive.
     let archive = out_dir.join("libjammi_flash.a");
-    let _ = std::fs::remove_file(&archive);
+    match std::fs::remove_file(&archive) {
+        // A first build has no archive to replace.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        removed => removed.expect("remove the previous libjammi_flash.a"),
+    }
     let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
     let status = Command::new(&ar)
         .arg("rcs")

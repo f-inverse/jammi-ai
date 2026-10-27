@@ -1,102 +1,60 @@
-//! Federation that keeps the engine's own functions in the engine.
+//! Federation that sends a database source only what it runs as the engine
+//! does.
 //!
 //! `datafusion-federation` hands the largest sub-plan whose scans share one
-//! remote to that remote as SQL, whatever functions the sub-plan calls. A
-//! function the session installed ([`crate::session::JammiSession::install_functions`])
-//! exists only here, so a remote asked to run it fails. [`LocalFunctionFederation`]
-//! federates only the maximal sub-plans that call none: a node that calls an
-//! engine function — anywhere beneath it, subqueries included — stays in the
-//! engine, and each of its inputs is federated on its own.
+//! remote to that remote as SQL. SQL that reads the same can mean something
+//! else there, and a function the engine has — DataFusion's own or one the
+//! session installed — may not exist there at all. [`RemoteFederation`]
+//! therefore federates only the maximal sub-plans [`remote::federable`]
+//! admits: ones that scan a remote, every node of which every remote they
+//! scan runs with the engine's meaning (each remote's allowlist, which names
+//! DataFusion's own implementations, so an installed function is never on
+//! one). Any other node stays in the engine, and each of its inputs is
+//! federated on its own.
+//!
+//! The sub-plan a remote runs is planned as a [`RemoteExec`]: a source of rows
+//! to the engine, whose plan no engine optimizer reaches into. A filter or a
+//! sort the engine runs above a remote's rows stays in the engine, whether
+//! the rows come from a federated sub-plan or from a remote table's own scan;
+//! only a limit reaches the remote.
 
-use std::collections::HashSet;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::fmt;
+use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::Statistics;
+use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::execution::context::SessionState;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_federation::FederationOptimizerRule;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
+use datafusion::physical_plan::{
+    displayable, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 
-/// The names of the functions a session installed: what no remote can run.
+pub(crate) mod remote;
+
+/// The federation optimizer rule, applied only to the sub-plans
+/// [`remote::federable`] admits.
 #[derive(Debug, Default)]
-pub(crate) struct EngineFunctions(RwLock<HashSet<String>>);
-
-impl EngineFunctions {
-    /// Record the function called `name`, or any of its `aliases`, as the
-    /// engine's own.
-    pub(crate) fn insert(&self, name: &str, aliases: &[String]) {
-        self.0
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(std::iter::once(name.to_string()).chain(aliases.iter().cloned()));
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.0
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(name)
-    }
-
-    /// Whether `plan` calls one of these functions anywhere, subqueries
-    /// included.
-    fn called_by(&self, plan: &LogicalPlan) -> Result<bool> {
-        let mut called = false;
-        plan.apply_with_subqueries(|node| {
-            for expr in node.expressions() {
-                expr.apply(|e| {
-                    called = function_name(e).is_some_and(|name| self.contains(name));
-                    Ok(if called {
-                        TreeNodeRecursion::Stop
-                    } else {
-                        TreeNodeRecursion::Continue
-                    })
-                })?;
-                if called {
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        Ok(called)
-    }
-}
-
-/// The function `expr` calls at its root, by the name it is registered under.
-fn function_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::ScalarFunction(f) => Some(f.func.name()),
-        Expr::AggregateFunction(f) => Some(f.func.name()),
-        Expr::WindowFunction(f) => Some(f.fun.name()),
-        _ => None,
-    }
-}
-
-/// The federation optimizer rule, applied only to sub-plans that call no
-/// engine function.
-#[derive(Debug)]
-pub(crate) struct LocalFunctionFederation {
-    functions: Arc<EngineFunctions>,
+pub(crate) struct RemoteFederation {
     federation: FederationOptimizerRule,
 }
 
-impl LocalFunctionFederation {
-    pub(crate) fn new(functions: Arc<EngineFunctions>) -> Self {
-        Self {
-            functions,
-            federation: FederationOptimizerRule::new(),
-        }
-    }
-}
-
-impl OptimizerRule for LocalFunctionFederation {
+impl OptimizerRule for RemoteFederation {
     fn rewrite(
         &self,
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_down(|node| {
-            if self.functions.called_by(&node)? {
+            if !remote::federable(&node)? {
                 return Ok(Transformed::no(node));
             }
             let federated = self.federation.rewrite(node, config)?;
@@ -113,31 +71,149 @@ impl OptimizerRule for LocalFunctionFederation {
     }
 
     fn name(&self) -> &str {
-        "local_function_federation"
+        "remote_federation"
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::functions::expr_fn::{lower, upper};
-    use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+/// Federation's physical planner, each federated sub-plan it plans behind a
+/// [`RemoteExec`].
+pub(crate) struct RemotePlanner(FederatedPlanner);
 
-    fn plan(expr: Expr) -> LogicalPlan {
-        LogicalPlanBuilder::empty(true)
-            .project([expr])
-            .unwrap()
-            .build()
-            .unwrap()
+impl fmt::Debug for RemotePlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RemotePlanner")
+    }
+}
+
+impl RemotePlanner {
+    pub(crate) fn new() -> Self {
+        Self(FederatedPlanner::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl ExtensionPlanner for RemotePlanner {
+    async fn plan_extension(
+        &self,
+        planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let federated = self
+            .0
+            .plan_extension(
+                planner,
+                node,
+                logical_inputs,
+                physical_inputs,
+                session_state,
+            )
+            .await?;
+        Ok(federated.map(|plan| Arc::new(RemoteExec::new(plan)) as _))
+    }
+}
+
+/// Rows a remote produces — a federated sub-plan's, or a remote table's own
+/// scan — as a source to the engine.
+///
+/// The remote's plan is held, not exposed as a child: no engine optimizer
+/// reaches into it. Physical filter pushdown would hand it a `FilterExec`'s
+/// predicate and drop the `FilterExec`; sort enforcement would move a
+/// `SortExec` beneath any node that keeps its input's order, onto a remote
+/// scan whose own sort pushdown writes the sort into its statement. A
+/// remote's plan writes what it takes in the remote's dialect and with the
+/// remote's meaning — or, for `datafusion-federation`'s plan, takes a
+/// predicate and applies it nowhere. Above this node both stay in the engine.
+/// The filters a remote runs as the engine does reach it at planning, through
+/// the remote's own provider. A limit is the remote's to apply — any `n` rows
+/// are any `n` rows — and is the one thing this node passes down.
+#[derive(Debug)]
+pub(crate) struct RemoteExec {
+    remote: Arc<dyn ExecutionPlan>,
+}
+
+impl RemoteExec {
+    pub(crate) fn new(remote: Arc<dyn ExecutionPlan>) -> Self {
+        Self { remote }
+    }
+}
+
+/// The remote's plan on one line, outermost node first, down to the
+/// statement the remote is sent.
+impl DisplayAs for RemoteExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        let plan = displayable(self.remote.as_ref()).indent(false).to_string();
+        let nodes = plan.lines().map(str::trim).collect::<Vec<_>>();
+        write!(f, "RemoteExec: {}", nodes.join(" <- "))
+    }
+}
+
+impl ExecutionPlan for RemoteExec {
+    fn name(&self) -> &str {
+        "RemoteExec"
     }
 
-    #[test]
-    fn a_plan_calls_an_installed_function_by_its_name_at_any_depth() {
-        let nested = plan(lower(upper(lit("a"))));
-        let functions = EngineFunctions::default();
-        assert!(!functions.called_by(&nested).unwrap());
-        functions.insert("upper", &[]);
-        assert!(functions.called_by(&nested).unwrap());
-        assert!(!functions.called_by(&plan(lower(lit("a")))).unwrap());
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.remote.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.remote.execute(partition, context)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.remote.partition_statistics(partition)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.remote.supports_limit_pushdown()
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.remote.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let remote = self.remote.with_fetch(limit)?;
+        Some(Arc::new(Self::new(remote)))
+    }
+
+    /// No filter from above reaches the remote; written out, not left to the
+    /// default, so a change to the default cannot quietly change it.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
+    }
+
+    /// No sort from above reaches the remote; written out for the same reason.
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }

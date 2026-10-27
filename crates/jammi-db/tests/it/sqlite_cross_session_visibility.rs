@@ -312,13 +312,12 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
                     Box::pin(async move {
                         // Take the snapshot, then hold this transaction open
                         // across every write below.
-                        let _ = tx
-                            .query_opt("SELECT job_id FROM jobs WHERE job_id = 'j'", &[], |r| {
-                                r.get::<String>("job_id")
-                            })
-                            .await?;
-                        let _ = ready_tx.send(());
-                        let _ = done_rx.await;
+                        tx.query_opt("SELECT job_id FROM jobs WHERE job_id = 'j'", &[], |r| {
+                            r.get::<String>("job_id")
+                        })
+                        .await?;
+                        ready_tx.send(()).expect("the test awaits the snapshot");
+                        done_rx.await.expect("the test ends the hold");
                         Ok(())
                     })
                 },
@@ -350,7 +349,7 @@ async fn probe_read_beside_a_long_lived_read_transaction_observes_the_write() {
         );
     }
 
-    let _ = done_tx.send(());
+    done_tx.send(()).expect("the held transaction waits to end");
     held.await
         .expect("held transaction task")
         .expect("held read transaction");

@@ -134,16 +134,18 @@ async fn subprocess_serve_with_a_valid_audit_master_key_passes_the_startup_check
     // session — out of scope here, per the brief): the ONLY thing pinned is
     // that the specific startup-check failure never appears.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let exited = loop {
         if child.try_wait().expect("try_wait").is_some() {
-            break;
+            break true;
         }
         if tokio::time::Instant::now() >= deadline {
-            break;
+            break false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if !exited {
+        child.start_kill().expect("signal the still-running child");
     }
-    let _ = child.start_kill();
     let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
         .expect("child must exit within the timeout after being killed")

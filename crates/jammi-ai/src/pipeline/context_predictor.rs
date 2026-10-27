@@ -981,12 +981,12 @@ impl InferenceSession {
 
     /// Distinct values of the task column, in scan order.
     async fn distinct_tasks(&self, source_id: &str, task_column: &str) -> Result<Vec<String>> {
-        let source_table = self.find_table_name(source_id).await?;
+        let source_table = self.first_table(source_id).await?;
         let batches = self
             .context()
             .sql(&format!(
                 "SELECT DISTINCT arrow_cast(\"{task_column}\", 'Utf8') AS _task \
-                 FROM \"{source_id}\".public.\"{source_table}\" \
+                 FROM {source_table} \
                  WHERE \"{task_column}\" IS NOT NULL ORDER BY _task"
             ))
             .await
@@ -1007,13 +1007,13 @@ impl InferenceSession {
         spec: &ContextPredictorTrainConfig,
         task: &str,
     ) -> Result<Vec<(String, f64)>> {
-        let source_table = self.find_table_name(source_id).await?;
+        let source_table = self.first_table(source_id).await?;
         let batches = self
             .context()
             .sql(&format!(
                 "SELECT arrow_cast(\"{key}\", 'Utf8') AS _key, \
                         arrow_cast(\"{value}\", 'Float64') AS _y \
-                 FROM \"{source_id}\".public.\"{source_table}\" \
+                 FROM {source_table} \
                  WHERE arrow_cast(\"{task_col}\", 'Utf8') = '{task}'",
                 key = spec.key_column,
                 value = spec.value_column,

@@ -236,10 +236,26 @@ async fn remote_list_and_describe_sources_like_local() {
         .expect("local describe_source")
         .expect("patents is registered");
     assert_eq!(
-        descriptor_shape(&remote_one),
-        descriptor_shape(&local_one),
+        descriptor_shape(&remote_one.descriptor),
+        descriptor_shape(&local_one.descriptor),
         "describe_source returns the same descriptor through either transport"
     );
+    assert_eq!(
+        remote_one.tables, local_one.tables,
+        "describe_source returns the same tables through either transport"
+    );
+    // A file source serves one table, under `public`, with the file's columns.
+    let [patents] = remote_one.tables.as_slice() else {
+        panic!("a file source serves one table: {:?}", remote_one.tables);
+    };
+    assert_eq!(patents.table.to_string(), r#""patents"."public"."patents""#);
+    for column in ["id", "abstract"] {
+        assert!(
+            patents.columns.field_with_name(column).is_ok(),
+            "the patents table lists its `{column}` column: {:?}",
+            patents.columns
+        );
+    }
 
     // Absent-source parity: both return None (the remote arm maps the server's
     // NotFound back to None), never a faked descriptor.
@@ -254,8 +270,7 @@ async fn remote_list_and_describe_sources_like_local() {
     assert!(remote_absent.is_none(), "remote: absent source → None");
     assert!(local_absent.is_none(), "local: absent source → None");
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Kind parity on the newest value of the frozen `ResultTableKind` enum: a
@@ -320,12 +335,13 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
         .expect("local describe_source")
         .expect("patents is registered");
     assert_eq!(
-        descriptor_shape(&remote_one),
-        descriptor_shape(&local_one),
+        descriptor_shape(&remote_one.descriptor),
+        descriptor_shape(&local_one.descriptor),
         "a training-set row describes identically through either transport"
     );
 
     let remote_rt = remote_one
+        .descriptor
         .result_tables
         .iter()
         .find(|t| t.table_name == "patents_training_set")
@@ -336,8 +352,7 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
         "the remote descriptor must carry the training set's own kind, not a fabricated one"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -421,8 +436,7 @@ async fn remote_server_info_like_local() {
         "this fixture's config selects the default in-process broker"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// Parity, non-default arm: `remote_server_info_like_local` above only exercises
@@ -463,8 +477,92 @@ async fn remote_server_info_reports_postgres_broker_kind() {
         "embedded and remote must agree on the runtime broker kind for a non-default config"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
+}
+
+/// A remote client lists a Postgres database's tables — every schema's, views
+/// among them — and each table's columns as the engine reads them, through
+/// `describe_source` alone: no SQL, no second connection to the database.
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_describe_source_lists_a_postgres_databases_tables_and_columns() {
+    use arrow::datatypes::DataType;
+    use jammi_db::source::SourceDefinition;
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT NOT NULL); \
+         CREATE SCHEMA sales; \
+         CREATE TABLE sales.orders (id BIGINT NOT NULL, customer_id BIGINT, placed DATE); \
+         CREATE VIEW sales.recent AS SELECT id, placed FROM sales.orders;",
+    )
+    .await;
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
+    remote
+        .add_source("shop", definition.source_type, definition.connection)
+        .await
+        .expect("register the database remotely");
+
+    let described = remote
+        .describe_source("shop")
+        .await
+        .expect("describe the database remotely")
+        .expect("shop is registered");
+    type Columns = Vec<(String, DataType, bool)>;
+    let tables: Vec<(String, Columns)> = described
+        .tables
+        .iter()
+        .map(|t| {
+            (
+                format!("{}.{}", t.table.schema, t.table.table),
+                t.columns
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+                    .collect(),
+            )
+        })
+        .collect();
+    let column =
+        |name: &str, data_type: DataType, nullable: bool| (name.to_string(), data_type, nullable);
+    assert_eq!(
+        tables,
+        vec![
+            (
+                "public.customers".to_string(),
+                vec![
+                    column("id", DataType::Int64, false),
+                    column("name", DataType::Utf8, false),
+                ],
+            ),
+            (
+                "sales.orders".to_string(),
+                vec![
+                    column("id", DataType::Int64, false),
+                    column("customer_id", DataType::Int64, true),
+                    column("placed", DataType::Date32, true),
+                ],
+            ),
+            (
+                "sales.recent".to_string(),
+                vec![
+                    column("id", DataType::Int64, true),
+                    column("placed", DataType::Date32, true),
+                ],
+            ),
+        ],
+        "every schema's tables and views, `public` first, each with its columns"
+    );
+    assert_eq!(
+        described.tables[1].table.to_string(),
+        r#""shop"."sales"."orders""#,
+        "a described table names the reference SQL reads it by"
+    );
+
+    server.stop().await;
 }
 
 /// The materialization-contract reads cross the wire unchanged: a real
@@ -597,6 +695,5 @@ async fn materialization_reads_cross_the_wire_like_local() {
         }
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

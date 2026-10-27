@@ -123,8 +123,7 @@ async fn scan_relation(
     session: &InferenceSession,
     source_id: &str,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let table_name = session.find_table_name(source_id).await?;
-    let relation = jammi_db::sql::source_relation(source_id, &table_name);
+    let relation = session.first_table(source_id).await?;
     let df = session
         .context()
         .sql(&format!("SELECT * FROM {relation}"))

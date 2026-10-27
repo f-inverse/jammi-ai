@@ -427,7 +427,7 @@ async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
     // any process issues pays a cold TCP+auth handshake this measurement is
     // not about (measured: ~3-4 ms of one-time connection setup, otherwise
     // indistinguishable in the 101-row number from genuine query cost).
-    let _ = catalog.list_ring_members(&self_id, margin).await.unwrap();
+    catalog.list_ring_members(&self_id, margin).await.unwrap();
     let mut cumulative_instances = 1usize; // self's own row, already seeded.
     for &n in &[100usize, 10_000usize] {
         bulk_seed(n, &format!("n{n}")).await;

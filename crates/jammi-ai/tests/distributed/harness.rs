@@ -13,6 +13,8 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+use jammi_test_utils::child::{reap_on_drop, sigkill};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -241,7 +243,7 @@ impl Fleet {
         let Some(w) = self.workers.iter_mut().find(|w| w.worker_id == worker_id) else {
             return false;
         };
-        sigkill(&mut w.child);
+        sigkill(&w.child);
         true
     }
 
@@ -297,28 +299,12 @@ impl Fleet {
 }
 
 impl Drop for Fleet {
-    /// Best-effort SIGKILL + reap of every child, so a panic in a property test
-    /// never leaks a worker process. `kill`/`wait` errors are ignored — a child
-    /// that already exited (e.g. one we `kill9`'d earlier) is already gone.
+    /// SIGKILL and reap every child, so a panic in a property test never leaks
+    /// a worker process; a child already `kill9`'d is only reaped.
     fn drop(&mut self) {
         for w in &mut self.workers {
-            sigkill(&mut w.child);
-            let _ = w.child.wait();
+            reap_on_drop(&mut w.child);
         }
-    }
-}
-
-/// SIGKILL a child by pid. We send the signal explicitly (rather than
-/// `Child::kill`, which would also work on Unix) so the call site reads as the
-/// deliberate "crash a worker" action the crash-window properties model, and so
-/// a child we already killed is a harmless no-op (ESRCH) rather than a panic.
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: `pid` is a child this process spawned; SIGKILL is unconditional and
-    // synchronous, touching no allocator or thread state. A racing exit makes the
-    // call a no-op (ESRCH), which we intentionally ignore.
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
     }
 }
 

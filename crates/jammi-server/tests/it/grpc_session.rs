@@ -92,7 +92,6 @@ async fn start_grpc_test_server() -> (
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store_for_server.clone(),
         trigger: Some(trigger),
         engine: Some(engine),
@@ -157,8 +156,7 @@ async fn grpc_set_tenant_then_list_topics_filters_by_session() {
         "session-a must not see tenant B's topic; got {topics:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -188,8 +186,7 @@ async fn grpc_two_concurrent_sessions_are_isolated() {
         "session topic lists must be disjoint; got intersection {intersection:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -207,8 +204,7 @@ async fn grpc_unset_session_sees_only_global_topics() {
         "unbound session must see no tenant-bound topics; got {topics:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -227,6 +223,5 @@ async fn grpc_set_tenant_rejects_invalid_uuid_typed() {
         err.message()
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }

@@ -27,6 +27,9 @@ mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy", "
 # Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL),
 # the Postgres source's among them.
 live-postgres-tests = ["postgres"]
+# Gates the MySQL source's tests, which need a live MySQL
+# (JAMMI_TEST_MYSQL_URL).
+live-mysql-tests = ["mysql"]
 # Compiles the mutable-sink crash-recovery checkpoint hook. Pure test
 # infrastructure: the hook is a single `await` on a notifier that only
 # arms when env vars are set. Off by default; the
@@ -90,6 +93,9 @@ bytes = "1"
 # tempfile is needed by storage::sidecar_layout to bridge USearch's
 # path-based FFI into object_store's byte-stream API for cloud schemes.
 tempfile = "3"
+# Mints the certificate authority and server certificate the live TLS tests
+# serve a database with.
+rcgen = "0.14"
 
 # Config
 serde.workspace = true
@@ -120,6 +126,8 @@ thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
 url.workspace = true
+# Reads a database source's CA certificate from the PEM a client sends.
+rustls-pki-types.workspace = true
 percent-encoding = "2"
 async-trait.workspace = true
 

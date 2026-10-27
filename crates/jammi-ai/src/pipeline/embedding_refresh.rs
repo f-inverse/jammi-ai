@@ -123,7 +123,12 @@ pub mod refresh_test_hooks {
             if self.state.parked.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), notified).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(30), notified)
+                .await
+                .is_err()
+            {
+                tracing::warn!("test hook: waited 30 s for a park that never came");
+            }
         }
 
         /// Whether the refresh is parked.
@@ -173,7 +178,12 @@ pub mod refresh_test_hooks {
         if state.released.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), released).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(60), released)
+            .await
+            .is_err()
+        {
+            tracing::warn!("test hook: the park released by its 60 s bound");
+        }
     }
 }
 
@@ -817,13 +827,8 @@ impl InferenceSession {
     }
 
     async fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
-        let table_name = self.find_table_name(&params.source_id).await?;
-        Ok(self.build_source_query(
-            &params.source_id,
-            &table_name,
-            &params.key_column,
-            &params.columns,
-        ))
+        let table = self.first_table(&params.source_id).await?;
+        Ok(self.build_source_query(&table, &params.key_column, &params.columns))
     }
 
     /// Step 4: drain the whole source once through `KeyCheckExec` (a null key

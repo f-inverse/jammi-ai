@@ -42,7 +42,7 @@ use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::catalog::status::JobStatus;
 use jammi_db::error::Result;
-use jammi_db::source::{SourceConnection, SourceType};
+use jammi_db::source::{SourceConnection, SourceDescription, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
@@ -253,10 +253,12 @@ impl Session {
             .await
     }
 
-    /// Describe one registered source by id, or `None` when no source with that
-    /// id is visible to the session's tenant.
-    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
-        self.engine.catalog().describe_source(source_id).await
+    /// Describe one registered source by id: its descriptor and every table it
+    /// serves with its columns, or `None` when no source with that id is
+    /// visible to the session's tenant. Unlike [`Self::list_sources`], which
+    /// reads the registry alone, this reaches the source.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescription>> {
+        self.engine.describe_source(source_id).await
     }
 
     /// The engine's capabilities handshake: version, compiled feature flags,

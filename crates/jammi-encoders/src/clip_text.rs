@@ -1034,7 +1034,7 @@ mod tests {
 
         let (input_ids, mask) = fixed_batch(&cfg, &device);
         let before = crate::ln_dispatch_snapshot();
-        let _ = model.forward(&input_ids, &mask).unwrap();
+        model.forward(&input_ids, &mask).unwrap();
         let after = crate::ln_dispatch_snapshot();
         assert!(
             after.fused > before.fused && after.eager == before.eager,

@@ -106,6 +106,13 @@ struct GpuEngineServer {
     engine: Arc<InferenceSession>,
 }
 
+impl GpuEngineServer {
+    /// Shut the server down and wait for its task to end.
+    async fn stop(self) {
+        crate::common::grpc::stop(self.shutdown, self.handle).await;
+    }
+}
+
 /// Spin up an in-process gRPC + Flight SQL server whose `InferenceSession` is
 /// pinned to the first CUDA device (`require_gpu = true`), so every RPC against
 /// it (including the Flight SQL reads below) runs the real CUDA-served path.
@@ -128,7 +135,6 @@ async fn start_gpu_engine_server() -> GpuEngineServer {
     let chain = jammi_server::runtime::GrpcChain {
         addr: ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: Some(session),
@@ -293,8 +299,7 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
         );
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 /// `encode_query`'s TWO-COMPUTE form on GPU: remote and local each run an
@@ -358,6 +363,5 @@ async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated()
         if bitwise_equal { "matched" } else { "diverged" }
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

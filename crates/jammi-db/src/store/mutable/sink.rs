@@ -33,6 +33,7 @@ use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, 
 
 use super::definition::MutableTableDefinition;
 use super::{keys_predicate, owned_rows, MutableBackend};
+use crate::tenant_scope::TenantConfig;
 
 /// How an incoming row relates to an existing row with the same primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +60,12 @@ impl TryFrom<InsertOp> for KeyConflict {
     }
 }
 
+/// The write half of a mutable companion table: one statement's rows,
+/// stamped with the tenant of the query that wrote them ([`TenantConfig`],
+/// read from the task context running the statement).
 pub struct MutableTableSink {
     def: Arc<MutableTableDefinition>,
     backend: Arc<dyn MutableBackend>,
-    tenant: crate::tenant_scope::TenantBinding,
     on_conflict: KeyConflict,
 }
 
@@ -70,13 +73,11 @@ impl MutableTableSink {
     pub fn new(
         def: Arc<MutableTableDefinition>,
         backend: Arc<dyn MutableBackend>,
-        tenant: crate::tenant_scope::TenantBinding,
         on_conflict: KeyConflict,
     ) -> Self {
         Self {
             def,
             backend,
-            tenant,
             on_conflict,
         }
     }
@@ -105,7 +106,7 @@ impl DataSink for MutableTableSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _ctx: &Arc<TaskContext>,
+        ctx: &Arc<TaskContext>,
     ) -> Result<u64, DataFusionError> {
         // Collect batches up-front so the transaction closure can be `Send`
         // without capturing the stream's non-Send internals.
@@ -116,10 +117,10 @@ impl DataSink for MutableTableSink {
 
         let def = Arc::clone(&self.def);
         let backend_for_closure = Arc::clone(&self.backend);
-        // Snapshot the tenant binding once per write_all call (not per row).
-        // The DataSink contract is "exactly one write_all per DML statement"
-        // so this is the natural unit of consistency.
-        let session_tenant = self.tenant.current_tenant();
+        // The statement's tenant, as the query was planned: one per
+        // write_all, the DataSink contract being one write_all per DML
+        // statement.
+        let session_tenant = TenantConfig::of(ctx.session_config().options())?.tenant();
         let table_name = def.id.as_str().to_string();
         let on_conflict = self.on_conflict;
         let written = self
@@ -129,10 +130,9 @@ impl DataSink for MutableTableSink {
                 let backend = backend_for_closure;
                 Box::pin(async move {
                     tx.set_tenant(session_tenant);
-                    // Defence-in-depth: confirm the transaction sees the same
-                    // tenant we're about to bind to every row. A future change
-                    // that mutates the binding mid-flight would fail here
-                    // instead of silently re-tenanting the rows.
+                    // The transaction must see the tenant every row is about
+                    // to be stamped with; a mismatch fails the statement
+                    // rather than re-tenanting its rows.
                     tx.assert_tenant_matches(session_tenant, &table_name)?;
                     let mut total: u64 = 0;
                     for batch in batches {

@@ -64,9 +64,9 @@ _CASCADE = {
 # `SourceType` serialises to, so a descriptor dict is shaped identically whether
 # it crossed the gRPC wire or came back from the in-process engine.
 _SOURCE_KIND_NAME = {
-    catalog_pb2.SourceKind.SOURCE_KIND_FILE: "File",
-    catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES: "Postgres",
-    catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "MySql",
+    catalog_pb2.SourceKind.SOURCE_KIND_FILE: "file",
+    catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES: "postgres",
+    catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "mysql",
 }
 
 # Wire `ResultTableKind` enum value → the string the embed wheel's
@@ -1290,6 +1290,64 @@ def build_recompute_request(
     return request
 
 
+def result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
+    """Project a wire `ResultTable` into the result-table dict both transports
+    return.
+
+    `model_id`, `key_column` and `derived_from` round-trip as `None` when the
+    engine did not record one (a derivation runs no model) — the same shape the embedded `Option<String>` serialises
+    to — and `kind` is spelled the same string the embedded `ResultTableKind`
+    serialises to, so a derived (neighbor-graph / as-of-join) table's
+    provenance reads identically regardless of transport. `RESULT_TABLE_KIND_
+    UNSPECIFIED` (never emitted for a genuine result table — every persisted
+    row has a concrete kind) falls back to `"Unspecified"`, the same
+    unrecognised-enum fallback `source_descriptor_to_dict` uses for `source_type`.
+    """
+    return {
+        "table_name": rt.table_name,
+        "source_id": rt.source_id,
+        "model_id": rt.model_id if rt.HasField("model_id") else None,
+        "dimensions": rt.dimensions,
+        "row_count": rt.row_count,
+        "status": rt.status,
+        "key_column": rt.key_column or None,
+        "kind": _RESULT_TABLE_KIND_NAME.get(rt.kind, "Unspecified"),
+        "derived_from": rt.derived_from if rt.HasField("derived_from") else None,
+    }
+
+
+def source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any]:
+    """Project a wire `SourceDescriptor` into the descriptor dict both
+    transports return — `source_id`, `source_type`, `status`, and
+    `result_tables` — the embedded engine handing over the same serialized
+    reply the server sends.
+    """
+    return {
+        "source_id": d.source_id,
+        "source_type": _SOURCE_KIND_NAME.get(d.kind, "Unspecified"),
+        "status": d.status,
+        "result_tables": [result_table_to_dict(rt) for rt in d.result_tables],
+    }
+
+
+def source_description_to_dict(d: catalog_pb2.SourceDescription) -> Dict[str, Any]:
+    """Project a wire `SourceDescription` into the `describe_source` dict both
+    transports return: the descriptor's keys, as `list_sources` yields them, plus
+    ``tables`` — each ``{"schema", "table", "columns"}``, ``columns`` a
+    `pyarrow.Schema` decoded from its IPC framing.
+    """
+    description = source_descriptor_to_dict(d.source)
+    description["tables"] = [
+        {
+            "schema": t.schema,
+            "table": t.table,
+            "columns": pa.ipc.open_stream(t.columns).schema,
+        }
+        for t in d.tables
+    ]
+    return description
+
+
 def recompute_report_to_dict(report: pipeline_pb2.RecomputeReport) -> Dict[str, Any]:
     """Shape a `RecomputeReport` into the plain dict the binding returns —
     identical whether it crossed the gRPC wire or came back from the in-process
@@ -1654,7 +1712,6 @@ def build_create_mutable_table_request(
     primary_key: List[str],
     indexes: Optional[List[Dict[str, Any]]] = None,
     order_column: Optional[str] = None,
-    chunk_size: Optional[int] = None,
 ) -> catalog_pb2.CreateMutableTableRequest:
     """Assemble the `CreateMutableTableRequest` for a mutable companion table from
     the binding's flat kwargs.
@@ -1663,8 +1720,7 @@ def build_create_mutable_table_request(
     stream); `primary_key` is a non-empty subset of its columns. `indexes` is an
     optional list of ``{"name", "columns", "unique"}`` dicts — one secondary
     index per entry. `order_column` is an optional monotonic column enabling
-    streaming `scan_after` reads; `chunk_size` overrides the engine's default scan
-    chunk size. The wire body is tenant-free — the server stamps the session
+    streaming `scan_after` reads. The wire body is tenant-free — the server stamps the session
     tenant onto the catalog row. The same request the embed binding submits
     in-process.
     """
@@ -1684,8 +1740,6 @@ def build_create_mutable_table_request(
     )
     if order_column is not None:
         definition.order_column = order_column
-    if chunk_size is not None:
-        definition.chunk_size = chunk_size
     return catalog_pb2.CreateMutableTableRequest(definition=definition)
 
 

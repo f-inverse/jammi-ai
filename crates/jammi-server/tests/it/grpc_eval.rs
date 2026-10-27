@@ -70,6 +70,7 @@ where
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -82,6 +83,7 @@ where
                 url: truth_url(),
                 format: FileFormat::Csv as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -174,8 +176,7 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
         assert!(c.is_object(), "cohorts_json is a JSON object");
     }
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -230,8 +231,7 @@ async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
         "each compared table carries its embedding eval report"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -276,6 +276,5 @@ async fn eval_embeddings_under_a_tenant_scope_over_the_wire() {
     assert!(!report.eval_run_id.is_empty());
     assert!(report.aggregate.is_some());
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

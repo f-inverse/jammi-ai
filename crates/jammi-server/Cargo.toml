@@ -104,8 +104,9 @@ live-gpu-tests = ["cuda", "jammi-ai/live-gpu-tests"]
 # The fleet harness they run on (`gang_chaos`, `gang_coordinator`) is the
 # test-hooks one.
 live-gpu-gang-tests = ["live-gpu-tests", "test-hooks", "jammi-ai/live-gpu-gang-tests"]
-# Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL.
-live-postgres-tests = []
+# Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL, the
+# Postgres source's among them.
+live-postgres-tests = ["postgres"]
 # Cloud object-store backends for source reads / result-table storage, forwarded
 # to jammi-db (which gates each behind object_store's cloud SDKs). The published
 # server image enables `storage-cloud` so it is deployment-agnostic — it reads

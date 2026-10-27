@@ -48,6 +48,7 @@ async fn add_patents(client_channel: tonic::transport::Channel) {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -111,8 +112,7 @@ async fn infer_returns_arrow_rows_over_the_wire() {
         "each inferred row carries a non-empty key"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -151,6 +151,7 @@ async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
                     url: patents_url(),
                     format: FileFormat::Parquet as i32,
                     tenant_column: None,
+                    ca_certificate: None,
                 }),
             })
             .await
@@ -180,8 +181,7 @@ async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
         "tenant-scoped infer returns rows for the tenant's source"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -203,8 +203,7 @@ async fn infer_rejects_unspecified_task() {
         .expect_err("unspecified task must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -226,6 +225,5 @@ async fn infer_rejects_missing_columns() {
         .expect_err("missing columns must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }

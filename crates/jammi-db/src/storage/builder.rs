@@ -39,7 +39,7 @@ pub(crate) fn build_object_store(
         cfg.validate()?;
     }
     match url.scheme() {
-        Scheme::File => build_file(url),
+        Scheme::File => build_file(),
         Scheme::Memory => Ok(Arc::new(object_store::memory::InMemory::new())),
         Scheme::S3 => build_s3(url, config),
         Scheme::Gcs => build_gcs(url, config),
@@ -48,12 +48,11 @@ pub(crate) fn build_object_store(
     }
 }
 
-fn build_file(url: &StorageUrl) -> Result<DynObjectStore, StorageError> {
+fn build_file() -> Result<DynObjectStore, StorageError> {
     // `LocalFileSystem::new()` returns a store rooted at "/" — the absolute
     // path lives in each `object_store::path::Path` the caller hands in.
     // This keeps `JammiObjectStore::put / get` portable across schemes
     // (the path component is always relative to the driver's root).
-    let _ = url; // scheme already validated; root is always "/"
     Ok(Arc::new(object_store::local::LocalFileSystem::new()))
 }
 
@@ -425,6 +424,12 @@ impl BuilderSeeds {
             let key = key.as_ref();
             let value: String = value.into();
             raw.insert(key.to_string(), value.clone());
+            #[cfg(any(
+                feature = "storage-s3",
+                feature = "storage-r2",
+                feature = "storage-gcs",
+                feature = "storage-azure"
+            ))]
             let lowered = key.to_ascii_lowercase();
             #[cfg(any(feature = "storage-s3", feature = "storage-r2"))]
             if key.starts_with("AWS_") {
@@ -444,7 +449,6 @@ impl BuilderSeeds {
                     azure = azure.with_config(k, value.clone());
                 }
             }
-            let _ = (&lowered, &value);
         }
         Self {
             #[cfg(any(feature = "storage-s3", feature = "storage-r2"))]
@@ -769,15 +773,14 @@ mod tests {
     fn file_scheme_always_available() {
         let url = StorageUrl::parse("/tmp").unwrap();
         let store = build_object_store(&url, None).expect("file driver builds");
-        // Smoke test: store implements Display.
-        let _ = format!("{store}");
+        assert!(!store.to_string().is_empty(), "the driver names itself");
     }
 
     #[test]
     fn memory_scheme_always_available() {
         let url = StorageUrl::memory("test");
         let store = build_object_store(&url, None).expect("memory driver builds");
-        let _ = format!("{store}");
+        assert!(!store.to_string().is_empty(), "the driver names itself");
     }
 
     #[cfg(not(feature = "storage-s3"))]
@@ -815,7 +818,7 @@ mod tests {
         });
         // No network: AmazonS3Builder::build() only constructs the client.
         let store = build_object_store(&url, Some(&cfg)).expect("r2 driver builds");
-        let _ = format!("{store}");
+        assert!(!store.to_string().is_empty(), "the driver names itself");
     }
 
     #[cfg(feature = "storage-r2")]

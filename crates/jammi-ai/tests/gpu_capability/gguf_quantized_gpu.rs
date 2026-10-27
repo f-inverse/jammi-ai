@@ -764,7 +764,7 @@ const ADMISSION_ALLOWANCE_BYTES: u64 = 2 * ALLOCATOR_POOL_BLOCK_BYTES;
 /// before` isolates the load-specific allocation instead.
 fn settle_cuda_device(device: &Device) {
     let warm = Tensor::zeros((64, 64), candle_core::DType::F32, device).unwrap();
-    let _ = warm.sum_all().unwrap();
+    warm.sum_all().unwrap();
     device.synchronize().unwrap();
 }
 
@@ -994,13 +994,13 @@ async fn gguf_vs_f32_gpu_throughput_baseline() {
 
     let t0 = Instant::now();
     for &text in &rows {
-        let _ = gguf_gpu.encode_text_query(&gguf_model, text).await.unwrap();
+        gguf_gpu.encode_text_query(&gguf_model, text).await.unwrap();
     }
     let gguf_elapsed = t0.elapsed();
 
     let t0 = Instant::now();
     for &text in &rows {
-        let _ = f32_gpu.encode_text_query(&f32_model, text).await.unwrap();
+        f32_gpu.encode_text_query(&f32_model, text).await.unwrap();
     }
     let f32_elapsed = t0.elapsed();
 

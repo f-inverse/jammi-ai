@@ -355,18 +355,8 @@ impl Fleet {
 impl Drop for Fleet {
     fn drop(&mut self) {
         for w in &mut self.workers {
-            sigkill(&mut w.child);
-            let _ = w.child.wait();
+            crate::child::reap_on_drop(&mut w.child);
         }
-    }
-}
-
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: `pid` is a child this process spawned; SIGKILL is unconditional
-    // and synchronous. A racing exit makes the call a no-op (ESRCH).
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
     }
 }
 

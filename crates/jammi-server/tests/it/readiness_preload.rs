@@ -257,7 +257,7 @@ async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
             .is_ok()
     );
 
-    let _ = served.drain_tx.send(true);
+    served.drain_tx.send_replace(true);
     let outcome = tokio::time::timeout(Duration::from_secs(60), served.task)
         .await
         .unwrap()
@@ -353,9 +353,9 @@ async fn signal_during_preload_exits_without_serving() {
         park.wait_parked().await;
         wait_worker_state(&served.session, WorkerState::Warming).await;
         if release {
-            let _ = served.release_tx.send(true);
+            served.release_tx.send_replace(true);
         } else {
-            let _ = served.drain_tx.send(true);
+            served.drain_tx.send_replace(true);
         }
         let outcome = tokio::time::timeout(Duration::from_secs(60), served.task)
             .await
@@ -418,7 +418,7 @@ async fn release_signal_during_preload_actually_releases() {
         jammi_ai::fine_tune::worker::loop_test_hooks::Rendezvous::ReleaseAt2e,
     );
 
-    let _ = served.release_tx.send(true);
+    served.release_tx.send_replace(true);
 
     tokio::time::timeout(Duration::from_secs(10), release_fired.wait_fired())
         .await

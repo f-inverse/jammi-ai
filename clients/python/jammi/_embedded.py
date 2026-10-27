@@ -85,13 +85,15 @@ from ._assembly import (
     build_register_topic_request,
     build_search_request,
     recompute_report_to_dict,
+    source_description_to_dict,
+    source_descriptor_to_dict,
     build_refresh_embeddings_request,
     build_compact_embeddings_request,
     build_expire_versions_request,
     refresh_report_to_dict,
     expiry_report_to_dict,
 )
-from ._generated.jammi.v1 import embedding_pb2, pipeline_pb2
+from ._generated.jammi.v1 import catalog_pb2, embedding_pb2, pipeline_pb2
 
 
 class _TenantScope:
@@ -347,6 +349,7 @@ class EmbeddedBackend:
         url: str,
         format: Optional[str] = None,
         tenant_column: Optional[str] = None,
+        ca_certificate: Optional[str] = None,
     ) -> None:
         """Register a data source on the embedded engine, by the URL that names it.
 
@@ -355,17 +358,35 @@ class EmbeddedBackend:
         they take no `format`. Anything else is a file read in `format`.
         `tenant_column` names the column whose value is each row's tenant: a
         tenant-bound session then reads only its own rows and the rows with no
-        tenant, through every verb that reads the source.
+        tenant, through every verb that reads the source. `ca_certificate` is the
+        PEM text of the certificate authority a database's server certificate is
+        verified against; the source then connects verified.
         """
-        self._native.add_source(name, url=url, format=format, tenant_column=tenant_column)
+        self._native.add_source(
+            name,
+            url=url,
+            format=format,
+            tenant_column=tenant_column,
+            ca_certificate=ca_certificate,
+        )
 
     def list_sources(self) -> List[Dict[str, Any]]:
-        """A descriptor for every source registered to the current tenant."""
-        return self._native.list_sources()
+        """A descriptor for every source registered to the current tenant, the
+        dict the remote client returns for the same reply."""
+        reply = catalog_pb2.ListSourcesResponse()
+        reply.ParseFromString(self._native._list_sources_proto())
+        return [source_descriptor_to_dict(d) for d in reply.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
-        """Describe one registered source by id, or ``None`` if not visible."""
-        return self._native.describe_source(source_id)
+        """Describe one registered source by id, or ``None`` if not visible: the
+        `list_sources` entry plus ``tables``, every table the source serves as
+        ``{"schema", "table", "columns"}`` with ``columns`` a `pyarrow.Schema`."""
+        body = self._native._describe_source_proto(source_id)
+        if body is None:
+            return None
+        description = catalog_pb2.SourceDescription()
+        description.ParseFromString(body)
+        return source_description_to_dict(description)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.
@@ -1558,7 +1579,6 @@ class EmbeddedBackend:
         primary_key: List[str],
         indexes: Optional[List[Dict[str, Any]]] = None,
         order_column: Optional[str] = None,
-        chunk_size: Optional[int] = None,
     ) -> str:
         """Register a mutable companion table and return its catalog id.
 
@@ -1566,8 +1586,7 @@ class EmbeddedBackend:
         list of column names drawn from it. `indexes` is an optional list of
         ``{"name", "columns", "unique"}`` dicts — one secondary index per entry.
         `order_column` is an optional monotonic column enabling streaming
-        `scan_after` reads; `chunk_size` overrides the engine's default scan chunk
-        size. Tenant scope is the session's bound tenant. Same handle shape and
+        `scan_after` reads. Tenant scope is the session's bound tenant. Same handle shape and
         verb signature as the remote `RemoteDatabase.create_mutable_table`; the
         request is assembled with the shared `CreateMutableTableRequest` builder
         and submitted through the engine's wire seam.
@@ -1578,7 +1597,6 @@ class EmbeddedBackend:
             primary_key=primary_key,
             indexes=indexes,
             order_column=order_column,
-            chunk_size=chunk_size,
         )
         return self._native._create_mutable_table_proto(request.SerializeToString())
 

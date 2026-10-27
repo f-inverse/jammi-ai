@@ -66,7 +66,7 @@ edges, by design — not a discrepancy.
 jammi-admin -> jammi-datafusion, jammi-db, jammi-wire
 jammi-ai -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
-jammi-cli -> jammi-admin, jammi-client, jammi-datafusion, jammi-db, jammi-wire
+jammi-cli -> jammi-admin, jammi-client, jammi-datafusion, jammi-db, jammi-test-utils, jammi-wire
 jammi-client -> jammi-admin, jammi-datafusion, jammi-db, jammi-wire
 jammi-datafusion -> jammi-datafusion, jammi-numerics
 jammi-db -> jammi-datafusion, jammi-numerics, jammi-test-resources, jammi-test-utils
@@ -4571,8 +4571,8 @@ to exact search.
   `decode_ipc_stream` (or `error_from_status`).
 - **Remote `sql` (Flight SQL lane):** `DataClient::sql` (`crates/jammi-client/src/lib.rs`)
   opens a `FlightSqlServiceClient` over the *same* tonic channel and stamps the **bound**
-  session id (not a fresh one) → server `TenantBoundProvider` scopes the query to the bound
-  tenant (shared-binding path, [§7]).
+  session id (not a fresh one) → server's `ResolvedFlightScope` resolves that session's tenant
+  and runs the request — its handler, every poll of its stream — under it.
 - **Eval IR metrics (numerics path):** `EvalRunner` encodes each query →
   `result_store.search_vectors` → `cosine_distance` (top-k heap, sorted `(dist,_row_id)`) →
   `RetrievalMetrics::recall_at_ks`/`compute_query`/`aggregate` → serialize through
@@ -5117,8 +5117,15 @@ auto-available to every encoder.)
 - **Single-session / shared-transport.** `DataClient::over` and `CatalogClient::over` must build
   over the *same* `SessionTransport` (`crates/jammi-client/src/lib.rs`); separate transports
   silently un-scope tenant bindings.
-- **Handlers must use `scoped`, never sticky `bind_tenant`** — all handlers share one
-  `Arc<InferenceSession>`; `bind_tenant` would race across concurrent requests.
+- **Every request enters its own scope; a shared session binds no tenant.** All handlers
+  share one `Arc<InferenceSession>`. A gRPC handler calls `scoped`
+  (`with_request_scope`: the request's tenant, or global when it named none);
+  `JammiFlightService` enters the scope its
+  `FlightScope` resolves around the handler and every poll of its response stream. A query
+  carries its scope in its own session configuration (`TenantConfig`, set by `QueryContext`),
+  which the analyzer, the mutable-table scan and sink, and everything on other tasks read; a
+  plan whose configuration has none is refused. `bind_tenant` is one embedded connection's
+  tenant, never a server's.
 - **gRPC-Web layer order is load-bearing.** `GrpcWebTrailersLayer` *before* `GrpcWebLayer`
   (`crates/jammi-server/src/runtime.rs`); reorder and gRPC-Web error handling breaks (raw gRPC
   unaffected).

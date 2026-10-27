@@ -163,6 +163,13 @@ struct AuthServer {
     handle: tokio::task::JoinHandle<()>,
 }
 
+impl AuthServer {
+    /// Shut the server down and wait for its task to end.
+    async fn stop(self) {
+        super::common::grpc::stop(self.shutdown, self.handle).await;
+    }
+}
+
 /// Stand up an in-process `CatalogService` fronted by the consumer's
 /// [`BearerAuthInterceptor`] (in place of the engine-default resolver). The
 /// fixture pre-registers one source per tenant — each under its own tenant scope
@@ -201,9 +208,7 @@ async fn start_auth_server() -> AuthServer {
     let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(catalog_svc)
-            .serve_with_incoming_shutdown(incoming, async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_incoming_shutdown(incoming, crate::common::grpc::stopped(shutdown_rx))
             .await
             .expect("grpc server");
     });
@@ -327,8 +332,7 @@ async fn two_authenticated_tenants_see_isolated_sources() {
         "tenant A must never see B's source through the seam"
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,8 +354,7 @@ async fn missing_credential_is_rejected_not_run_unscoped() {
         err.message()
     );
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -380,8 +383,7 @@ async fn invalid_credential_is_rejected() {
     let sources = list_source_ids(&mut legit).await.expect("legit lists");
     assert_eq!(sources, vec!["a_source".to_string()]);
 
-    let _ = server.shutdown.send(());
-    let _ = server.handle.await;
+    server.stop().await;
 }
 
 // --- the same contract, now through the engine's composability seam ----------
@@ -426,7 +428,6 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
     let chain = GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(Arc::clone(&session)),
@@ -471,6 +472,5 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
         .expect_err("a forged credential must be rejected at the seam");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown_tx, handle).await;
 }

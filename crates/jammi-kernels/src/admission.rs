@@ -456,22 +456,22 @@ impl ComputeCapability {
 /// it borrows a handle that is already bound/retained for the device
 /// candle is using, rather than retaining/binding a new one.
 pub fn probe_cuda_compute_capability(device: &candle_core::Device) -> Option<ComputeCapability> {
-    #[cfg(feature = "cuda")]
-    {
-        if let candle_core::Device::Cuda(cuda_device) = device {
-            if let Ok((major, minor)) = cuda_device.cuda_stream().context().compute_capability() {
-                return Some(ComputeCapability::new(
-                    major.max(0) as usize,
-                    minor.max(0) as usize,
-                ));
-            }
+    match device {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_device) => {
+            let (major, minor) = cuda_device
+                .cuda_stream()
+                .context()
+                .compute_capability()
+                .ok()?;
+            Some(ComputeCapability::new(
+                major.max(0) as usize,
+                minor.max(0) as usize,
+            ))
         }
-        None
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = device;
-        None
+        #[cfg(not(feature = "cuda"))]
+        candle_core::Device::Cuda(_) => None,
+        candle_core::Device::Cpu | candle_core::Device::Metal(_) => None,
     }
 }
 
@@ -488,19 +488,12 @@ pub fn probe_cuda_compute_capability(device: &candle_core::Device) -> Option<Com
 /// admission predicate: no call site should branch dispatch on it (unlike
 /// [`ComputeCapability`], which several call sites gate on).
 pub fn probe_cuda_device_name(device: &candle_core::Device) -> Option<String> {
-    #[cfg(feature = "cuda")]
-    {
-        if let candle_core::Device::Cuda(cuda_device) = device {
-            if let Ok(name) = cuda_device.cuda_stream().context().name() {
-                return Some(name);
-            }
-        }
-        None
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = device;
-        None
+    match device {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_device) => cuda_device.cuda_stream().context().name().ok(),
+        #[cfg(not(feature = "cuda"))]
+        candle_core::Device::Cuda(_) => None,
+        candle_core::Device::Cpu | candle_core::Device::Metal(_) => None,
     }
 }
 
@@ -960,7 +953,8 @@ impl Drop for ProbeCaptureGuard {
             }
             panic!("{OUT_OF_ORDER_WINDOW}");
         }
-        let _ = self.restore();
+        // The window a drop restores is no one's to read.
+        drop(self.restore());
     }
 }
 
@@ -1878,7 +1872,7 @@ pub enum ProbedOpKind {
 /// // Outside `jammi_kernels`, every field is invisible, so a struct
 /// // literal cannot even name its fields — the compiler proves this,
 /// // not a runtime check or a syn oracle over construction shapes.
-/// let _ = jammi_kernels::admission::ProbedOp {
+/// let forged = jammi_kernels::admission::ProbedOp {
 ///     report_key: "forged",
 ///     kind: jammi_kernels::admission::ProbedOpKind::TwoArm,
 ///     registry: &[],

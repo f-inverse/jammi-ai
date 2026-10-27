@@ -21,7 +21,7 @@ use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::source::{SourceConnection, SourceType};
+use jammi_db::source::{SourceConnection, SourceDescription, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, Staleness};
@@ -46,8 +46,9 @@ use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
     derives_from_edge_from_proto, describe_table_from_proto, encode_ipc_stream, error_from_status,
     index_segment_from_proto, match_verdict_from_proto, model_from_proto,
-    source_descriptor_from_proto, source_type_to_proto, staleness_from_proto, topic_from_proto,
-    trigger_error_from_status, SessionChannel, SessionTransport,
+    source_description_from_proto, source_descriptor_from_proto, source_type_to_proto,
+    staleness_from_proto, topic_from_proto, trigger_error_from_status, SessionChannel,
+    SessionTransport,
 };
 use jammi_wire::{
     job_status_info_from_proto, job_summary_from_proto, worker_summary_from_proto, JobStatusInfo,
@@ -141,8 +142,9 @@ impl CatalogClient {
             .collect()
     }
 
-    /// Describe one registered source by id, or `None` when absent.
-    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
+    /// Describe one registered source by id: its descriptor and every table it
+    /// serves with its columns, or `None` when absent.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescription>> {
         match self
             .client()
             .describe_source(DescribeSourceRequest {
@@ -150,7 +152,7 @@ impl CatalogClient {
             })
             .await
         {
-            Ok(resp) => source_descriptor_from_proto(resp.into_inner())
+            Ok(resp) => source_description_from_proto(resp.into_inner())
                 .map(Some)
                 .map_err(|s| error_from_status(&s)),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),

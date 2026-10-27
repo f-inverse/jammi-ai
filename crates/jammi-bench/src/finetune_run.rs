@@ -3306,12 +3306,6 @@ mod tests {
             );
             tensors.insert(format!("{prefix}.output_layer_norm.bias"), zeros_1d(hidden));
         }
-        // `heads` only feeds the config's own `n_heads` divisibility check
-        // inside `DistilBert::builder().build(..)` — no weight tensor is
-        // keyed by head count, so it is read here only to keep the tuple
-        // destructure honest about every field `tiny_config` (the
-        // `jammi-encoders` analogue) names.
-        let _ = heads;
         candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
             .expect("save synthetic model.safetensors");
         dir

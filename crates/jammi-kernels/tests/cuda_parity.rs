@@ -11700,7 +11700,7 @@ fn isolated_kernel_timing_cast_boundary() {
             Tensor::from_slice(&grad_res_v, (m_e, outf_e), &cuda).unwrap()
         },
         |grad_res: &mut Tensor| {
-            let _ = apply1(grad_res, cast_scale_op).unwrap();
+            apply1(grad_res, cast_scale_op).unwrap();
         },
     );
     let stats_e_kernel_only = time_kernel(
@@ -11788,7 +11788,7 @@ fn isolated_kernel_timing_cast_boundary() {
             (base, f32val)
         },
         |(base, f32val): &mut (Tensor, Tensor)| {
-            let _ = apply2(base, f32val, cast_add_op).unwrap();
+            apply2(base, f32val, cast_add_op).unwrap();
         },
     );
     let stats_f_kernel_only = time_kernel(

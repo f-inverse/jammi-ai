@@ -885,7 +885,10 @@ async fn run_rank_increments_gang_requests_metric() {
     let channel = crate::common::grpc::channel(server.peer_addr).await;
     let mut client = GangServiceClient::new(channel);
     let outbound = tokio_stream::once(assign_frame(0, 0));
-    let _ = client.run_rank(outbound).await;
+    // Counted whether it is served or refused.
+    match client.run_rank(outbound).await {
+        Ok(_) | Err(_) => {}
+    }
     assert_eq!(
         server
             .metrics

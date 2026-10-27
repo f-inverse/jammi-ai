@@ -6,11 +6,11 @@
 
 Jammi federates external databases alongside local files. Register a database by its
 URL and every table in it becomes a table of the SQL surface, queried in place: the
-largest part of a query that reads only one database's tables — filters, projections,
-joins, aggregates, limits — runs in that database, and the engine joins the result with
-any other source. A function only the engine has (one it installs, such as the content
-hash an embedding job computes) is never sent to a database: the part of the query that
-calls it runs in the engine, over the rows the database returns.
+largest part of a query that reads only one database's tables, and that the database
+reads exactly as the engine does, runs in that database, and the engine joins the result
+with any other source. Anything the database would read otherwise stays in the engine,
+over the rows the database returns, so an answer never depends on where it was computed
+([What runs in the database](#what-runs-in-the-database)).
 
 ## Python
 
@@ -27,9 +27,43 @@ db.add_source("papers", url="/data/papers.parquet", format="parquet")
 db.sql("SELECT id, title FROM pg_data.public.articles WHERE published LIMIT 10")
 ```
 
-A Postgres source serves the tables of the database's `public` schema; a MySQL source
-serves the tables of the database its URL names. Both appear under the source's name
-with the `public` schema: `pg_data.public.articles`, `mysql_data.public.assignees`.
+A Postgres source serves the tables, views and materialized views of every schema the
+connecting role may use, each under its own schema: `pg_data.public.articles`,
+`pg_data.sales.orders`. Which schemas and relations a source serves is the role's
+grants; the system schemas are never served. A MySQL source serves the tables of the
+database its URL names under `public`: `mysql_data.public.assignees`.
+
+`describe_source` lists what a source serves: each table's schema, its name and its
+columns as the engine reads them, a `pyarrow.Schema` in Python. A remote session gets the
+same answer as the embedded engine, so a client finds a database's tables without holding
+its credentials. `list_sources` reads the registry alone; `describe_source` reaches the
+database, so a database it cannot reach fails it.
+
+```python
+for table in db.describe_source("pg_data")["tables"]:
+    print(f"{table['schema']}.{table['table']}", table["columns"].names)
+```
+
+A query over a Postgres source whose database has stopped answering fails at once — an
+`Unavailable` error (gRPC `UNAVAILABLE`, the retryable class) naming the database's address
+and why it was not reached — and answers again, with no re-registration, once the database
+does.
+
+## Postgres column types
+
+Every column of every type reads as the value it holds, and no column's type keeps its
+table, or any other table of the source, from registering. A column is read as stored
+when it is a number, a bounded or unbounded `numeric`, `boolean`, a string type, `uuid`,
+`bytea`, `date`, `time`, `timestamptz`, `interval`, or an array of numbers, booleans or
+strings. Postgres converts the rest before the engine reads them, and a filter, sort or
+aggregate the database runs compares the converted value:
+
+| Type | Read as |
+|---|---|
+| a domain | its base type |
+| `money` | `numeric(19, s)`, `s` the database's money scale (read when the source registers) |
+| `timestamp` | the instant it names at UTC; every session runs with `TimeZone` set to UTC |
+| every other type (`jsonb`, `json`, `citext`, `timetz`, an enum, `inet`, `tsvector`, `xml`, `bit`, …) | its text |
 
 ## Rust
 
@@ -71,8 +105,52 @@ out: `postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`
 `prefer` (the default, as in libpq), `require`, `verify-ca` or `verify-full`.
 
 A MySQL URL is `mysql://user:password@host:port/database`, and must name its database.
-Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`; a server
-with no TLS — a local development instance — is reached with `sslmode=disabled`.
+Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`. `required`
+verifies the server's certificate and the host it names; `preferred` encrypts without
+verifying either; a server with no TLS — a local development instance — is reached with
+`sslmode=disabled`.
+
+### A server certificate the engine's host does not trust
+
+A database whose certificate a private CA signed — a managed database's own CA, or a
+self-hosted server's — is verified against that CA when the source holds it: pass the
+CA's PEM text, not a path, so a remote client hands it over the same way the embedded
+engine takes it.
+
+```python
+ca = open("private-ca.pem").read()
+db.add_source("orders", url="mysql://reader:secret@orders.internal:3306/shop", ca_certificate=ca)
+```
+
+A source holding a CA connects with a mode that verifies the server: `required` for
+MySQL, `verify-full` for Postgres when the URL names no mode. A URL naming a mode that
+does not verify (`preferred`, `disabled`, `prefer`, `require`, `disable`) is refused with
+the CA, as is a Postgres URL that also names its own `sslrootcert`, a path on the engine's
+host. A file source takes no CA.
+
+## What runs in the database
+
+A database is sent only constructs it is known to mean as the engine means them, each
+backed by a test that runs it over the database and over the same rows in a file. Every
+database runs scans, projections, filters, limits, inner, left and right joins, boolean
+logic, `IS [NOT] NULL`, comparisons and `BETWEEN` on numbers, booleans, dates and
+zone-less timestamps, `+ - *` on numbers, integer casts, `COUNT`, `SUM` over numbers, and
+`MIN`/`MAX` over ordered types.
+
+| Construct | PostgreSQL | MySQL |
+|---|---|---|
+| `=`, `<>`, `IN`, grouping and join keys on strings | in the database (byte equality) | in the engine (the default collation folds case) |
+| `\|\|` | in the database | in the engine (a logical OR in MySQL) |
+| `/` and `%` on integers and floats | in the database | in the engine (`/` on integers is decimal division) |
+| `ORDER BY` on non-string keys | in the database | in the engine (NULLs sort first ascending) |
+| `AVG` over integers and floats | in the database | in the engine (a four-place decimal) |
+| `COUNT(DISTINCT …)`, `FULL JOIN` | in the database | in the engine |
+
+Always in the engine: ordering comparisons and sorts on strings (a database orders them
+by its collation), `AVG` over decimals, date arithmetic, string casts, every scalar
+function — DataFusion's (`approx_distinct`, `date_trunc`, `upper`) and every function a
+session installs — and `unnest`. A filter or a sort the engine runs above a database's
+rows stays above them; only a limit reaches the database.
 
 ## Cross-source joins
 
@@ -89,8 +167,9 @@ WHERE a.institution = 'MIT'
 ## Generate embeddings from external sources
 
 A database source feeds every verb a file does. A verb that names a source rather than a
-table — `generate_embeddings` among them — reads the source's first table in name order,
-so a database registered for one holds the table it reads first:
+table — `generate_embeddings` among them — reads the source's first table: its `public`
+schema's first relation in name order, or, with no `public` relation, the first schema's
+by name. A database registered for one holds the table it reads first:
 
 ```python
 db.generate_embeddings(

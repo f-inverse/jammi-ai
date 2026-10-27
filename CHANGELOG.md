@@ -174,6 +174,108 @@ The dependency audit is green again on the live advisory database.
   the image for the host's platform, so a CUDA-image run on an arm64 host failed before it
   began.
 
+Every request runs under its own tenant, a database is sent only what it reads as the engine
+does, and a database source reads, lists and verifies what it holds.
+
+- **Every request runs under its own tenant.** Flight SQL bound each query's tenant by
+  overwriting one process-wide binding, so two tenants querying at once each read the other's
+  rows about half the time, and a connection that bound no tenant inherited whichever tenant had
+  queried last, for its reads and for the sources it registered. A request now resolves its
+  tenant once, where it enters, and runs under it alone: its handler, every poll of its response
+  stream, and its query's own session configuration (`TenantConfig`), which the analyzer, the
+  mutable-table scan and sink, and the work DataFusion runs on other tasks read. A request that
+  names no tenant runs global on every verb. SQL cannot set a query's scope, and a plan planned
+  without one is refused. `TenantBoundProvider` is `ResolvedFlightScope`, a `FlightScope`, and
+  `GrpcChain` has no `flight_binding`.
+- **A tenant reaches only the sources it sees, by name as by listing.** A source resolved from
+  its catalog row whichever tenant owned it, so a tenant, or a request naming none, that named
+  another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
+  owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
+  the catalogs a query sees and `information_schema` list the same set. The cookbook's tenancy
+  chapters taught the cross-tenant read as a caveat; they now measure it as a hard zero, and a
+  global source with no discriminator as what every tenant shares.
+- **A database is sent only what it reads as the engine does.** Federation handed a
+  database the largest sub-plan over its tables whatever it contained, and some of it meant
+  something else there or did not exist there: MySQL read `||` as OR, `DATE - DATE` as a
+  number, `=` on strings case-insensitively, sorted NULLs first and failed `date_trunc`
+  (#743); Postgres was sent
+  `approx_distinct` (#750), a session's installed function in a `WHERE` (#765), and a decimal
+  `AVG` with more places than the engine planned (#745); a plan holding `unnest` crashed the
+  federation rule (#748). One allowlist, read through each database's semantics, now decides
+  what a database runs: Postgres compares strings for equality, concatenates, divides, sorts
+  non-string keys, averages numbers, counts distinct values and full-joins in the database;
+  MySQL does none of those. Everything else stays in the engine, over the rows the database
+  returns. The rows a database produces are a `RemoteExec`, a source no engine optimizer
+  reaches into, so a filter or sort above them stays above them: a `WHERE` on a Postgres column
+  of a Postgres × Parquet join had returned the rows it should have removed (#739). A live test runs every
+  admitted and refused construct over Postgres, over MySQL, and over the same rows in a file;
+  the MySQL one runs in a new `Test (MySQL)` lane against MySQL 8.4 (`ci/dev.sh --with mysql`).
+- **Every Postgres column reads as the value it holds, and none fails its source.** The
+  driver named a column's type from its type name and failed the whole source's registration
+  on one it did not know — a domain, `jsonb`, `citext`, `timetz` (#740) — failed every query
+  selecting `tsvector`, `inet`, `xml` or `bit`, and dropped every `timestamp` before 1970 from
+  its column, failing the batch (#744). The engine now reads a source's columns from
+  Postgres's own catalog and, column by column, reads a type as stored where the driver reads
+  it correctly and through Postgres where it does not: a domain as its base type, `money` as
+  `numeric(19, s)` (its binary form read `12.34` as `1234`, so `SUM` was 100 times too large;
+  #741), a `timestamp` as its instant at UTC (every session pins `TimeZone` to UTC), every
+  other type as its text.
+- **A Postgres source serves every schema, view and materialized view.** It served the base
+  tables of `public` alone, so a table in any other schema, a view and a materialized view
+  were "not found" (#754). It now serves every relation of every schema its role may use,
+  each under its own schema (`pg.sales.orders`). A source's table is a `SourceTable` — source,
+  schema and table, rendering its quoted reference — in place of a name callers wrote under
+  `public` by hand; `JammiSession::source_tables` lists them `public` first, and a verb that
+  names a source reads the first.
+- **A query over a stopped Postgres database fails at once, naming it.** The driver's pool
+  retried a refused connect for its whole 30 s timeout, then advised enlarging the pool
+  (#742). A connect the pool has not answered within 250 ms now probes the database's address:
+  a refusal, an unresolved host or no answer fails the query at once as `Unavailable`, naming
+  the address and the cause; a reachable database leaves the query waiting on a busy pool.
+  Every Postgres read runs through one path that keeps that error typed, where the driver's
+  flattened it to text.
+- **A client lists a source's tables and their columns, on either transport.** A remote client
+  had no way to: `list_sources` and `describe_source` carried no tables, and `information_schema`
+  is off on a server, where a `SET` does not carry from one request to the next (#751).
+  `describe_source` now returns the source's descriptor and every table it serves, each with its
+  schema, name and columns as the engine reads them, reaching the source to read them;
+  `list_sources` still reads the registry alone. The server guide lists embedding tables through
+  `list_sources`, where it queried `information_schema`. **BREAKING** (wire, Rust API, Python):
+  `DescribeSource` returns a `SourceDescription`, and so does `describe_source` in `jammi_db`,
+  `jammi_ai` and `jammi_admin`; Python's dict gains `tables`, each `{"schema", "table",
+  "columns"}` with `columns` a `pyarrow.Schema`, and a remote descriptor's `source_type` reads
+  `file`, `postgres` or `mysql`, as the embedded one does, where it read `File`, `Postgres` or
+  `MySql`. Both transports project the one serialized reply, so an embedded descriptor's
+  `result_tables` carry the remote keys (`table_name`, `source_id`, `model_id`, `dimensions`,
+  `row_count`, `status`, `key_column`, `kind`, `derived_from`), where they carried the whole
+  catalog row.
+- **A database source verifies its server against a CA the client hands over.** A remote client
+  had no way to: a server whose certificate a private CA signed was reachable only unverified
+  (`sslmode=preferred` skips verification) or with the CA added to the server's own trust store
+  (#753). `SourceConnection.ca_certificate` holds the CA as PEM text, on the wire and in Python's
+  `add_source(..., ca_certificate=...)`; the source then connects with a mode that verifies —
+  `required` for MySQL, `verify-full` for Postgres unless its URL names `verify-ca` — and a URL
+  naming a mode that does not verify is refused with it, as is a file source holding one. Live
+  tests serve Postgres and MySQL over TLS and register a source holding the server's CA (it
+  connects) and one holding an unrelated CA (it is refused). **BREAKING** (Rust API):
+  `SourceConnection.options`, a map passed to the driver that no remote client could set and the
+  URL already carries, is gone.
+- **A list column breaks down by item in every form.** `FROM t CROSS JOIN unnest(f(t.c)) AS
+  u(x)` failed to plan on every source: DataFusion plans a lateral `unnest` as a correlated
+  subquery over one empty row, which its decorrelation does not reach (#748). An optimizer rule,
+  `lateral_unnest`, plans the subquery's projections and unnests over the join's left side, its
+  outer references read as that side's columns, so the lateral and select-list forms answer alike
+  over a file, Postgres and MySQL.
+- **A mutable table has no chunk size.** The definition's `chunk_size` and its builder
+  method, the wire field and the Python `chunk_size=` argument
+  set a value no read consulted: `scan_after` returns its rows whole and a trigger replay steps
+  by a fixed size of its own. **BREAKING** (Rust API, wire, Python): they are gone, and field 6
+  of `jammi.v1.catalog.MutableTableDefinition` is reserved.
+- **Every discarded result is handled as what it means** (#731). The workspace's 487 `let _ =`
+  sites are propagated, matched with each outcome named, or not produced. Three tests that passed
+  by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
+  while unwinding, and a guard keeps the pattern out.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

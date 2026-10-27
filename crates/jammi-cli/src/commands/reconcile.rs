@@ -45,43 +45,36 @@ pub async fn run(
 /// [`run`] so a unit test can exercise it against a hand-built report with
 /// no server round trip.
 fn render(report: &ReconcileReport) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "scope:           {}", report.scope);
-    let _ = writeln!(out, "applied:         {}", report.applied);
-    let _ = writeln!(
-        out,
-        "rows_failed:     {}",
-        join_capped(&report.rows_failed, report.rows_failed_count)
-    );
-    let _ = writeln!(
-        out,
-        "orphans:         {}",
-        join_capped(&report.orphans, report.orphan_count)
-    );
-    let _ = writeln!(
-        out,
-        "pending:         {}",
-        join_capped(&report.pending, report.pending_count)
-    );
-    let _ = writeln!(
-        out,
-        "unattributed:    {}",
-        join_capped(&report.unattributed, report.unattributed_count)
-    );
-    let _ = writeln!(
-        out,
-        "damaged:         {}",
-        join_capped(&report.damaged, report.damaged_count)
-    );
-    let _ = writeln!(
-        out,
-        "referenced:      {}",
-        join_capped(&report.referenced, report.referenced_count)
-    );
-    let _ = writeln!(out, "truncated:       {}", report.truncated);
-    let _ = writeln!(out, "bytes_reclaimed: {}", report.bytes_reclaimed);
-    out
+    [
+        ("scope", report.scope.to_string()),
+        ("applied", report.applied.to_string()),
+        (
+            "rows_failed",
+            join_capped(&report.rows_failed, report.rows_failed_count),
+        ),
+        ("orphans", join_capped(&report.orphans, report.orphan_count)),
+        (
+            "pending",
+            join_capped(&report.pending, report.pending_count),
+        ),
+        (
+            "unattributed",
+            join_capped(&report.unattributed, report.unattributed_count),
+        ),
+        (
+            "damaged",
+            join_capped(&report.damaged, report.damaged_count),
+        ),
+        (
+            "referenced",
+            join_capped(&report.referenced, report.referenced_count),
+        ),
+        ("truncated", report.truncated.to_string()),
+        ("bytes_reclaimed", report.bytes_reclaimed.to_string()),
+    ]
+    .into_iter()
+    .map(|(label, value)| format!("{:<17}{value}\n", format!("{label}:")))
+    .collect()
 }
 
 /// Render a key list as a comma-separated line, or `—` when empty — the same

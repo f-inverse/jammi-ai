@@ -472,6 +472,12 @@ struct ForeignConn<'a> {
 
 impl ForeignConn<'_> {
     /// Run `sql`, returning the SQLite result code and any error message.
+    /// Wait up to five seconds for a lock rather than failing at once.
+    fn wait_when_busy(&self) {
+        let (rc, msg) = self.exec("PRAGMA busy_timeout = 5000");
+        assert_eq!(rc, 0, "PRAGMA busy_timeout: {msg}");
+    }
+
     fn exec(&self, sql: &str) -> (c_int, String) {
         let csql = CString::new(sql).unwrap();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -647,13 +653,12 @@ fn spawn_engine_load(
                     let res = backend
                         .transaction(TxOptions::default(), move |tx| {
                             Box::pin(async move {
-                                let _ = tx
-                                    .query_opt(
-                                        "SELECT v FROM foreign_probe WHERE id = 1",
-                                        &[],
-                                        |r| r.get::<String>("v"),
-                                    )
-                                    .await?;
+                                tx.query_opt(
+                                    "SELECT v FROM foreign_probe WHERE id = 1",
+                                    &[],
+                                    |r| r.get::<String>("v"),
+                                )
+                                .await?;
                                 tx.execute(
                                     "UPDATE foreign_probe SET v = $1 WHERE id = 1",
                                     &[SqlValue::TextOwned(value)],
@@ -887,7 +892,7 @@ fn child_main(role: Role) -> ! {
                         continue;
                     }
                 };
-                let _ = conn.exec("PRAGMA busy_timeout = 5000");
+                conn.wait_when_busy();
                 let (rc, msg) = conn.exec(&format!(
                     "UPDATE foreign_probe SET v = 'foreign-{i}' WHERE id = 1"
                 ));
@@ -929,7 +934,7 @@ fn child_main(role: Role) -> ! {
                     Ok(c) => c,
                     Err(rc) => tripped(format!("round {i}: foreign open failed rc={rc}")),
                 };
-                let _ = conn.exec("PRAGMA busy_timeout = 5000");
+                conn.wait_when_busy();
                 let (rc, msg) = conn.exec(&format!(
                     "UPDATE foreign_probe SET v = '{foreign_value}' \
                      WHERE id = 1 AND v = '{engine_value}'"
@@ -977,7 +982,7 @@ fn child_main(role: Role) -> ! {
             // Reverse direction: the foreign connection stays open and keeps
             // committing while ENGINE pools open and close underneath it.
             let conn = lib.open(&db_path).expect("foreign connection");
-            let _ = conn.exec("PRAGMA busy_timeout = 5000");
+            conn.wait_when_busy();
             for i in 0..FOREIGN_CYCLES {
                 eprintln!("[child] phase: churn {i} open");
                 let churned = match try_open_engine(&rt, dir.path()) {
@@ -1684,8 +1689,8 @@ fn role_round_trip_and_totality_covers_all_ten_variants() {
         );
         // Both are total functions over every variant — calling them must
         // not panic for any role.
-        let _ = role.synthetic();
-        let _ = role.expected_terminus();
+        role.synthetic();
+        role.expected_terminus();
     }
 }
 

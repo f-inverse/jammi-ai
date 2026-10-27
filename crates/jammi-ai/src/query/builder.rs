@@ -21,7 +21,6 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{Admission, FiniteQuery, SearchMethod};
 use jammi_db::session::QueryContext;
-use jammi_db::sql::source_relation;
 use jammi_db::store::manifest::ProducingDescriptor;
 use jammi_db::ChannelId;
 
@@ -156,8 +155,7 @@ impl QueryBuilder {
         channel: &str,
     ) -> Result<Self> {
         if let Some(ref key_col) = table.key_column {
-            let source_table_name = session.find_table_name(&table.source_id).await?;
-            let relation = source_relation(&table.source_id, &source_table_name);
+            let relation = session.first_table(&table.source_id).await?;
             let source_cols =
                 build_hydration_select(session.context(), &relation, key_col, &plan.schema())
                     .await?;
@@ -298,8 +296,8 @@ impl QueryBuilder {
             _ => JoinType::Left,
         };
 
-        let table_name = self.session.find_table_name(source).await?;
-        let sql = format!("SELECT * FROM {}", source_relation(source, &table_name));
+        let table = self.session.first_table(source).await?;
+        let sql = format!("SELECT * FROM {table}");
         let df = self
             .session
             .context()
@@ -508,8 +506,7 @@ async fn admitted_rows(
                 .to_string(),
             actual: "none".to_string(),
         })?;
-    let source_table_name = session.find_table_name(&table.source_id).await?;
-    let relation = source_relation(&table.source_id, &source_table_name);
+    let relation = session.first_table(&table.source_id).await?;
     let batches = session
         .context()
         .sql(&format!(
@@ -528,12 +525,12 @@ async fn admitted_rows(
 
 async fn build_hydration_select(
     ctx: &QueryContext,
-    table_ref: &str,
+    table: &jammi_db::source::SourceTable,
     key_col: &str,
     result: &arrow::datatypes::Schema,
 ) -> Result<String> {
     let df = ctx
-        .sql(&format!("SELECT * FROM {table_ref} LIMIT 0"))
+        .sql(&format!("SELECT * FROM {table} LIMIT 0"))
         .await
         .map_err(|e| JammiError::from(e.context("Schema introspection")))?;
     let schema = df.schema();
@@ -550,7 +547,7 @@ async fn build_hydration_select(
                 continue;
             }
             return Err(JammiError::Schema {
-                table: table_ref.to_string(),
+                table: table.to_string(),
                 column: name.to_string(),
                 expected: "a source column named unlike the search result's own columns"
                     .to_string(),

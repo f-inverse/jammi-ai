@@ -199,7 +199,10 @@ impl GpuScheduler {
                     "GPU memory probe failed ({e}); GPU memory admission disabled (unlimited)"
                 );
                 #[cfg(not(feature = "cuda"))]
-                let _ = &e;
+                tracing::debug!(
+                    gpu_device,
+                    "GPU memory probe failed ({e}), as a build without CUDA does"
+                );
                 Ok(if cfg!(feature = "metal") {
                     Self::unbudgeted(1)
                 } else {

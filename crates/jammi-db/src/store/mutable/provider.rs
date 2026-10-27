@@ -33,6 +33,8 @@ use datafusion::prelude::Expr;
 
 use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
 use crate::error::JammiError;
+use crate::tenant::TenantId;
+use crate::tenant_scope::TenantConfig;
 
 use super::definition::{MutableTableDefinition, MutableTableError};
 use super::sink::{
@@ -40,11 +42,13 @@ use super::sink::{
 };
 use super::{keys_predicate, owned_rows, visible_rows, MutableBackend};
 
-/// `TableProvider` for one mutable companion table.
+/// `TableProvider` for one mutable companion table. Every read and write
+/// runs under the tenant scope of the query that plans it
+/// ([`TenantConfig`]): a scan from the state planning it, a write from the
+/// task context running it.
 pub struct MutableTableProvider {
     pub(crate) def: Arc<MutableTableDefinition>,
     pub(crate) backend: Arc<dyn MutableBackend>,
-    pub(crate) tenant: crate::tenant_scope::TenantBinding,
 }
 
 impl fmt::Debug for MutableTableProvider {
@@ -56,36 +60,28 @@ impl fmt::Debug for MutableTableProvider {
 }
 
 impl MutableTableProvider {
-    pub fn new(
-        def: Arc<MutableTableDefinition>,
-        backend: Arc<dyn MutableBackend>,
-        tenant: crate::tenant_scope::TenantBinding,
-    ) -> Self {
-        Self {
-            def,
-            backend,
-            tenant,
-        }
+    pub fn new(def: Arc<MutableTableDefinition>, backend: Arc<dyn MutableBackend>) -> Self {
+        Self { def, backend }
     }
 
     /// Read all rows from the backend table into a single in-memory partition.
     /// This is the unsophisticated scan path — the entire table is read with
     /// the tenant-scope predicate pushed down to backend SQL, then DataFusion
     /// applies projection / additional filters above the scan node.
-    async fn read_to_batch(&self, limit: Option<usize>) -> Result<RecordBatch, DataFusionError> {
+    async fn read_to_batch(
+        &self,
+        scope: TenantConfig,
+        limit: Option<usize>,
+    ) -> Result<RecordBatch, DataFusionError> {
         // Inject the tenant-scope predicate at the backend SQL layer so we
         // ship the correct row set off the SQLite/Postgres side, not just
         // the union (which DataFusion's AnalyzerRule would also filter, but
         // at the cost of materializing the full table first).
         //
-        // Skip the predicate entirely when the caller is executing inside a
-        // `JammiSession::with_admin_scope` closure: cross-tenant
-        // administrative scans (server-startup recovery, audit reads) need
-        // rows from every tenant. The analyzer-rule bypass on its own would
-        // still leave the provider's SQL filter in place, so the provider
-        // must consult the same marker.
-        let visible = (!crate::tenant_scope::TenantBinding::is_admin_scope())
-            .then(|| visible_rows(self.tenant.current_tenant()));
+        // An admin scope reads every tenant's rows (server-startup recovery,
+        // audit reads); the analyzer rule injects no predicate for it, and
+        // neither does the backend SQL.
+        let visible = (!scope.every_tenant()).then(|| visible_rows(scope.tenant()));
         let def = Arc::clone(&self.def);
         let backend = Arc::clone(&self.backend);
         self.backend
@@ -129,13 +125,13 @@ impl MutableTableProvider {
     /// session) is left in place. Returns the number of rows rewritten.
     pub(crate) async fn rewrite_rows(
         &self,
+        tenant: Option<TenantId>,
         old: RecordBatch,
         new: Option<RecordBatch>,
     ) -> Result<u64, JammiError> {
         let (old, new) = distinct_rows(&self.def, old, new)?;
         let def = Arc::clone(&self.def);
         let backend = Arc::clone(&self.backend);
-        let tenant = self.tenant.current_tenant();
         let settled = self
             .backend
             .catalog_backend()
@@ -197,7 +193,8 @@ impl TableProvider for MutableTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let batch = self.read_to_batch(limit).await?;
+        let scope = TenantConfig::of(state.config_options())?;
+        let batch = self.read_to_batch(scope, limit).await?;
         let schema = batch.schema();
         let mem = MemTable::try_new(schema, vec![vec![batch]])?;
         mem.scan(state, projection, filters, limit).await
@@ -212,7 +209,6 @@ impl TableProvider for MutableTableProvider {
         let sink = Arc::new(MutableTableSink::new(
             Arc::clone(&self.def),
             Arc::clone(&self.backend),
-            self.tenant.clone(),
             KeyConflict::try_from(insert_op)?,
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
@@ -224,7 +220,7 @@ impl TableProvider for MutableTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let def = Arc::clone(&self.def);
         let backend = Arc::clone(&self.backend);
-        let tenant = self.tenant.current_tenant();
+        let tenant = TenantConfig::of(state.config_options())?.tenant();
         let deleted = self
             .backend
             .catalog_backend()

@@ -78,11 +78,7 @@ async fn build_harness_with_broker(
     // (`get_mutable_table`) and a row scan resolve the same tenant. A divergent
     // binding would let the registry believe it is tenant-scoped while the
     // catalog reads unscoped, silently missing the tenant's backing tables.
-    let tenant_binding = TenantBinding::unscoped();
-    tenant_binding.set_shared(match tenant {
-        Some(t) => TenantContext::Scoped(t),
-        None => TenantContext::Unscoped,
-    });
+    let tenant_binding = TenantBinding::bound_to(TenantContext::from_option(tenant));
     let catalog = Arc::new(Catalog::from_backend_with_tenant(
         backend_impl,
         Some(tenant_binding.clone()),
@@ -306,11 +302,11 @@ async fn broadcast_fan_out_to_two_subscribers(backend: BackendKind) {
         tokio::select! {
             biased;
             Some(b) = stream_x.next() => {
-                let _ = b.unwrap();
+                b.expect("a delivered batch");
                 count_x += 1;
             }
             Some(b) = stream_y.next() => {
-                let _ = b.unwrap();
+                b.expect("a delivered batch");
                 count_y += 1;
             }
         }

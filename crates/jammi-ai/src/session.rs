@@ -7,8 +7,9 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{FiniteQuery, SearchMethod};
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
+use jammi_db::source::SourceTable;
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 
 use crate::eval::runner::EvalRunner;
@@ -679,6 +680,15 @@ impl InferenceSession {
             .await
     }
 
+    /// Describe one registered source: its descriptor and every table it serves
+    /// with its columns ([`JammiSession::describe_source`]).
+    pub async fn describe_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<jammi_db::source::SourceDescription>> {
+        self.inner.describe_source(source_id).await
+    }
+
     /// Remove a source and all associated state (result tables, disk files,
     /// ANN cache, DataFusion registration). Eval runs are preserved.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
@@ -873,24 +883,29 @@ impl InferenceSession {
         )
     }
 
-    /// Run `f` with `tenant` bound for the duration of the closure's future.
+    /// Run `f` with `tenant` bound for the duration of the closure's future:
+    /// how a session shared between requests scopes each one. Concurrent
+    /// invocations from different tasks each see their own `tenant`.
     ///
-    /// The binding is installed as a Tokio task-local that shadows the
-    /// session's sticky shared binding for the executing task only.
-    /// Concurrent invocations from different tasks each see their own
-    /// `tenant`; no race exists on the shared
-    /// `Arc<RwLock<TenantContext>>` because no shared write happens in the
-    /// scoped path.
-    ///
-    /// Delegates to [`jammi_db::session::JammiSession::with_tenant_scoped`];
-    /// see that method for the design rationale (Option β: task-local
-    /// override rather than per-call session rebuild).
+    /// Delegates to [`jammi_db::session::JammiSession::with_tenant_scoped`].
     pub async fn with_tenant_scoped<'a, F, Fut, T>(&'a self, tenant: jammi_db::TenantId, f: F) -> T
     where
         F: FnOnce(jammi_db::TenantScope<'a>) -> Fut,
         Fut: std::future::Future<Output = T> + 'a,
     {
         self.inner.with_tenant_scoped(tenant, f).await
+    }
+
+    /// Run `f` under one request's scope: `tenant`'s, or global when the
+    /// request names none, whatever tenant the session is bound to.
+    ///
+    /// Delegates to [`jammi_db::session::JammiSession::with_request_scope`].
+    pub async fn with_request_scope<F, Fut, T>(&self, tenant: Option<jammi_db::TenantId>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.inner.with_request_scope(tenant, f).await
     }
 
     /// Run `f` inside the bound tenant's scope when one is bound, so every
@@ -942,7 +957,7 @@ impl InferenceSession {
         InferenceRuntime {
             model: Arc::new(crate::inference::runtime::TenantScopedModels::capture(
                 Arc::clone(&self.model_cache),
-                self.tenant_binding_arc(),
+                &self.inner.tenant_binding_arc(),
             )),
             observer: self.observer.clone(),
         }
@@ -992,13 +1007,6 @@ impl InferenceSession {
     /// Access the engine configuration.
     pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
-    }
-
-    /// Shared handle to the engine's tenant binding. The server's
-    /// Flight SQL `TenantBoundProvider` updates this for the duration of
-    /// each query so the analyzer rule scopes rows to the bound tenant.
-    pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {
-        self.inner.tenant_binding_arc()
     }
 
     /// Access the ANN cache.
@@ -1572,8 +1580,8 @@ impl InferenceSession {
             });
         }
 
-        let table_name = self.find_table_name(source_id).await?;
-        let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
+        let table = self.first_table(source_id).await?;
+        let query = self.build_source_query(&table, key_column, content_columns);
         let input_plan = self.plan_source_query(&query).await?;
         // Describe the model for the schema and the definition: its width,
         // its regression head's form, and the identity the environment
@@ -1725,8 +1733,7 @@ impl InferenceSession {
     /// plan reads by name in both roles.
     pub(crate) fn build_source_query(
         &self,
-        source_id: &str,
-        table_name: &str,
+        table: &SourceTable,
         key_column: &str,
         content_columns: &[String],
     ) -> String {
@@ -1756,7 +1763,7 @@ impl InferenceSession {
             "SELECT {select_list}, {}({hash_args}) AS {} FROM {}",
             crate::query::CONTENT_HASH_UDF_NAME,
             jammi_db::store::schema::CONTENT_HASH_COLUMN,
-            source_relation(source_id, table_name)
+            table
         )
     }
 
@@ -1783,13 +1790,13 @@ impl InferenceSession {
         df.create_physical_plan().await.map_err(scan_error)
     }
 
-    /// The first table a source serves, resolved through the catalog's
-    /// `sources` row ([`JammiSession::source_table_names`]) — a source
-    /// registered on any replica resolves here, and a missing one is
-    /// [`JammiError::NotFound`].
-    pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
+    /// The first table a source serves, in its order ([`SourceTable`]'s),
+    /// resolved through the catalog's `sources` row
+    /// ([`JammiSession::source_tables`]) — a source registered on any replica
+    /// resolves here, and a missing one is [`JammiError::NotFound`].
+    pub(crate) async fn first_table(&self, source_id: &str) -> Result<SourceTable> {
         self.inner
-            .source_table_names(source_id)
+            .source_tables(source_id)
             .await?
             .into_iter()
             .next()

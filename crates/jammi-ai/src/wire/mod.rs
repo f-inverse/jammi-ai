@@ -27,7 +27,7 @@ pub use catalog::{
     add_channel_columns_from_bytes, add_channel_columns_from_proto,
     create_mutable_table_from_bytes, create_mutable_table_from_proto, register_channel_from_bytes,
     register_channel_from_proto, register_topic_from_bytes, register_topic_from_proto,
-    AddChannelColumnsArgs,
+    source_description_to_bytes, source_descriptors_to_bytes, AddChannelColumnsArgs,
 };
 pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,

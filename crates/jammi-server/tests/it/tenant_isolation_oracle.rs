@@ -59,6 +59,8 @@ use prost::Message;
 use prost_types::FileDescriptorSet;
 use tempfile::{tempdir, TempDir};
 
+use super::common::grpc::start_engine_server_over_session;
+
 // ---------------------------------------------------------------------------
 // Derived wire surface
 // ---------------------------------------------------------------------------
@@ -1203,7 +1205,7 @@ fn cases() -> Vec<IsolationCase> {
         ),
         // `asof_join` reads two tenant-scoped SOURCE relations (not embedding
         // tables): it resolves each through the session's tenant-scoped catalog
-        // (`find_table_name` over the per-tenant source list), so a caller cannot
+        // (`first_table` over the per-tenant source list), so a caller cannot
         // point either side at another tenant's relation. The join runs no model,
         // so this gate — source resolution — is the whole tenant boundary, and it
         // is asserted for real here. A peer cannot even resolve tenant A's source
@@ -1212,7 +1214,7 @@ fn cases() -> Vec<IsolationCase> {
             assert_source_resolver_isolated().await;
         }),
         // `build_lexical_index` reads one registered SOURCE, resolved through
-        // the session's tenant-scoped catalog (`find_table_name`) before any
+        // the session's tenant-scoped catalog (`first_table`) before any
         // row is planned, so source resolution is its whole tenant boundary —
         // the gate `AsofJoin` rides.
         case!(
@@ -1227,7 +1229,7 @@ fn cases() -> Vec<IsolationCase> {
         // `generate_structure_embeddings` reads no embedding table and runs no
         // model: its one input is the edge relation, a registered SOURCE it
         // resolves through the session's tenant-scoped catalog
-        // (`find_table_name`, inside `require_source_columns`) before any row
+        // (`first_table`, inside `require_source_columns`) before any row
         // is planned — and the edge scan itself runs through the tenant-scope
         // analyzer rule. Source resolution is therefore the whole tenant
         // boundary, the gate `AsofJoin` rides, asserted for real here.
@@ -1846,35 +1848,65 @@ async fn assert_lexical_isolated() {
     );
 }
 
-/// `asof_join` resolves its two input relations through the tenant-scoped source
-/// catalog: a peer cannot resolve a tenant's registered source, so it cannot
-/// point either side of the join at that source. This drives the real source
-/// resolution gate — `get_source` / `list_sources` are tenant-filtered.
+/// Source resolution is tenant-scoped on every path a verb or a query takes:
+/// tenant A's private source resolves for A, and for tenant B — or a caller
+/// that names no tenant — it is not found by its table listing, by name in
+/// SQL, nor among the catalogs `information_schema` lists. The source holds
+/// no tenant column, so nothing but resolution stands between B and its rows.
 async fn assert_source_resolver_isolated() {
-    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
-    cat_a
-        .register_source("asof_src_a", SourceType::File, &parquet_connection())
+    let dir = tempdir().unwrap();
+    let session = JammiSession::new(test_config(dir.path())).await.unwrap();
+    let session = &session;
+    session
+        .with_tenant_scoped(tenant_a(), |_| async move {
+            session
+                .add_source("asof_src_a", SourceType::File, parquet_connection())
+                .await
+        })
         .await
         .unwrap();
-    assert!(
-        cat_a.get_source("asof_src_a").await.unwrap().is_some(),
-        "tenant A must resolve its own asof_join input source"
-    );
-    assert!(
-        cat_b.get_source("asof_src_a").await.unwrap().is_none(),
-        "CROSS-TENANT LEAK: tenant B resolved tenant A's source to asof-join against it"
-    );
-    let b_ids: Vec<String> = cat_b
-        .list_sources()
+    let query = "SELECT COUNT(*) AS n FROM asof_src_a.public.patents";
+    session
+        .with_tenant_scoped(tenant_a(), |scope| async move { scope.sql(query).await })
         .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.source_id)
-        .collect();
-    assert!(
-        !b_ids.contains(&"asof_src_a".to_string()),
-        "CROSS-TENANT READ LEAK: tenant B lists tenant A's asof_join source: {b_ids:?}"
-    );
+        .expect("tenant A reads its own source");
+
+    let tables = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || session.source_tables("asof_src_a"))
+            .await
+    };
+    let rows = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || session.sql(query))
+            .await
+    };
+    let catalogs = |tenant: Option<TenantId>| async move {
+        session
+            .with_request_scope(tenant, || async {
+                session.context().state().catalog_list().catalog_names()
+            })
+            .await
+    };
+    assert!(tables(Some(tenant_a())).await.is_ok());
+    assert!(catalogs(Some(tenant_a()))
+        .await
+        .contains(&"asof_src_a".to_string()));
+    for (who, tenant) in [("tenant B", Some(tenant_b())), ("an unscoped caller", None)] {
+        let err = tables(tenant).await.expect_err(who);
+        assert_eq!(
+            err.class(),
+            jammi_db::error::ErrorClass::NotFound,
+            "CROSS-TENANT LEAK: {who} resolved tenant A's source: {err}"
+        );
+        rows(tenant).await.expect_err(&format!(
+            "CROSS-TENANT READ LEAK: {who} read tenant A's source by name"
+        ));
+        assert!(
+            !catalogs(tenant).await.contains(&"asof_src_a".to_string()),
+            "CROSS-TENANT LEAK: {who} lists tenant A's source"
+        );
+    }
 }
 
 /// `verify_materialization` recomputes the stored Parquet digest and checks it
@@ -2963,15 +2995,19 @@ async fn assert_prune_jobs_isolated() {
     );
 }
 
-/// Flight SQL `DoGet` runs `sql` against the session's tenant-scoped provider.
-/// Two tenants insert into the same mutable table; each `SELECT` returns only
-/// its own rows — cross-tenant rows are never returned.
+/// Flight SQL isolation over the real `db.sql` lane, under concurrency. One
+/// shared engine serves both tenants (the realistic server topology); each
+/// tenant writes its row through its own scope, then the two tenants' Flight
+/// SQL reads interleave, each session's tenant resolved from its
+/// `jammi-session-id` by the server's Flight scope. Every read returns its own
+/// tenant's row alone.
 async fn assert_flight_sql_isolated() {
-    // One shared session (the realistic server topology); the table is created
-    // once (unscoped) so both tenants address the same backing storage, and
-    // per-tenant scopes via `with_tenant_scoped` are what separate the rows.
     let dir = tempdir().unwrap();
-    let session = Arc::new(JammiSession::new(test_config(dir.path())).await.unwrap());
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
     let def = MutableTableDefinitionBuilder::new(
         MutableTableId::new("widgets").unwrap(),
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
@@ -2979,10 +3015,9 @@ async fn assert_flight_sql_isolated() {
     .primary_key(vec!["id".into()])
     .build()
     .unwrap();
-    session.create_mutable_table(def).await.unwrap();
-
-    async fn insert(session: &JammiSession, tenant: TenantId, id: i64) {
-        session
+    engine.create_mutable_table(def).await.unwrap();
+    for (tenant, id) in [(tenant_a(), 1_i64), (tenant_b(), 2)] {
+        engine
             .with_tenant_scoped(tenant, |scope| async move {
                 scope
                     .sql(&format!(
@@ -2993,40 +3028,50 @@ async fn assert_flight_sql_isolated() {
             })
             .await;
     }
-    insert(&session, tenant_a(), 1).await;
-    insert(&session, tenant_b(), 2).await;
 
-    let ids_a = select_ids(&session, tenant_a()).await;
-    let ids_b = select_ids(&session, tenant_b()).await;
-    assert_eq!(
-        ids_a,
-        vec![1],
-        "tenant A's Flight SQL read returns only its row"
-    );
-    assert_eq!(
-        ids_b,
-        vec![2],
-        "tenant B's Flight SQL read returns only its row"
-    );
-}
-
-async fn select_ids(session: &JammiSession, tenant: TenantId) -> Vec<i64> {
-    session
-        .with_tenant_scoped(tenant, |scope| async move {
-            let rows = scope
+    let (addr, _shutdown, _serve) = start_engine_server_over_session(Arc::clone(&engine)).await;
+    let reads = |tenant: TenantId| async move {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+        let client = jammi_client::DataClient::connect(endpoint).await.unwrap();
+        client.bind_tenant(tenant).await.unwrap();
+        let mut reads = Vec::new();
+        for _ in 0..20 {
+            let rows = client
                 .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
                 .await
                 .unwrap();
-            let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+            reads.push(ids_of(&rows));
+        }
+        reads
+    };
+    let (reads_a, reads_b) = tokio::join!(
+        tokio::spawn(reads(tenant_a())),
+        tokio::spawn(reads(tenant_b()))
+    );
+    let (reads_a, reads_b) = (reads_a.unwrap(), reads_b.unwrap());
+    assert!(
+        reads_a.iter().all(|ids| ids == &[1]),
+        "tenant A's Flight SQL reads return only its row: {reads_a:?}"
+    );
+    assert!(
+        reads_b.iter().all(|ids| ids == &[2]),
+        "tenant B's Flight SQL reads return only its row: {reads_b:?}"
+    );
+}
+
+/// The `id` column of `rows`, in order.
+fn ids_of(rows: &[RecordBatch]) -> Vec<i64> {
+    rows.iter()
+        .flat_map(|batch| {
             let col = batch
                 .column_by_name("id")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            (0..col.len()).map(|i| col.value(i)).collect()
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
         })
-        .await
+        .collect()
 }
 
 /// Result-table SCAN isolation over the real `db.sql` lane.

@@ -11,12 +11,16 @@ mod channels;
 mod common;
 mod concurrent_writers;
 mod create_table_as;
+#[cfg(any(feature = "live-postgres-tests", feature = "live-mysql-tests"))]
+mod database_tls;
 mod datafusion_version;
 mod docs_config_fences;
 mod domain_hash_prefix_free_gate;
 mod ephemeral;
 mod eval_per_query;
 mod exact_search;
+#[cfg(feature = "live-postgres-tests")]
+mod federated_filters;
 mod foundation;
 mod freshness;
 mod gang_instance_freshness;
@@ -47,12 +51,22 @@ mod models_delete_call_sites;
 mod mutable_crash_recovery;
 mod mutable_federation;
 mod mutable_tables;
+#[cfg(feature = "live-postgres-tests")]
+mod postgres_money;
+#[cfg(feature = "live-postgres-tests")]
+mod postgres_outage;
+#[cfg(feature = "live-postgres-tests")]
+mod postgres_relations;
+#[cfg(feature = "live-postgres-tests")]
+mod postgres_types;
 mod read_vectors;
 mod reconcile;
 mod reconcile_artifacts;
 mod recovery;
 mod register_computed_embedding;
 mod registry_read_only;
+#[cfg(any(feature = "live-postgres-tests", feature = "live-mysql-tests"))]
+mod remote_conformance;
 #[cfg(feature = "test-hooks")]
 mod rendezvous_ring;
 mod replace_table;
@@ -74,3 +88,4 @@ mod trigger;
 mod trigger_multi_replica_offsets;
 mod trigger_replay_column_types;
 mod trigger_replay_row_order;
+mod unnest_forms;

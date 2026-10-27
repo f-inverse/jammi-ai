@@ -38,7 +38,7 @@ Fires on: pr, main.
 | `image-cuda-merge` | ubuntu | ghcr | pr, main | - | - | Promotes the CUDA image's leg to its one reference through the same merge every image goes through. |
 | `image-latest` | ubuntu | ghcr | main | - | - | Points the CI images' `:latest` alias, which the devcontainer builds FROM, at main's tree. |
 | `devcontainer-image` | ubuntu | - | pr | - | - | The devcontainer image builds; it is never published. |
-| `fmt-clippy` | cpu-image | - | pr, main | - | - | The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles. |
+| `fmt-clippy` | cpu-image | - | pr, main | - | - | The workspace is formatted and lints clean; its database source drivers lint in the gated jammi-db leg, which compiles both. |
 | `clippy-gated` | cpu-image x6 | - | pr, main | - | - | Every test surface compiled only under a feature naming a host resource, or the live hub, lints clean (`check_lint_surface_closure.py` asserts every gated surface has a lane). |
 | `clippy-cuda` | cuda-image x7 | cutlass, nccl | pr, main | - | - | Every CUDA-gated surface compiles and lints under nvcc with no device, one leg per feature graph; `flash-attn` stays unreachable from `cuda`, so jammi-ai is linted without it. |
 | `clippy-metal` | macos | - | pr, main | - | - | The Metal-gated surfaces lint clean; a hosted macOS runner cannot construct a Metal device, so they run on Apple-silicon hardware. |
@@ -48,6 +48,7 @@ Fires on: pr, main.
 | `test-storage-cloud` | cpu-image | - | pr | - | - | The cloud drivers' root-identity determinants, compiled only under the shipped `storage-cloud` graph. |
 | `test-python-rust` | cpu-image | - | pr | - | - | The `jammi-python` crate's Rust tests link libpython against the image's interpreter, outside the archive maturin would build. |
 | `test-pg` | cpu-image | postgres | pr | - | - | The backend-parameterised suites' Postgres arms, each test on a database of its own, four at a time (the server's connection budget). |
+| `test-mysql` | cpu-image | mysql | pr | - | - | The MySQL source's tests against a live MySQL: every construct a query can hold answers over MySQL as over the same rows in a file. |
 | `test-live` | cpu-image | hub-token | main | - | - | The tests `live-hub-tests` adds, against the live model hub: a verdict main measures, so a hub outage reds main until it is measured again. |
 | `perf-gate` | cpu-image | - | main | - | - | Every CPU-hermetic `*-scale` tier against its committed floor, and a proof the gate bites: measured on main only, because a hosted runner's throughput jitters and a per-PR rate gate would flap. |
 | `distributed-build` | cpu-image | - | pr, main | `distributed-jammi-ai`, `distributed-jammi-bench` | - | Compiles the `jammi-server` the distributed harness spawns, with the S3 driver its workers publish through, and archives each crate's distributed test binary with it. |

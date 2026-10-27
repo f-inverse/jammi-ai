@@ -6,6 +6,7 @@ use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTa
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::{JammiError, Missing};
+use jammi_db::source::SourceTable;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
@@ -1258,19 +1259,15 @@ fn catalog_names(session: &JammiSession) -> Vec<String> {
 #[tokio::test]
 async fn a_postgres_database_registered_by_its_url_joins_a_file() {
     use jammi_db::source::SourceDefinition;
-    use sqlx::{Connection, Executor, PgConnection};
 
     // The source is a database holding exactly this test's table.
     let source_dir = tempdir().unwrap();
-    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
-    let mut db = PgConnection::connect(&url).await.unwrap();
-    db.execute(
+    let url = jammi_test_utils::postgres_database_holding(
+        source_dir.path(),
         "CREATE TABLE ratings (id BIGINT PRIMARY KEY, stars INTEGER NOT NULL); \
          INSERT INTO ratings VALUES (1, 5), (2, 3), (3, 4);",
     )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
+    .await;
 
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
@@ -1423,8 +1420,8 @@ async fn source_registered_on_one_live_session_resolves_on_another_until_removed
     assert!(on_a > 0);
     assert_eq!(on_b, on_a, "B serves the same rows A registered");
     assert_eq!(
-        session_b.source_table_names(&source_id).await.unwrap(),
-        vec!["patents".to_string()]
+        session_b.source_tables(&source_id).await.unwrap(),
+        vec![SourceTable::new(&source_id, SourceTable::PUBLIC, "patents")]
     );
     let described = session_b
         .catalog()
@@ -1444,7 +1441,7 @@ async fn source_registered_on_one_live_session_resolves_on_another_until_removed
         .await
         .unwrap_err();
     assert_source_not_found(&err, &source_id);
-    let err = session_b.source_table_names(&source_id).await.unwrap_err();
+    let err = session_b.source_tables(&source_id).await.unwrap_err();
     assert_source_not_found(&err, &source_id);
     assert!(session_b
         .catalog()
@@ -1502,8 +1499,8 @@ async fn source_redefined_on_one_live_session_resolves_to_its_new_definition_on_
         .unwrap();
 
     assert_eq!(
-        session_b.source_table_names(&source_id).await.unwrap(),
-        vec!["scores".to_string()],
+        session_b.source_tables(&source_id).await.unwrap(),
+        vec![SourceTable::new(&source_id, SourceTable::PUBLIC, "scores")],
         "B resolves the id to its new definition"
     );
     assert_eq!(

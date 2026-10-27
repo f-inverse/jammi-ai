@@ -155,7 +155,7 @@ use jammi_db::catalog::status::{JobKind, JobKinds, JobPhase};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::sql::{quote_ident, source_relation};
+use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
 };
@@ -428,9 +428,15 @@ impl HostAdmission {
     /// [`EmbeddedWorker`]'s `Drop` (unconditionally attempted, idempotent
     /// either way it lands).
     pub(crate) fn release_loop_claim(&self, generation: u64) {
-        let _ = self
+        match self
             .loop_owner
-            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            // Released, or a successor's generation holds the slot now and
+            // keeps it.
+            Ok(_released) => {}
+            Err(_successor) => {}
+        }
     }
 
     /// Install the process's [`MemberDialer`] — once. `false` when one is
@@ -1385,12 +1391,11 @@ pub(crate) async fn materialize_graph_training_set(
     sample_config: GraphSampleConfig,
     inputs: Vec<InputAnchor>,
 ) -> Result<jammi_db::store::TrainingSetTable> {
-    let node_table = session.find_table_name(&sources.node_source).await?;
+    let node_table = session.first_table(&sources.node_source).await?;
     let id_col = quote_ident(&sources.id_column);
     let text_col = quote_ident(&sources.text_column);
     let node_query = format!(
-        "SELECT {id_col}, {text_col} FROM {} ORDER BY {id_col} ASC NULLS FIRST, {text_col} ASC NULLS FIRST",
-        source_relation(&sources.node_source, &node_table)
+        "SELECT {id_col}, {text_col} FROM {node_table} ORDER BY {id_col} ASC NULLS FIRST, {text_col} ASC NULLS FIRST"
     );
     let node_batches = session.sql(&node_query).await?;
     let mut nodes = Vec::new();
@@ -1417,9 +1422,7 @@ pub(crate) async fn materialize_graph_training_set(
     let (src_name, dst_name) = sources.edges.columns();
     let edge_relation = match &sources.edges {
         GraphEdges::Table(table) => jammi_db::store::result_table_relation(table).to_string(),
-        GraphEdges::Source { source, .. } => {
-            source_relation(source, &session.find_table_name(source).await?)
-        }
+        GraphEdges::Source { source, .. } => session.first_table(source).await?.to_string(),
     };
     let src_col = quote_ident(src_name);
     let dst_col = quote_ident(dst_name);
@@ -3933,8 +3936,10 @@ impl EmbeddedWorker {
             return Ok(StopOutcome::NothingToJoin);
         };
         let mut state_rx = self.shared.state_receiver();
-        // The sender lives in `self.shared`, so this cannot error.
-        let _ = state_rx.wait_for(|s| *s != LoopState::Running).await;
+        state_rx
+            .wait_for(|s| *s != LoopState::Running)
+            .await
+            .expect("the loop's state sender lives in `self.shared`");
         // A join error here is a task panic inside `run_until` (every fallible
         // step inside its loop is already caught and logged, not propagated as
         // a panic — the guard reports `Failed`) or the task having been
@@ -7545,7 +7550,7 @@ pub mod training_test_hooks {
                 .map(|i| list.remove(i))
         };
         if let Some(ArmedPause { tx, .. }) = armed {
-            let _ = tx.send(());
+            tx.send(()).expect("the test awaits the pause");
             std::future::pending::<()>().await;
         }
     }

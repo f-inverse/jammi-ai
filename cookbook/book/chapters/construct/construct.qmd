@@ -214,8 +214,8 @@ structure a route graph only approximates.
 ## The tenancy rail: what the engine isolates — and what it does not
 
 Air Routes is the clean place to make the **tenancy rail** honest. The engine
-isolates by tenant at **two layers**, and there is a caveat that matters. We
-demonstrate all three on the *same* engine handle, binding a tenant scope with
+isolates by tenant at **three layers**, and one thing is shared by design. We
+demonstrate all four on the *same* engine handle, binding a tenant scope with
 `set_tenant` (an opaque UUID — the engine validates the form, never who the
 tenant is). The `rails.tenant` context manager wraps the engine's
 `tenant_scope` and restores the prior scope on exit.
@@ -303,37 +303,52 @@ claim("the discriminator gives each tenant exactly its own rows of the shared so
       set(seen_a) == set(na) and set(seen_b) == set(eu))
 ```
 
-### The caveat — a discriminator-less source is globally readable
+### A tenant's source is its own; a global source is every tenant's
 
-This is the honest limit. A source with **no `tenant_id` column** is **globally
-readable** by any tenant that names it: there is no column for the analyzer to
-filter on, and the engine does not authenticate — access-gating lives *above*
-the engine (a Flight SQL / gRPC interceptor). We register Europe's airports
-under tenant B with no discriminator column, then read them under tenant A.
+A source tenant B registers resolves for B alone: tenant A naming it gets `NotFound`, as for
+a source that does not exist, even with no `tenant_id` column to filter on. What every
+tenant reads is a *global* source — one registered with no tenant bound — and with no
+discriminator its rows are every tenant's: global means shared. The engine does not
+authenticate; access-gating lives *above* it (a Flight SQL / gRPC interceptor). We
+register Europe's airports under tenant B with no discriminator and name them under
+tenant A; then register them globally and read them under tenant A.
 
 ```{python}
+from jammi.errors import NotFound
+
 with rails.tenant(db, TENANT_B):
     register("air_eu_nodisc", pa.table({"code": eu}))
 
 with rails.tenant(db, TENANT_A):
-    seen_global = sorted(r["code"] for r in db.sql(
-        "SELECT code FROM air_eu_nodisc.public.air_eu_nodisc").to_pylist())
+    try:
+        db.sql("SELECT code FROM air_eu_nodisc.public.air_eu_nodisc")
+        private_read = "read"
+    except NotFound:
+        private_read = "not found"
 
-print(f"tenant A reads B's discriminator-less source: {len(seen_global)} of {len(eu)} rows")
+with rails.tenant(db, ""):
+    register("air_eu_shared", pa.table({"code": eu}))
+with rails.tenant(db, TENANT_A):
+    seen_shared = sorted(r["code"] for r in db.sql(
+        "SELECT code FROM air_eu_shared.public.air_eu_shared").to_pylist())
+
+print(f"tenant A naming B's source: {private_read}")
+print(f"tenant A reads the global source with no discriminator: {len(seen_shared)} of {len(eu)} rows")
 ```
 
 ```{python}
-claim("a discriminator-less source is globally readable: A reads every one of its rows",
-      set(seen_global) == set(eu), f"{len(seen_global)} of {len(eu)}")
+claim("a source tenant B registers is not found by tenant A", private_read == "not found")
+claim("a global source with no discriminator is read whole by every tenant",
+      set(seen_shared) == set(eu), f"{len(seen_shared)} of {len(eu)}")
 ```
 
 ```{python}
 db.close()
 ```
 
-Two isolation layers are properties of the engine itself: `set_tenant` scopes
-catalog listing, and a `tenant_id` discriminator column row-filters a shared
-source. But the engine does not authenticate — a discriminator-less source any
-tenant can name is global by design, so cross-tenant data isolation is a property
-you *opt into* (a discriminator column) or *gate above* (an interceptor), not a
-blanket guarantee.
+Three isolation layers are properties of the engine itself: `set_tenant` scopes
+the catalog listing and which sources a name resolves to, and a `tenant_id`
+discriminator column row-filters a shared source. But the engine does not
+authenticate: who a tenant is, and so which scope a connection binds, is decided
+*above* it (an interceptor), and a global source with no discriminator is every
+tenant's by design.

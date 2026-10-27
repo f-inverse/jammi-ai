@@ -1090,7 +1090,8 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
 
     // Restore permissions unconditionally so the tempdir's own Drop cleanup
     // never has to fight the chmod.
-    let _ = std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644));
+    std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore the weights' permissions");
 
     let err = match result {
         Ok(_) => panic!(

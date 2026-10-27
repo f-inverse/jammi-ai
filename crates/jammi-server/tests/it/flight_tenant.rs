@@ -1,17 +1,11 @@
 //! Flight SQL `jammi-session-id`-bound tenant isolation.
 //!
-//! Co-mounted with `SessionService` on one Tonic server. A client binds a
-//! tenant via the gRPC `SessionService.SetTenant` call carrying a
-//! `jammi-session-id` header; the same header on a Flight SQL query routes
-//! through [`TenantBoundProvider`] which updates the engine's shared
-//! [`TenantBinding`] for the duration of that query.
-//!
-//! Concurrency caveat (mirrors `crates/jammi-server/src/flight.rs` rustdoc):
-//! the binding is process-global. The tests serialise their Flight SQL
-//! queries — two concurrent queries on different tenants would race the
-//! binding. The gRPC-only test in `grpc_session.rs` exercises the
-//! per-request `SessionTenant` extension path that does NOT race; this
-//! file exists specifically to cover the Flight SQL surface.
+//! Co-mounted with `CatalogService` on one Tonic server. A client binds a
+//! tenant via `CatalogService.SetTenant` carrying a `jammi-session-id`
+//! header; the same header on a Flight SQL query is resolved by the server's
+//! Flight scope, and the query runs under that tenant alone — concurrently
+//! with other tenants' queries, and without leaving a tenant behind for a
+//! session that names none.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,8 +84,8 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
         .expect("add notes source");
 
     // Flight SQL + the control-plane `CatalogService` on one listener — the same
-    // surface the multi-tenant Flight shape serves (Flight bound through the
-    // `TenantBoundProvider`, `CatalogService.SetTenant` binding the tenant via
+    // surface the multi-tenant Flight shape serves (Flight scoped through the
+    // `ResolvedFlightScope`, `CatalogService.SetTenant` binding the tenant via
     // the engine-default `jammi-session-id` resolver), assembled from the
     // canonical gRPC chain with no engine mounted. Binding eagerly through the
     // chain seam holds the port from bind through serve, so no concurrent test
@@ -100,7 +94,6 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: None,
@@ -181,12 +174,63 @@ async fn flight_two_session_ids_see_disjoint_row_counts() {
     bind_tenant_via_session_service(addr, "session-a", TENANT_A).await;
     bind_tenant_via_session_service(addr, "session-b", TENANT_B).await;
 
-    // Bound bindings are global → run sequentially.
     let count_a = flight_count_notes(addr, "session-a").await;
     let count_b = flight_count_notes(addr, "session-b").await;
 
     assert_eq!(count_a, 6, "session A's Flight SQL view must yield 6 rows");
     assert_eq!(count_b, 4, "session B's Flight SQL view must yield 4 rows");
+
+    handle.abort();
+}
+
+/// Two tenants querying at once each see only their own rows, on every one of
+/// many interleaved queries: a request's tenant lives in that request alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_concurrent_tenants_each_see_only_their_rows() {
+    let (addr, _dir, handle) = start_flight_test_server().await;
+    bind_tenant_via_session_service(addr, "session-a", TENANT_A).await;
+    bind_tenant_via_session_service(addr, "session-b", TENANT_B).await;
+
+    const QUERIES: usize = 40;
+    let queries = |session: &'static str| async move {
+        let mut counts = Vec::with_capacity(QUERIES);
+        for _ in 0..QUERIES {
+            counts.push(flight_count_notes(addr, session).await);
+        }
+        counts
+    };
+    let workers: Vec<_> = (0..4)
+        .map(|i| {
+            let session = if i % 2 == 0 { "session-a" } else { "session-b" };
+            (session, tokio::spawn(queries(session)))
+        })
+        .collect();
+    for (session, worker) in workers {
+        let want = if session == "session-a" { 6 } else { 4 };
+        let counts = worker.await.expect("worker");
+        assert!(
+            counts.iter().all(|&n| n == want),
+            "{session} must count {want} on every query, counted {counts:?}"
+        );
+    }
+
+    handle.abort();
+}
+
+/// A session that names no tenant reads only global rows, after another
+/// tenant's query as before it: nothing a scoped request did is left for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flight_a_session_naming_no_tenant_stays_global_after_another_tenants_query() {
+    let (addr, _dir, handle) = start_flight_test_server().await;
+    bind_tenant_via_session_service(addr, "session-a", TENANT_A).await;
+
+    assert_eq!(flight_count_notes(addr, "session-unbound").await, 0);
+    assert_eq!(flight_count_notes(addr, "session-a").await, 6);
+    assert_eq!(
+        flight_count_notes(addr, "session-unbound").await,
+        0,
+        "a session with no tenant must not inherit tenant A's scope"
+    );
 
     handle.abort();
 }

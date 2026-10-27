@@ -1409,7 +1409,9 @@ async fn run_now_under_release_and_stop_does_not_change_in_flight() {
     );
     assert_eq!(after.releases, 0);
     park.release();
-    let _ = run.await.unwrap();
+    run.await
+        .unwrap()
+        .expect_err("the run names a model that does not exist, so released, it fails");
     assert_eq!(
         session
             .catalog()
@@ -1575,7 +1577,9 @@ async fn release_and_stop_report_matches_release_job_leases_on_the_pair_that_act
     );
 
     park.release();
-    let _ = run.await.unwrap();
+    run.await
+        .unwrap()
+        .expect_err("the run names a model that does not exist, so released, it fails");
     leases_session.close().await;
 }
 

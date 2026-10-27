@@ -1,13 +1,14 @@
 """Unit tests for the three rails (provenance, tenancy, measurement).
 
 The tenancy rail is exercised against a *real* embedded ``jammi`` engine —
-hermetic (no network, no GPU). It asserts the engine's two genuine isolation
-layers and the honest caveat the Air Routes showcase teaches:
+hermetic (no network, no GPU). It asserts the engine's isolation layers and the
+visibility the Air Routes showcase teaches by design:
 
 * catalog-listing isolation — tenant A's ``list_sources`` excludes B's source;
 * row-level discriminator-column isolation — a ``tenant_id``-tagged source
   returns disjoint rows under A vs B;
-* the caveat — a discriminator-less source is globally readable.
+* name resolution — a source B registers is not found by A, discriminator or not;
+* by design — a global source with no discriminator is read whole by every tenant.
 
 Each test genuinely exercises its property and fails if it broke.
 """
@@ -20,6 +21,7 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from jammi.errors import NotFound
 
 from jammi_cookbook import rails
 
@@ -105,21 +107,29 @@ def test_discriminator_column_row_isolation(db, root):
     rails.assert_rows_isolated(seen_a, set(seen_b), tenant_id=TENANT_A)
 
 
-def test_discriminator_less_source_is_globally_readable(db, root):
-    """A source with NO ``tenant_id`` column is globally readable (the caveat).
-
-    The honest limit, asserted positively: with no discriminator column there is
-    nothing for the analyzer to filter on and the engine does not authenticate, so
-    tenant A reads ALL of a source registered under tenant B when it names it. The
-    remedy is a discriminator column or an access gate above the engine.
-    """
+def test_another_tenants_source_is_not_found(db, root):
+    """A source tenant B registers does not resolve for tenant A, even with no
+    ``tenant_id`` column: naming it is ``NotFound``, as for a source that does
+    not exist."""
     with rails.tenant(db, TENANT_B):
         _register(db, "b_open", pa.table({"code": ["XXX", "YYY"]}), root=root)
 
-    with rails.tenant(db, TENANT_A):
-        seen = sorted(r["code"] for r in db.sql(
-            "SELECT code FROM b_open.public.b_open").to_pylist())
-    assert seen == ["XXX", "YYY"], "a discriminator-less source is globally readable"
+    with rails.tenant(db, TENANT_A), pytest.raises(NotFound):
+        db.sql("SELECT code FROM b_open.public.b_open")
+
+
+def test_a_global_source_without_a_discriminator_is_every_tenants(db, root):
+    """A global source — registered with no tenant bound — resolves for every
+    tenant, and with no ``tenant_id`` column there is nothing to scope its rows
+    by: every tenant reads all of it. Global means shared."""
+    with rails.tenant(db, ""):
+        _register(db, "shared_open", pa.table({"code": ["XXX", "YYY"]}), root=root)
+
+    for tenant in (TENANT_A, TENANT_B):
+        with rails.tenant(db, tenant):
+            seen = sorted(r["code"] for r in db.sql(
+                "SELECT code FROM shared_open.public.shared_open").to_pylist())
+        assert seen == ["XXX", "YYY"], f"tenant {tenant} reads the whole global source"
 
 
 def test_assert_listing_isolated_flags_a_leak():

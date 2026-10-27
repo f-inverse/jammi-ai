@@ -51,6 +51,13 @@ chains naturally. If you hold a session behind `Arc`, use `bind_tenant(&t)`
 to update the binding in place — the session shares one `TenantBinding`
 across all references.
 
+A session's bound tenant is one connection's. A session that serves several
+callers at once — a server's — binds none: it scopes each call with
+`with_request_scope(Some(t), ..)` — or `with_request_scope(None, ..)` for a
+call that names no tenant — and concurrent calls each run under their own. A query keeps the
+scope it was planned under for every part of its execution, whichever task
+runs it.
+
 ## Python
 
 ```python
@@ -96,11 +103,13 @@ jammi --tenant 018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9b models list
 A programmatic client (Python, Go, Java) binds the tenant once per
 connection via the `jammi.v1.catalog.CatalogService.SetTenant` RPC. The
 server records the tenant against the `jammi-session-id` request metadata
-header; every Flight SQL query the same connection issues afterwards
-inherits the binding through the same resolver — the engine-default
-`SessionIdTenantResolver` — applied by the single async tenant-binding layer
-(`TenantResolverLayer`) that fronts both the `CatalogService` and the Flight
-SQL provider. Browser clients reach the same `CatalogService` over HTTP/1.1
+header, and every gRPC verb and Flight SQL query the same connection issues
+afterwards runs under it: the server resolves each request's tenant from that
+header through one resolver — the engine-default `SessionIdTenantResolver` —
+for both transports. Each request carries its own scope, so connections
+bound to different tenants never see each other's rows however their
+requests interleave, and a connection that binds no tenant runs global on
+every verb. Browser clients reach the same `CatalogService` over HTTP/1.1
 via the gRPC-Web shim (`application/grpc-web+proto`) — no separate REST
 surface, same `jammi-session-id` header semantics.
 
@@ -153,8 +162,8 @@ to both transports, so there is nothing separate to wire up for Flight.
    `Ok(TenantScope::Tenant(t))`.
 3. **The engine binds it.** The async `TenantResolverLayer` maps the resolved
    scope onto the `SessionTenant` request extension every verb handler reads,
-   and the Flight SQL provider (`TenantBoundProvider`) binds the same scope for
-   `db.sql` — you write only `resolve`.
+   and the Flight SQL lane (`ResolvedFlightScope`) runs each `db.sql` request
+   under the same scope — you write only `resolve`.
 
 Because `resolve` runs *in front of* every handler, the tenant the engine acts
 on is the one the credential proves, not one the caller asserts. The
@@ -207,7 +216,7 @@ use std::sync::Arc;
 use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
 
 let chain = GrpcChain {
-    // .. addr, flight_ctx, flight_binding, store, trigger, engine, tiers, metrics ..
+    // .. addr, flight_ctx, store, trigger, engine, tiers, metrics ..
     tenant_resolver: Arc::new(AuthResolver),
     ..chain_defaults
 };
@@ -276,7 +285,9 @@ grant — see [Security Posture](./security.md) for the full comparison.
 Two sessions on the same process, bound to different tenants, will:
 
 1. **Read each other as invisible:** `list_sources()` returns the calling
-   tenant's sources plus any globally-scoped (`tenant_id IS NULL`) sources.
+   tenant's sources plus any globally-scoped (`tenant_id IS NULL`) sources,
+   and naming another tenant's source, in SQL or a verb, is `NotFound`, as
+   for a source that does not exist.
 2. **Write into different lanes:** a `register_source` from Alice produces
    a row tagged `tenant_id = alice`; Bob's `list_sources` does not see it.
 3. **Share globally-scoped rows:** an unscoped (`tenant_id IS NULL`)

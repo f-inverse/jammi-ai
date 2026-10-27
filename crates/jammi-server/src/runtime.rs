@@ -36,7 +36,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
 
-use crate::flight::{JammiFlightService, TenantBoundProvider};
+use crate::flight::{JammiFlightService, ResolvedFlightScope};
 use crate::grpc::audit::AuditServer;
 use crate::grpc::catalog::{AdminAuthorizer, CatalogServer};
 use crate::grpc::embedding::EmbeddingServer;
@@ -710,7 +710,6 @@ impl Server {
         GrpcChain {
             addr: self.flight_addr,
             flight_ctx: self.session.context().clone(),
-            flight_binding: self.session.tenant_binding_arc(),
             store: self.session_store.clone(),
             trigger,
             engine: Some(Arc::clone(&self.session)),
@@ -1003,7 +1002,7 @@ impl BoundServer {
         let (_release_tx, release_rx) = watch::channel(false);
         tokio::spawn(async move {
             shutdown.await;
-            let _ = drain_tx.send(true);
+            drain_tx.send_replace(true);
         });
         self.serve_with_signals(drain_rx, release_rx)
             .await
@@ -1084,9 +1083,7 @@ impl BoundServer {
                     .add_routes(routes)
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener),
-                        async move {
-                            let _ = peer_stop_rx.await;
-                        },
+                        stopped(peer_stop_rx),
                     )
                     .await
                     .map_err(ServerError::from)
@@ -1095,9 +1092,7 @@ impl BoundServer {
 
         let health_task = tokio::spawn(async move {
             axum::serve(health_listener, health_router)
-                .with_graceful_shutdown(async move {
-                    let _ = health_stop_rx.await;
-                })
+                .with_graceful_shutdown(stopped(health_stop_rx))
                 .await
                 .map_err(ServerError::from)
         });
@@ -1223,14 +1218,14 @@ impl BoundServer {
                 // covered by anything in this suite is UNMEASURED — a grep
                 // for a test that panics either task found none — and is
                 // left that way rather than asserted.
-                let _ = health_stop_tx.send(());
+                request_stop(health_stop_tx);
                 let health_result = match health_task.await {
                     Ok(r) => r,
                     Err(join_err) => {
                         Err(ServerError::Io(std::io::Error::other(join_err.to_string())))
                     }
                 };
-                let _ = peer_stop_tx.send(());
+                request_stop(peer_stop_tx);
                 let peer_result = match peer_task {
                     Some(task) => match task.await {
                         Ok(r) => r,
@@ -1265,7 +1260,12 @@ impl BoundServer {
             // signalled, so the worker is never stopped at t = 0.
             let session_ref = Arc::clone(&session);
             let gated_join = async move {
-                let _ = drain_gate.wait_for(|v| *v).await;
+                match drain_gate.wait_for(|v| *v).await {
+                    // A drain, or its sender dropped as the server ends:
+                    // either way the drain begins.
+                    Ok(_drained) => {}
+                    Err(_dropped) => {}
+                }
                 readiness_ref.begin_drain();
                 // Held gang ranks end `Drain` the same instant — with or
                 // without a worker (`EmbeddedWorker::begin_drain` flips the
@@ -1330,12 +1330,12 @@ impl BoundServer {
         // the catalog (the keeper's own connection included — a
         // successor process can open the same SQLite catalog directory at
         // once), flush telemetry.
-        let _ = health_stop_tx.send(());
+        request_stop(health_stop_tx);
         let health_result = match health_task.await {
             Ok(r) => r,
             Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
         };
-        let _ = peer_stop_tx.send(());
+        request_stop(peer_stop_tx);
         let peer_result = match peer_task {
             Some(task) => match task.await {
                 Ok(r) => r,
@@ -1387,8 +1387,6 @@ pub struct GrpcChain {
     /// The engine session's query context; each Flight SQL request derives
     /// its own state from it.
     pub flight_ctx: QueryContext,
-    /// Tenant binding the Flight SQL provider mutates per request.
-    pub flight_binding: jammi_db::tenant_scope::TenantBinding,
     /// Session store shared between the `CatalogService` tenant trio (writers)
     /// and the engine-default `SessionIdTenantResolver` (reader).
     pub store: SessionStore,
@@ -1841,7 +1839,7 @@ impl BoundChain {
         let (drain_tx, drain_rx) = watch::channel(false);
         tokio::spawn(async move {
             shutdown.await;
-            let _ = drain_tx.send(true);
+            drain_tx.send_replace(true);
         });
         self.serve_with_drain(drain_rx).await
     }
@@ -1938,7 +1936,6 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     let GrpcChain {
         addr,
         flight_ctx,
-        flight_binding,
         store,
         trigger,
         engine,
@@ -1958,21 +1955,16 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // truncating to a SMALLER, surprising cap.
     let max_message_bytes: usize = usize::try_from(limits.max_message_bytes).unwrap_or(usize::MAX);
 
-    // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
-    // as the gRPC plane. The provider resolves each query's scope and binds it,
-    // closing the cross-transport bypass where an authenticated gRPC plane would
-    // still let Flight bind from an unauthenticated header (#220).
-    let provider = TenantBoundProvider::new(
-        flight_ctx.state(),
-        flight_binding,
-        Arc::clone(&tenant_resolver),
-    );
-    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(provider)))
+    // Flight SQL resolves each query's scope through the SAME resolver as the
+    // gRPC plane, so an authenticated gRPC plane never sits beside a Flight
+    // lane that would bind from an unauthenticated header.
+    let scope = ResolvedFlightScope::new(flight_ctx.clone(), Arc::clone(&tenant_resolver));
+    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(scope)))
         .max_decoding_message_size(max_message_bytes);
 
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
     // wraps every engine service uniformly — no branch, no separate interceptor,
-    // so nothing can double-bind or clobber the resolved tenant. MUST-FIX 1 — the
+    // so nothing can double-bind or clobber the resolved tenant. The
     // wrapping applies only to the services THIS function builds; downstream
     // services mounted via `AssembledChain::mount` (a downstream's own
     // pre-authentication verbs) stay un-gated by the engine resolver.
@@ -1999,7 +1991,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // this — every service mounted onto it, engine or downstream, then inherits
     // the gRPC-web framing + trailer repair the serve path applies. Flight SQL is
     // NOT wrapped by the layer: its `db.sql` lane binds inside the
-    // `TenantBoundProvider` (threaded with the same resolver above).
+    // `ResolvedFlightScope` (threaded with the same resolver above).
     let mut routes = tonic::service::Routes::new(flight_svc);
     let mut mounted = vec!["Flight SQL".to_string()];
 
@@ -2244,29 +2236,30 @@ async fn signal_watcher(drain_tx: watch::Sender<bool>, release_tx: watch::Sender
             tokio::select! {
                 () = on_interrupt => {
                     tracing::info!("SIGINT received: RELEASE — handing leases back and exiting");
-                    let _ = release_tx.send(true);
+                    release_tx.send_replace(true);
                     return;
                 }
                 () = on_terminate => {
                     if draining {
                         tracing::info!("second SIGTERM while draining: RELEASE");
-                        let _ = release_tx.send(true);
+                        release_tx.send_replace(true);
                         return;
                     }
                     draining = true;
                     tracing::info!("SIGTERM received: DRAIN — finishing in-flight work");
-                    let _ = drain_tx.send(true);
+                    drain_tx.send_replace(true);
                 }
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = &drain_tx;
+        // No SIGTERM here: nothing signals a drain.
+        drop(drain_tx);
         match signal::ctrl_c().await {
             Ok(()) => {
                 tracing::info!("Ctrl+C received: RELEASE");
-                let _ = release_tx.send(true);
+                release_tx.send_replace(true);
             }
             Err(e) => tracing::error!("Failed to install Ctrl+C handler: {e}"),
         }
@@ -2896,4 +2889,19 @@ mod release_outcome_tests {
             ShutdownOutcome::Released
         );
     }
+}
+
+/// Resolves when the server's stop is requested through `signal`, or its
+/// sender is dropped as the server ends: either way the listener stops.
+async fn stopped(signal: oneshot::Receiver<()>) {
+    match signal.await {
+        Ok(()) => {}
+        Err(_dropped) => {}
+    }
+}
+
+/// Ask a side task to stop. A task that already ended dropped its receiver,
+/// and has nothing to stop.
+fn request_stop(stop: oneshot::Sender<()>) {
+    stop.send(()).unwrap_or(());
 }

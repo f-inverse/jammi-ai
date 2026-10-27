@@ -449,8 +449,7 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
         a.close().await;
     }
     readyz_is_200(&b).await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 /// A caller's vector through the placed lane's ENTRY over `record`:
@@ -564,8 +563,7 @@ async fn a_caller_width_fault_is_refused_before_any_fan_out() {
 
     table.abort().await.unwrap();
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -658,8 +656,7 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
     table_w.abort().await.unwrap();
     table_nodims.abort().await.unwrap();
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -864,8 +861,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
         "a corrupt stored vector never fans out"
     );
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,14 +1016,12 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
     }
     readyz_is_200(&b).await;
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
     table_nodims.abort().await.unwrap();
     table.abort().await.unwrap();
     a2.close().await;
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,8 +1083,7 @@ async fn coordinator_under_another_tenant_fails_before_fan_out() {
     );
 
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,8 +1160,7 @@ async fn force_local_entries_ignore_placement_while_placed_entries_refuse() {
     assert_eq!(delta(&c1, &c2, "local_load"), 0);
 
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,8 +1277,7 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
 
     table.abort().await.unwrap();
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,8 +1470,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
 
     table.abort().await.unwrap();
     a.close().await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,8 +1784,7 @@ async fn an_exact_rescore_is_verified_against_the_pinned_versions_segments() {
         served.hits[0]
     );
 
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }
 
 /// A versioned table whose superseded segment is placed on a peer: the placed
@@ -1857,6 +1846,5 @@ async fn a_placed_search_serves_the_current_version_under_its_mask() {
         a.close().await;
     }
     readyz_is_200(&b).await;
-    let _ = b.shutdown.send(());
-    let _ = b.handle.await;
+    b.stop().await;
 }

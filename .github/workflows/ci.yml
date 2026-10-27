@@ -195,7 +195,7 @@ jobs:
           context: .devcontainer
           cache-scope: devcontainer
 
-  # The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles.
+  # The workspace is formatted and lints clean; its database source drivers lint in the gated jammi-db leg, which compiles both.
   fmt-clippy:
     name: Format & Lint
     needs:
@@ -212,8 +212,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy jammi-db postgres,mysql
-        run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
 
   # Every test surface compiled only under a feature naming a host resource, or the live hub, lints clean (`check_lint_surface_closure.py` asserts every gated surface has a lane).
   clippy-gated:
@@ -230,7 +228,7 @@ jobs:
             cmd: cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
             container: ghcr.io/f-inverse/jammi-ai-ci:ctx-f11e59b47140e868
           - surface: jammi-db host resources
-            cmd: cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
+            cmd: cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,live-mysql-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
             container: ghcr.io/f-inverse/jammi-ai-ci:ctx-f11e59b47140e868
           - surface: jammi-server host resources
             cmd: cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
@@ -463,6 +461,32 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/setup-rust-ci
       - run: cargo nextest run --profile postgres -p jammi-db -p jammi-server --features jammi-db/live-postgres-tests,jammi-server/live-postgres-tests -E '(package(jammi-db) & (kind(lib) | binary(it))) | (package(jammi-server) & binary(it))'
+
+  # The MySQL source's tests against a live MySQL: every construct a query can hold answers over MySQL as over the same rows in a file.
+  test-mysql:
+    name: Test (MySQL)
+    needs:
+      - image-cpu-merge
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    container: ghcr.io/f-inverse/jammi-ai-ci:ctx-f11e59b47140e868
+    services:
+      mysql:
+        image: mysql:8.4@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+        env:
+          MYSQL_ROOT_PASSWORD: jammi
+          MYSQL_DATABASE: jammi_test
+        options: '--health-cmd "mysqladmin ping -h 127.0.0.1 -pjammi --silent" --health-interval 5s --health-timeout 5s --health-retries 24'
+        ports:
+          - 3306:3306
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      JAMMI_TEST_MYSQL_URL: mysql://root:jammi@mysql:3306/jammi_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-rust-ci
+      - run: cargo nextest run --profile ci -p jammi-db --features live-mysql-tests -E 'package(jammi-db) & binary(it) & test(/mysql/)'
 
   # The tests `live-hub-tests` adds, against the live model hub: a verdict main measures, so a hub outage reds main until it is measured again.
   test-live:
@@ -1347,6 +1371,7 @@ jobs:
       - test-storage-cloud
       - test-python-rust
       - test-pg
+      - test-mysql
       - test-live
       - perf-gate
       - distributed-build

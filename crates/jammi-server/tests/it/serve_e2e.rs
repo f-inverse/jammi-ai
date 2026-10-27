@@ -149,9 +149,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_task = tokio::spawn(async move {
         bound
-            .serve_with_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(crate::common::grpc::stopped(shutdown_rx))
             .await
     });
 
@@ -203,6 +201,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -281,6 +280,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", fixture("patents.parquet").display()),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -293,6 +293,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
                 url: format!("file://{}", fixture("relevance.csv").display()),
                 format: FileFormat::Csv as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await

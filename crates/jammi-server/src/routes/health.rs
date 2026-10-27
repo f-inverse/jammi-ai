@@ -296,13 +296,17 @@ impl MetricsRegistry {
         self.inner.register(Box::new(jobs_running.clone()))?;
         self.inner.register(Box::new(jobs_in_flight.clone()))?;
         self.inner.register(Box::new(claim_loop_up.clone()))?;
-        let _ = self.worker.set(WorkerGauges {
+        match self.worker.set(WorkerGauges {
             shared,
             jobs_queued,
             jobs_running,
             jobs_in_flight,
             claim_loop_up,
-        });
+        }) {
+            // A concurrent attach set them first, and its gauges stay.
+            Ok(()) => {}
+            Err(_second) => {}
+        }
         Ok(())
     }
 
@@ -320,10 +324,14 @@ impl MetricsRegistry {
              every lease it holds.",
         )?;
         self.inner.register(Box::new(heartbeat_age.clone()))?;
-        let _ = self.keeper.set(KeeperGauge {
+        match self.keeper.set(KeeperGauge {
             keeper,
             heartbeat_age,
-        });
+        }) {
+            // A concurrent attach set it first, and its gauge stays.
+            Ok(()) => {}
+            Err(_second) => {}
+        }
         Ok(())
     }
 

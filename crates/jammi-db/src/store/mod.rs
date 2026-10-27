@@ -450,7 +450,7 @@ impl TrainingSetSpec<'_> {
 ///
 /// ```compile_fail,E0616
 /// let table: jammi_db::store::TrainingSetTable = unimplemented!();
-/// let _ = table.record;
+/// let record = table.record;
 /// ```
 #[derive(Debug, Clone)]
 pub struct TrainingSetTable {
@@ -1001,10 +1001,10 @@ mod from_record_tests {
 /// A training set is not read this way: its handle, [`TrainingSetTable`],
 /// reads through [`TrainingSetTable::scan`] alone (this minter is what that
 /// scan resolves its relation through, inside this module). Two relation
-/// shapes are NOT this minter's: a source-side federation relation
-/// (`"{source_id}".public."{table}"`) and a `FROM "{backing}"` read of a
-/// caller-named backing table — neither is a session-registered result
-/// table.
+/// shapes are NOT this minter's: a source's own table
+/// ([`crate::source::SourceTable`], `"{source}"."{schema}"."{table}"`) and a
+/// `FROM "{backing}"` read of a caller-named backing table — neither is a
+/// session-registered result table.
 pub fn result_table_relation(table_name: &str) -> RelationKey {
     RelationKey(format!("jammi.{table_name}"))
 }
@@ -1614,7 +1614,12 @@ pub mod reconcile_test_hooks {
             if self.parked.load(Ordering::SeqCst) {
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+                .await
+                .is_err()
+            {
+                tracing::warn!("test hook: waited 5 s for a park that never came");
+            }
         }
 
         /// Whether the pass is currently parked at the armed point.
@@ -1653,8 +1658,12 @@ pub mod reconcile_test_hooks {
             let released = state.release.notified();
             tokio::pin!(released);
             released.as_mut().enable();
-            if !state.released.load(Ordering::SeqCst) {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), released).await;
+            if !state.released.load(Ordering::SeqCst)
+                && tokio::time::timeout(std::time::Duration::from_secs(30), released)
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("test hook: the park released by its 30 s bound");
             }
         }
     }

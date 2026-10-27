@@ -53,6 +53,7 @@
 //! depending on `CARGO_BIN_EXE_*` (which Cargo only sets for binaries in the
 //! test's own package).
 
+use jammi_test_utils::child::reap_on_drop;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -178,7 +179,11 @@ impl TestServer {
             stdout: drain_pipe(stdout, "[stdout] ", Arc::clone(&logs), move |line| {
                 if let Some(sender) = tx.as_ref() {
                     if let Some(ports) = parse_listening_banner(line) {
-                        let _ = sender.send(ports);
+                        match sender.send(ports) {
+                            // A startup that stopped waiting needs no ports.
+                            Ok(()) => {}
+                            Err(_unheard) => {}
+                        }
                         tx = None; // reported once; keep draining stdout
                     }
                 }
@@ -232,8 +237,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        reap_on_drop(&mut self.child);
     }
 }
 
@@ -249,8 +253,11 @@ impl Drains {
     /// has exited (or been killed) and its pipes are closed — so joining is
     /// what makes the accumulated log complete rather than truncated.
     fn join(self) {
-        let _ = self.stdout.join();
-        let _ = self.stderr.join();
+        for (name, drain) in [("stdout", self.stdout), ("stderr", self.stderr)] {
+            if drain.join().is_err() {
+                eprintln!("the {name} drain panicked; the log it wrote is incomplete");
+            }
+        }
     }
 }
 
@@ -302,8 +309,7 @@ impl ServerStartupFailure {
         } else {
             let observed = child.try_wait().ok().flatten();
             if observed.is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_on_drop(&mut child);
             }
             observed
         };

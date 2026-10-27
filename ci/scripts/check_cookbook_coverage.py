@@ -159,16 +159,35 @@ def module_functions(read: Reader) -> set[str]:
     return found
 
 
+_RAW_STRING = re.compile(r'r(#*)"')
+_CHAR = re.compile(r"'(?:\\.|[^\\'])'")
+
+
 def _braced(text: str, open_at: int) -> str:
-    """The text between the `{` at `open_at` and its matching `}`."""
+    """The text between the `{` at `open_at` and its matching `}`, a brace
+    inside a string, raw-string or char literal not counting."""
     depth = 0
-    for i in range(open_at, len(text)):
-        if text[i] == "{":
+    i = open_at
+    while i < len(text):
+        c = text[i]
+        raw = _RAW_STRING.match(text, i) if c == "r" else None
+        if raw:
+            i = text.index('"' + raw.group(1), raw.end()) + 1 + len(raw.group(1))
+            continue
+        if c == '"':
+            i += 1
+            while text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c == "'" and (char := _CHAR.match(text, i)):
+            i = char.end()
+            continue
+        elif c == "{":
             depth += 1
-        elif text[i] == "}":
+        elif c == "}":
             depth -= 1
             if depth == 0:
                 return text[open_at + 1 : i]
+        i += 1
     raise CoverageError("unbalanced braces in a Rust source")
 
 
@@ -236,13 +255,30 @@ _NAME_CONST = re.compile(r"\bconst\s+\w*NAME\s*:\s*&(?:'static\s+)?str\s*=\s*\"(
 _NAME_FN = re.compile(r"\bfn\s+\w*name\s*\([^)]*\)\s*->\s*&(?:'static\s+)?str\s*\{")
 
 
+_TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*mod\s+\w+\s*\{")
+
+
+def _without_test_modules(text: str) -> str:
+    """`text` with each `#[cfg(test)]` module removed: a function a test
+    defines is not one the engine registers."""
+    while match := _TEST_MODULE.search(text):
+        body = _braced(text, match.end() - 1)
+        text = text[: match.start()] + text[match.end() + len(body) + 1 :]
+    return text
+
+
 def sql_functions(read: Reader, rust_sources: Iterable[Path]) -> set[str]:
     """Every SQL function the engine registers: the names each source file
-    implementing a DataFusion function trait declares."""
+    implementing a DataFusion function trait declares, outside its tests."""
     functions: set[str] = set()
     for path in rust_sources:
         text = read(path)
-        if text is None or not _SQL_IMPL.search(text):
+        if text is None:
+            continue
+        if not _SQL_IMPL.search(text):
+            continue
+        text = _without_test_modules(text)
+        if not _SQL_IMPL.search(text):
             continue
         names = set(_NAME_CONST.findall(text))
         for fn in _NAME_FN.finditer(text):
@@ -578,6 +614,14 @@ def self_test() -> int:
     udf = 'pub const THING_NAME: &str = "thing_hash";\nimpl ScalarUDFImpl for Thing {}\n'
     nameless_udf = "impl ScalarUDFImpl for Anonymous {}\n"
     udf_path = CRATES / "demo" / "src" / "udf.rs"
+    # A test module's function, beside a name fn that is not a SQL function's.
+    tested = (
+        'impl Executor for Stub {\n    fn name(&self) -> &str {\n        "postgres"\n    }\n}\n'
+        "#[cfg(test)]\nmod tests {\n    const OPEN: &str = \"}\";\n    const BRACE: char = '{';\n"
+        "    impl ScalarUDFImpl for IsEven {\n"
+        '        fn name(&self) -> &str {\n            "is_even"\n        }\n    }\n}\n'
+    )
+    tested_path = CRATES / "demo" / "src" / "remote.rs"
     chapter = (
         "```{python}\ndb.alpha()\nrails.wrap(db)\n```\n"
         "```{python}\n#| eval: false\ndb.gamma()\n```\n"
@@ -600,11 +644,12 @@ def self_test() -> int:
         CLI / "main.rs": cli_main,
         CLI / "commands" / "things.rs": cli_things,
         udf_path: udf,
+        tested_path: tested,
     }
     read = files.get
     failures: list[str] = []
 
-    shipped = load_shipped(read, [udf_path])
+    shipped = load_shipped(read, [udf_path, tested_path])
     expected = {
         "kind", "alpha", "beta", "gamma", "audit", "connect", "helper",
         "jammi status", "jammi things list", "jammi things add-column", "jammi embed",

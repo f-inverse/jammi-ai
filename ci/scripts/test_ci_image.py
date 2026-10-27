@@ -81,9 +81,9 @@ class ContentKeyTest(unittest.TestCase):
 
     def test_refs_name_every_reference_a_lane_uses(self):
         got = ci_image.refs()
-        self.assertEqual(set(got), {"cpu", "cuda", "postgres", "colab"})
+        self.assertEqual(set(got), {"cpu", "cuda", "postgres", "mysql", "colab"})
         self.assertTrue(got["cpu"].endswith(":" + ci_image.tag(CPU)))
-        for service in ("postgres", "colab"):
+        for service in ("postgres", "mysql", "colab"):
             self.assertRegex(got[service], r"@sha256:[0-9a-f]{64}$", f"the {service} image is pinned by digest")
 
 

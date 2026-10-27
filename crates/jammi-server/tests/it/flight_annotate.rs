@@ -110,7 +110,7 @@ async fn flight_annotate_runs_inference_as_a_sql_relation() {
         other => panic!("vector column should be a FixedSizeList, got {other:?}"),
     }
 
-    let _ = server.shutdown.send(());
+    server.stop().await;
 }
 
 /// A `WHERE` over the annotated output composes — the compound query is open
@@ -135,7 +135,7 @@ async fn flight_annotate_composes_with_a_filter() {
         "the filter keeps the successfully-annotated rows"
     );
 
-    let _ = server.shutdown.send(());
+    server.stop().await;
 }
 
 /// `annotate` over a relation joined back to its source: the caller projects an
@@ -175,7 +175,7 @@ async fn flight_annotate_joins_back_to_source_columns() {
     );
     assert!(batch.column_by_name("_status").is_some());
 
-    let _ = server.shutdown.send(());
+    server.stop().await;
 }
 
 /// A statement that refuses typed while its rows stream — a `CREATE TABLE …
@@ -231,5 +231,5 @@ async fn flight_statement_refusing_mid_stream_carries_the_engine_error_detail() 
         }
     }
 
-    let _ = server.shutdown.send(());
+    server.stop().await;
 }

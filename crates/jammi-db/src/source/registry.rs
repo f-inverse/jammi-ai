@@ -3,7 +3,7 @@
 //! resolution.
 //!
 //! A session's DataFusion context resolves a three-part name
-//! `<source>.public.<table>` through the `JammiCatalogList` installed as
+//! `<source>.<schema>.<table>` through the `JammiCatalogList` installed as
 //! its catalog list. Every name that is not one of the session's fixed
 //! catalogs (DataFusion's default catalog, where result tables live, and
 //! `mutable`) is a source id, and the catalog handed back for it is a lazy
@@ -40,10 +40,15 @@
 //! never the catalog: they serve `information_schema` and diagnostics, not
 //! name resolution.
 //!
-//! Tenant scope does not enter here: provider resolution is tenant-agnostic
-//! (a source's row is read across tenants, exactly as the startup preload
-//! lists them), and tenant isolation is enforced on the rows a scan returns
-//! by the analyzer, not by which providers resolve.
+//! A source resolves only where the caller's scope sees its row — its
+//! owner's tenant, every tenant for a global source, any in an admin scope
+//! ([`crate::tenant_scope::TenantBinding::sees`]) — so another tenant's
+//! source is not found by name, exactly as `list_sources` omits it. A row
+//! that exists but is not visible is not-found to that caller and leaves the
+//! owner's providers cached; a row that is gone evicts them. The cache keeps
+//! each source's owner, and the synchronous listings report only what the
+//! caller sees. The startup preload builds every source across tenants;
+//! which a caller may resolve is decided at resolution, never at build.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,16 +60,24 @@ use datafusion::execution::session_state::SessionState;
 use parking_lot::RwLock;
 
 use super::file_format;
-use super::schema_provider::PublicSchemaCatalog;
-use super::{table_name_from_url, SourceDefinition, SourceType};
+use super::{
+    table_name_from_url, SourceDefinition, SourceTable, SourceTableDescription, SourceType,
+};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageRegistry, StorageUrl};
-use crate::tenant_scope::SourceTenantColumns;
+use crate::tenant::TenantId;
+use crate::tenant_scope::{SourceTenantColumns, TenantBinding};
 
-/// A source's DataFusion table providers keyed by table name, in the order
-/// the driver discovered them.
-pub(crate) type SourceTables = Vec<(String, Arc<dyn TableProvider>)>;
+/// A source's DataFusion table providers, each keyed by the table it serves,
+/// in the source's order ([`SourceTable::order_key`]).
+pub(crate) type SourceTables = Vec<(SourceTable, Arc<dyn TableProvider>)>;
+
+/// `tables` in the source's order.
+fn ordered(mut tables: SourceTables) -> SourceTables {
+    tables.sort_by(|(a, _), (b, _)| a.order_key().cmp(&b.order_key()));
+    tables
+}
 
 /// What one build of a source yields: its tables, plus the directory-listing
 /// extension [`file_format::create_listing_table`] resolved adaptively
@@ -79,19 +92,52 @@ pub(crate) struct BuiltSource {
 /// they were built from — the cache entry a resolution revalidates against.
 pub(crate) struct ResolvedSource {
     definition: SourceDefinition,
+    /// The tenant that owns the source, or `None` for a global one.
+    owner: Option<TenantId>,
     tables: SourceTables,
 }
 
 impl ResolvedSource {
-    /// The source's table names, in discovery order.
-    pub(crate) fn table_names(&self) -> Vec<String> {
-        self.tables.iter().map(|(name, _)| name.clone()).collect()
+    /// The tables the source serves, in its order.
+    pub(crate) fn tables(&self) -> Vec<SourceTable> {
+        self.tables.iter().map(|(table, _)| table.clone()).collect()
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    /// The tables the source serves with their columns, in its order.
+    pub(crate) fn described(&self) -> Vec<SourceTableDescription> {
         self.tables
             .iter()
-            .find(|(table, _)| table == name)
+            .map(|(table, provider)| SourceTableDescription {
+                table: table.clone(),
+                columns: provider.schema(),
+            })
+            .collect()
+    }
+
+    /// The schemas the source serves its tables in, in its order.
+    fn schema_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (table, _) in &self.tables {
+            if names.last() != Some(&table.schema) {
+                names.push(table.schema.clone());
+            }
+        }
+        names
+    }
+
+    /// The names of the tables in `schema`, in the source's order.
+    fn table_names(&self, schema: &str) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter(|(table, _)| table.schema == schema)
+            .map(|(table, _)| table.table.clone())
+            .collect()
+    }
+
+    fn table(&self, schema: &str, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables
+            .iter()
+            .find(|(table, _)| table.schema == schema && table.table == name)
             .map(|(_, provider)| Arc::clone(provider))
     }
 }
@@ -143,15 +189,31 @@ impl SourceRegistry {
         }
     }
 
-    /// Resolve `source_id` from its catalog row: the cached providers when
-    /// the row still carries the definition they were built from, freshly
-    /// built ones when it does not, and [`JammiError::NotFound`] —
-    /// after evicting whatever was cached — when there is no row.
+    /// Resolve `source_id` from its catalog row as the caller's scope sees
+    /// it: the cached providers when the row still carries the definition
+    /// they were built from, freshly built ones when it does not, and
+    /// [`JammiError::NotFound`] when the caller sees no row — after evicting
+    /// whatever was cached, when no tenant does.
     pub(crate) async fn resolve(&self, source_id: &str) -> Result<Arc<ResolvedSource>> {
-        match self.catalog.get_source_across_tenants(source_id).await? {
-            Some(record) => self.adopt(source_id, record.into_definition()).await,
+        let visible = if TenantBinding::is_admin_scope() {
+            self.catalog.get_source_across_tenants(source_id).await?
+        } else {
+            self.catalog.get_source(source_id).await?
+        };
+        match visible {
+            Some(record) => {
+                let owner = record.owner;
+                self.adopt(source_id, record.into_definition(), owner).await
+            }
             None => {
-                self.evict(source_id);
+                if self
+                    .catalog
+                    .get_source_across_tenants(source_id)
+                    .await?
+                    .is_none()
+                {
+                    self.evict(source_id);
+                }
                 Err(JammiError::NotFound(Missing::Source {
                     source_id: source_id.into(),
                 }))
@@ -167,6 +229,7 @@ impl SourceRegistry {
         &self,
         source_id: &str,
         definition: SourceDefinition,
+        owner: Option<TenantId>,
     ) -> Result<Arc<ResolvedSource>> {
         if let Some(hit) = self.cached_for(source_id, &definition) {
             return Ok(hit);
@@ -176,7 +239,7 @@ impl SourceRegistry {
             return Ok(hit);
         }
         let built = self.build(source_id, &definition).await?;
-        Ok(self.admit(source_id, definition, built.tables))
+        Ok(self.admit(source_id, definition, owner, built.tables))
     }
 
     /// Build the DataFusion table providers for `definition` — the ONE
@@ -191,6 +254,14 @@ impl SourceRegistry {
         let connection = &definition.connection;
         match &definition.source_type {
             SourceType::File => {
+                if connection.ca_certificate.is_some() {
+                    return Err(JammiError::InvalidArgument {
+                        argument: "ca_certificate".into(),
+                        reason: format!(
+                            "File source '{source_id}' connects to no database server for a CA certificate to verify"
+                        ),
+                    });
+                }
                 let format =
                     connection
                         .format
@@ -218,7 +289,14 @@ impl SourceRegistry {
                 )
                 .await?;
                 Ok(BuiltSource {
-                    tables: vec![(table_name_from_url(url.as_str()), table)],
+                    tables: vec![(
+                        SourceTable::new(
+                            source_id,
+                            SourceTable::PUBLIC,
+                            &table_name_from_url(url.as_str()),
+                        ),
+                        table,
+                    )],
                     resolved_extension,
                 })
             }
@@ -260,11 +338,16 @@ impl SourceRegistry {
         &self,
         source_id: &str,
         definition: SourceDefinition,
+        owner: Option<TenantId>,
         tables: SourceTables,
     ) -> Arc<ResolvedSource> {
         self.tenant_columns
             .set(source_id, definition.connection.tenant_column.clone());
-        let resolved = Arc::new(ResolvedSource { definition, tables });
+        let resolved = Arc::new(ResolvedSource {
+            definition,
+            owner,
+            tables: ordered(tables),
+        });
         self.cached
             .write()
             .insert(source_id.to_string(), Arc::clone(&resolved));
@@ -278,30 +361,82 @@ impl SourceRegistry {
         self.cached.write().remove(source_id);
     }
 
-    /// The source ids this process currently holds providers for.
+    /// The source ids this process holds providers for that the caller's
+    /// scope sees.
     pub(crate) fn cached_ids(&self) -> Vec<String> {
-        self.cached.read().keys().cloned().collect()
+        self.cached
+            .read()
+            .iter()
+            .filter(|(_, resolved)| self.catalog.sees(resolved.owner))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
+    /// The providers held for `source_id`, when the caller's scope sees it.
     fn cached(&self, source_id: &str) -> Option<Arc<ResolvedSource>> {
-        self.cached.read().get(source_id).cloned()
+        self.cached
+            .read()
+            .get(source_id)
+            .filter(|resolved| self.catalog.sees(resolved.owner))
+            .cloned()
     }
 
+    /// The providers held for `source_id` when they were built from
+    /// `definition` — whoever the caller is: which caller may resolve the
+    /// source was decided before its providers are asked for.
     fn cached_for(
         &self,
         source_id: &str,
         definition: &SourceDefinition,
     ) -> Option<Arc<ResolvedSource>> {
-        self.cached(source_id)
+        self.cached
+            .read()
+            .get(source_id)
             .filter(|resolved| resolved.definition == *definition)
+            .cloned()
     }
 }
 
-/// The `public` schema of one source, resolved through the registry on
-/// every table lookup. See the module docs for which methods read through
-/// and which report the cache.
+/// One source as a DataFusion catalog: a schema for each of the source's
+/// schemas, each resolved through the registry on every table lookup. See
+/// the module docs for which methods read through and which report the
+/// cache.
+struct SourceCatalog {
+    source_id: String,
+    registry: Arc<SourceRegistry>,
+}
+
+impl std::fmt::Debug for SourceCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCatalog")
+            .field("source_id", &self.source_id)
+            .field("schemas", &self.schema_names())
+            .finish()
+    }
+}
+
+impl CatalogProvider for SourceCatalog {
+    fn schema_names(&self) -> Vec<String> {
+        self.registry
+            .cached(&self.source_id)
+            .map(|resolved| resolved.schema_names())
+            .unwrap_or_default()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        Some(Arc::new(SourceSchema {
+            source_id: self.source_id.clone(),
+            schema: name.to_string(),
+            registry: Arc::clone(&self.registry),
+        }))
+    }
+}
+
+/// One schema of one source, resolved through the registry on every table
+/// lookup.
 struct SourceSchema {
     source_id: String,
+    schema: String,
     registry: Arc<SourceRegistry>,
 }
 
@@ -309,6 +444,7 @@ impl std::fmt::Debug for SourceSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceSchema")
             .field("source_id", &self.source_id)
+            .field("schema", &self.schema)
             .field("tables", &self.table_names())
             .finish()
     }
@@ -319,7 +455,7 @@ impl SchemaProvider for SourceSchema {
     fn table_names(&self) -> Vec<String> {
         self.registry
             .cached(&self.source_id)
-            .map(|resolved| resolved.table_names())
+            .map(|resolved| resolved.table_names(&self.schema))
             .unwrap_or_default()
     }
 
@@ -329,13 +465,13 @@ impl SchemaProvider for SourceSchema {
             .resolve(&self.source_id)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(resolved.table(name))
+        Ok(resolved.table(&self.schema, name))
     }
 
     fn table_exist(&self, name: &str) -> bool {
         self.registry
             .cached(&self.source_id)
-            .is_some_and(|resolved| resolved.table(name).is_some())
+            .is_some_and(|resolved| resolved.table(&self.schema, name).is_some())
     }
 }
 
@@ -373,11 +509,10 @@ impl CatalogProviderList for JammiCatalogList {
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         self.fixed.catalog(name).or_else(|| {
-            let schema: Arc<dyn SchemaProvider> = Arc::new(SourceSchema {
+            Some(Arc::new(SourceCatalog {
                 source_id: name.to_string(),
                 registry: Arc::clone(&self.sources),
-            });
-            Some(Arc::new(PublicSchemaCatalog::new(schema)))
+            }) as Arc<dyn CatalogProvider>)
         })
     }
 }

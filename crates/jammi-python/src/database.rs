@@ -16,7 +16,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
-use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
+use jammi_db::source::{CaCertificate, FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate, TriggerError};
 
@@ -556,20 +556,28 @@ impl PyDatabase {
     /// read in `format` — a local path (parsed into `file://...`) or any
     /// storage URL the build was compiled with (`s3://`, `gs://`, `azure://`).
     /// `tenant_column` names the column whose value is each row's tenant,
-    /// persisted with the source.
-    #[pyo3(signature = (name, *, url, format=None, tenant_column=None))]
+    /// persisted with the source. `ca_certificate` is the PEM text of the
+    /// certificate authority a database's server certificate is verified
+    /// against.
+    #[pyo3(signature = (name, *, url, format=None, tenant_column=None, ca_certificate=None))]
     fn add_source(
         &self,
         name: &str,
         url: &str,
         format: Option<&str>,
         tenant_column: Option<String>,
+        ca_certificate: Option<String>,
     ) -> PyResult<()> {
         self.check_open()?;
         let format = format.map(parse_file_format).transpose()?;
         let definition = SourceDefinition::from_url(url, format).map_err(to_pyerr)?;
+        let ca_certificate = ca_certificate
+            .map(CaCertificate::from_pem)
+            .transpose()
+            .map_err(to_pyerr)?;
         let connection = SourceConnection {
             tenant_column,
+            ca_certificate,
             ..definition.connection
         };
         crate::released(
@@ -580,33 +588,39 @@ impl PyDatabase {
         .map_err(to_pyerr)
     }
 
-    /// List a descriptor for every source registered to the current tenant.
-    /// Each is a dict carrying `source_id`, `source_type`, `status`, and
-    /// `result_tables` (the embedding result tables produced from it, each
-    /// with its own `status` / `row_count` / `dimensions`). Registry
-    /// introspection, not a SQL query.
-    fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// The serialized `ListSourcesResponse` for every source registered to
+    /// the current tenant — the reply the remote client receives, projected
+    /// by the one projection both transports share. Registry introspection,
+    /// not a SQL query.
+    fn _list_sources_proto(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let descriptors = crate::released(
             &self.runtime,
             self.session.catalog().list_source_descriptors(),
         )
         .map_err(to_pyerr)?;
-        serializable_to_pydict(py, &descriptors)
+        let bytes = jammi_ai::wire::source_descriptors_to_bytes(descriptors);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
 
-    /// Describe one registered source by id, or `None` when no source with
-    /// that id is visible to the current tenant. Returns the same dict shape
-    /// `list_sources` yields per entry.
-    fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
+    /// The serialized `SourceDescription` of one registered source, or `None`
+    /// when no source with that id is visible to the current tenant. Reaches
+    /// the source to read its tables, where the listing reads the registry
+    /// alone.
+    fn _describe_source_proto(
+        &self,
+        py: Python<'_>,
+        source_id: &str,
+    ) -> PyResult<Option<Py<PyAny>>> {
         self.check_open()?;
-        let descriptor = crate::released(
-            &self.runtime,
-            self.session.catalog().describe_source(source_id),
-        )
-        .map_err(to_pyerr)?;
-        descriptor
-            .map(|d| serializable_to_pydict(py, &d))
+        let description = crate::released(&self.runtime, self.session.describe_source(source_id))
+            .map_err(to_pyerr)?;
+        description
+            .map(|d| {
+                let bytes =
+                    jammi_ai::wire::source_description_to_bytes(d).map_err(status_to_pyerr)?;
+                Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+            })
             .transpose()
     }
 
@@ -1131,8 +1145,8 @@ impl PyDatabase {
     /// binding. Registry introspection, not a SQL query. Each entry is a dict
     /// mirroring the table's `MutableTableDefinition`: `id` (str), `schema`
     /// (`pyarrow.Schema`), `primary_key` (list of str), `indexes` (list of
-    /// `{"name", "columns", "unique"}` dicts), `order_column` (str — empty when
-    /// the table declares none), and `chunk_size` (int).
+    /// `{"name", "columns", "unique"}` dicts) and `order_column` (str — empty
+    /// when the table declares none).
     fn list_mutable_tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let defs =
@@ -1156,7 +1170,6 @@ impl PyDatabase {
             }
             entry.set_item("indexes", indexes)?;
             entry.set_item("order_column", def.order_column.clone().unwrap_or_default())?;
-            entry.set_item("chunk_size", def.chunk_size)?;
             out.append(entry)?;
         }
         Ok(out.into_any().unbind())

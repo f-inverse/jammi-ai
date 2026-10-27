@@ -60,8 +60,8 @@ use channel_repo::ChannelRepo;
 /// and asserts via `backend::Transaction::assert_tenant_matches` before the
 /// underlying INSERT, as defence in depth. Reads filter to
 /// `tenant_id = <bound> OR tenant_id IS NULL`. When unbound (default), every
-/// row is written with NULL `tenant_id` and reads return every row — the
-/// no-op identity for single-tenant deployments.
+/// row is written with NULL `tenant_id` and reads return the NULL-tenant rows
+/// — every row of a single-tenant deployment.
 pub struct Catalog {
     backend: Arc<BackendImpl>,
     tenant: Option<TenantBinding>,
@@ -147,10 +147,7 @@ impl Catalog {
     /// and write on the returned handle is scoped to it, sharing the original
     /// catalog's backend (`Arc`) so it sees the same database.
     pub fn pinned_to_tenant(&self, tenant: Option<TenantId>) -> Self {
-        let binding = TenantBinding::unscoped();
-        if let Some(t) = tenant {
-            binding.set_shared(crate::tenant::TenantContext::Scoped(t));
-        }
+        let binding = TenantBinding::bound_to(crate::tenant::TenantContext::from_option(tenant));
         Self {
             backend: Arc::clone(&self.backend),
             tenant: Some(binding),
@@ -184,6 +181,12 @@ impl Catalog {
     /// [`crate::session::JammiSession::with_tenant_scoped`].
     pub fn current_tenant(&self) -> Option<TenantId> {
         self.tenant.as_ref().and_then(|b| b.current_tenant())
+    }
+
+    /// Whether what `owner` owns is visible to the current scope
+    /// ([`TenantBinding::visible`] under [`Self::current_tenant`]).
+    pub fn sees(&self, owner: Option<TenantId>) -> bool {
+        TenantBinding::visible(owner, self.current_tenant())
     }
 
     /// The shared [`TenantBinding`] backing this catalog, or `None` when the

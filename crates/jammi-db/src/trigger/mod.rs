@@ -28,3 +28,12 @@ pub use publisher::Publisher;
 pub use subscriber::Subscriber;
 pub use subscription::{DeliveredBatch, LiveEvent, LiveStream, Subscription};
 pub use topic::{TopicDefinition, OFFSET_COLUMN, PRODUCED_AT_COLUMN, ROW_INDEX_COLUMN};
+
+/// Send `item` to every receiver `sender` has now. A broadcast no one
+/// receives delivers to no one: that is fan-out, not a failed delivery.
+pub(crate) fn fan_out<T>(sender: &tokio::sync::broadcast::Sender<T>, item: T) {
+    match sender.send(item) {
+        Ok(_receivers) => {}
+        Err(tokio::sync::broadcast::error::SendError(_unreceived)) => {}
+    }
+}

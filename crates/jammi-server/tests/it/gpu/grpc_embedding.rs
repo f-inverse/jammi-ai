@@ -84,7 +84,6 @@ async fn start_gpu_embedding_server() -> (
     let chain = jammi_server::runtime::GrpcChain {
         addr: crate::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: Some(session),
@@ -120,6 +119,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
                 tenant_column: None,
+                ca_certificate: None,
             }),
         })
         .await
@@ -208,6 +208,5 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
         "hits must be ordered by descending score, got {hits:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    crate::common::grpc::stop(shutdown, handle).await;
 }

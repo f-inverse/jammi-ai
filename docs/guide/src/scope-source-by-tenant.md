@@ -134,7 +134,8 @@ For a file with 10 rows split 6 (`customer_id = alice`) + 4
 
 If the federated source you are wrapping carries no tenant
 discriminator, two options are open: (1) re-shape upstream so each
-tenant lands in its own table, registered as a separate source, or
+tenant lands in its own table, registered by that tenant as a separate
+source, which no other tenant resolves, or
 (2) accept that the source is globally visible to every session and
 gate access at a higher layer (Flight SQL session interceptor, gRPC
 auth middleware). The engine itself does not authenticate;

@@ -544,7 +544,11 @@ async fn rebuild_failure_after_the_purge_defers_seg1_reclaim_to_a_later_pass() {
     // Restore write permission unconditionally before any assertion can
     // panic, so the tempdir's own Drop can clean up either way.
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _ = std::fs::remove_file(&probe_path);
+    match std::fs::remove_file(&probe_path) {
+        // A probe the read-only directory refused was never written.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        removed => removed.expect("remove the write probe"),
+    }
 
     let promoted = store
         .catalog()
@@ -1317,7 +1321,11 @@ async fn abort_aggregates_a_real_delete_failure_into_one_error() {
     // Restore write permission unconditionally (before any assertion can
     // panic) so the tempdir's own Drop can clean up.
     std::fs::set_permissions(&table_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _ = std::fs::remove_file(&probe_path);
+    match std::fs::remove_file(&probe_path) {
+        // A probe the read-only directory refused was never written.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        removed => removed.expect("remove the write probe"),
+    }
 
     let err = result.unwrap_err();
     let message = err.to_string();

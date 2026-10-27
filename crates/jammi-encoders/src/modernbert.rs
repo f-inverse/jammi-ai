@@ -2892,7 +2892,7 @@ mod tests {
         let device = Device::Cpu;
         let mask = Tensor::ones((5, 4), DType::F32, &device).unwrap();
         let before = flash_d2h_syncs();
-        let _ = compute_lengths_and_prefix(&mask).unwrap();
+        compute_lengths_and_prefix(&mask).unwrap();
         let after = flash_d2h_syncs();
         assert_eq!(after, before + 1);
     }
@@ -3355,7 +3355,7 @@ mod tests {
         // training consults it identically.
         model.set_training(false);
         let flash_before_eval = cascade_counters_for("attention_block_flash").snapshot();
-        let _ = model.forward_hidden(&input_ids, &mask).unwrap();
+        model.forward_hidden(&input_ids, &mask).unwrap();
         let flash_after_eval = cascade_counters_for("attention_block_flash").snapshot();
         assert_eq!(
             flash_after_eval.declined - flash_before_eval.declined,

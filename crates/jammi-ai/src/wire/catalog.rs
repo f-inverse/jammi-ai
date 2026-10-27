@@ -12,11 +12,16 @@
 //! The embedded binding builds each request with the same pure-Python assembly
 //! the remote client uses, serializes it, and hands the bytes here — so the
 //! in-process and remote control-plane paths decode through one shared seam.
+//! The source listing and description cross back the same way: serialized
+//! replies the Python client projects with the one projection both transports
+//! read.
 
 use prost::Message;
 use tonic::Status;
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
+use jammi_db::catalog::source_repo::SourceDescriptor;
+use jammi_db::source::SourceDescription;
 use jammi_db::store::mutable::MutableTableDefinition;
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TopicDefinition;
@@ -24,6 +29,20 @@ use jammi_db::{ChannelId, TenantId};
 
 use jammi_wire::proto::catalog as pb;
 use jammi_wire::{columns_from_proto, decode_ipc_schema, definition_from_proto, parse_channel_id};
+
+// ─── ListSources / DescribeSource ────────────────────────────────────────────
+
+/// The serialized `ListSources` reply for `descriptors` — the message the gRPC
+/// handler sends.
+pub fn source_descriptors_to_bytes(descriptors: Vec<SourceDescriptor>) -> Vec<u8> {
+    pb::ListSourcesResponse::from(descriptors).encode_to_vec()
+}
+
+/// The serialized `DescribeSource` reply for `description`. Fallible only on a
+/// table's column schema encode.
+pub fn source_description_to_bytes(description: SourceDescription) -> Result<Vec<u8>, Status> {
+    Ok(pb::SourceDescription::try_from(description)?.encode_to_vec())
+}
 
 // ─── RegisterChannel ─────────────────────────────────────────────────────────
 

@@ -30,8 +30,6 @@ from ._assembly import (
     _EDGE_DIRECTION,
     _FILE_FORMAT,
     _MODEL_TASK_NAME,
-    _RESULT_TABLE_KIND_NAME,
-    _SOURCE_KIND_NAME,
     _database_source_kind,
     _local_source_url,
     build_add_channel_columns_request,
@@ -62,6 +60,8 @@ from ._assembly import (
     build_search_request,
     build_subscribe_request,
     recompute_report_to_dict,
+    source_description_to_dict,
+    source_descriptor_to_dict,
     build_refresh_embeddings_request,
     build_compact_embeddings_request,
     build_expire_versions_request,
@@ -240,46 +240,6 @@ def _flight_to_jammi(exc: "pa.ArrowException") -> JammiError:
     return _status_to_jammi(grpc.StatusCode.UNKNOWN, str(exc), None)
 
 
-def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
-    """Project a wire `ResultTable` into the embed wheel's result-table dict.
-
-    `model_id`, `key_column` and `derived_from` round-trip as `None` when the
-    engine did not record one (a derivation runs no model) — the same shape the embedded `Option<String>` serialises
-    to — and `kind` is spelled the same string the embedded `ResultTableKind`
-    serialises to, so a derived (neighbor-graph / as-of-join) table's
-    provenance reads identically regardless of transport. `RESULT_TABLE_KIND_
-    UNSPECIFIED` (never emitted for a genuine result table — every persisted
-    row has a concrete kind) falls back to `"Unspecified"`, the same
-    unrecognised-enum fallback `_source_descriptor_to_dict` uses for `kind`.
-    """
-    return {
-        "table_name": rt.table_name,
-        "source_id": rt.source_id,
-        "model_id": rt.model_id if rt.HasField("model_id") else None,
-        "dimensions": rt.dimensions,
-        "row_count": rt.row_count,
-        "status": rt.status,
-        "key_column": rt.key_column or None,
-        "kind": _RESULT_TABLE_KIND_NAME.get(rt.kind, "Unspecified"),
-        "derived_from": rt.derived_from if rt.HasField("derived_from") else None,
-    }
-
-
-def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any]:
-    """Project a wire `SourceDescriptor` into the embed wheel's descriptor dict.
-
-    The descriptor shape matches the embed wheel's `list_sources` /
-    `describe_source` entries — `source_id`, `source_type`, `status`, and
-    `result_tables` — so a caller reads the same keys regardless of transport.
-    """
-    return {
-        "source_id": d.source_id,
-        "source_type": _SOURCE_KIND_NAME.get(d.kind, "Unspecified"),
-        "status": d.status,
-        "result_tables": [_result_table_to_dict(rt) for rt in d.result_tables],
-    }
-
-
 def _present(message, field: str) -> Optional[str]:
     """A `jammi.v1` optional field's value, or ``None`` when the peer left it
     absent."""
@@ -424,9 +384,9 @@ def _mutable_table_definition_to_dict(
 
     Mirrors the embedded `Database.list_mutable_tables` entry — `id`, `schema`
     (a `pyarrow.Schema` decoded from the IPC framing), `primary_key`, `indexes`
-    (each a `{"name", "columns", "unique"}` dict), `order_column` (empty string
-    when the table declares none, matching the embedded `unwrap_or_default`), and
-    `chunk_size` — so a caller reads the same keys regardless of transport.
+    (each a `{"name", "columns", "unique"}` dict) and `order_column` (empty string
+    when the table declares none, matching the embedded `unwrap_or_default`) — so
+    a caller reads the same keys regardless of transport.
     """
     schema = pa.ipc.open_stream(d.schema).schema
     return {
@@ -438,7 +398,6 @@ def _mutable_table_definition_to_dict(
             for idx in d.indexes
         ],
         "order_column": d.order_column,
-        "chunk_size": d.chunk_size,
     }
 
 
@@ -1304,6 +1263,7 @@ class RemoteDatabase:
         url: str,
         format: Optional[str] = None,
         tenant_column: Optional[str] = None,
+        ca_certificate: Optional[str] = None,
     ) -> None:
         """Register a data source on the remote engine, by the URL that names it.
 
@@ -1315,7 +1275,10 @@ class RemoteDatabase:
         `gs://`, `azure://`). `tenant_column` names the column whose value is
         each row's tenant: a tenant-bound session then reads only its own rows
         and the rows with no tenant, through every verb that reads the source.
-        Maps to `CatalogService.AddSource`.
+        `ca_certificate` is the PEM text of the certificate authority a
+        database's server certificate is verified against, for a server whose
+        certificate the engine's host does not trust; the source then connects
+        verified. Maps to `CatalogService.AddSource`.
         """
         kind = _database_source_kind(url)
         if kind is not None:
@@ -1323,7 +1286,9 @@ class RemoteDatabase:
                 raise InvalidArgument(
                     f"a database source takes no format (got {format!r} for {url!r})"
                 )
-            connection = catalog_pb2.SourceConnection(url=url, tenant_column=tenant_column)
+            connection = catalog_pb2.SourceConnection(
+                url=url, tenant_column=tenant_column, ca_certificate=ca_certificate
+            )
         else:
             try:
                 file_format = _FILE_FORMAT[format]
@@ -1334,7 +1299,10 @@ class RemoteDatabase:
                 ) from None
             kind = catalog_pb2.SourceKind.SOURCE_KIND_FILE
             connection = catalog_pb2.SourceConnection(
-                url=_local_source_url(url), format=file_format, tenant_column=tenant_column
+                url=_local_source_url(url),
+                format=file_format,
+                tenant_column=tenant_column,
+                ca_certificate=ca_certificate,
             )
         self._call(
             self._catalog.AddSource,
@@ -1344,17 +1312,20 @@ class RemoteDatabase:
     def list_sources(self) -> List[Dict[str, Any]]:
         """A descriptor for every source registered to the current tenant.
 
-        Maps to `CatalogService.ListSources`; same dict shape per entry as
-        :meth:`describe_source`.
+        Maps to `CatalogService.ListSources`; each entry is :meth:`describe_source`'s
+        dict without ``tables``, read from the registry alone.
         """
         resp = self._call(self._catalog.ListSources, catalog_pb2.ListSourcesRequest())
-        return [_source_descriptor_to_dict(d) for d in resp.sources]
+        return [source_descriptor_to_dict(d) for d in resp.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
-        """Describe one registered source by id, or ``None`` if not visible.
+        """Describe one registered source by id, or ``None`` if not visible: the
+        :meth:`list_sources` entry plus ``tables``, every table the source serves
+        as ``{"schema", "table", "columns"}`` with ``columns`` a `pyarrow.Schema`.
 
-        Maps to `CatalogService.DescribeSource`. The engine returns a NotFound
-        status when no such source exists; that is surfaced here as ``None``.
+        Maps to `CatalogService.DescribeSource`, which reaches the source to read
+        its tables. The engine returns a NotFound status when no such source
+        exists; that is surfaced here as ``None``.
         """
         try:
             d = self._call(
@@ -1365,7 +1336,7 @@ class RemoteDatabase:
             if getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return None
             raise
-        return _source_descriptor_to_dict(d)
+        return source_description_to_dict(d)
 
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.
@@ -1451,7 +1422,6 @@ class RemoteDatabase:
         primary_key: List[str],
         indexes: Optional[List[Dict[str, Any]]] = None,
         order_column: Optional[str] = None,
-        chunk_size: Optional[int] = None,
     ) -> str:
         """Register a mutable companion table on the remote engine and return its
         catalog id.
@@ -1460,8 +1430,7 @@ class RemoteDatabase:
         list of column names drawn from it. `indexes` is an optional list of dicts
         of shape ``{"name": str, "columns": [str, ...], "unique": bool=False}`` —
         one secondary index per entry. `order_column` is an optional monotonic
-        column enabling streaming `scan_after` reads; `chunk_size` overrides the
-        engine's default scan chunk size. Tenant scope is the session's bound
+        column enabling streaming `scan_after` reads. Tenant scope is the session's bound
         tenant (the wire body is tenant-free). Maps to
         `CatalogService.CreateMutableTable`.
         """
@@ -1471,7 +1440,6 @@ class RemoteDatabase:
             primary_key=primary_key,
             indexes=indexes,
             order_column=order_column,
-            chunk_size=chunk_size,
         )
         resp = self._call(self._catalog.CreateMutableTable, request)
         return resp.mutable_table_id
@@ -1495,8 +1463,7 @@ class RemoteDatabase:
         """A descriptor for every mutable companion table registered to the current
         tenant. Each entry is the same dict shape as the embed
         `Database.list_mutable_tables`: ``id``, ``schema`` (a `pyarrow.Schema`),
-        ``primary_key``, ``indexes``, ``order_column`` (empty when none), and
-        ``chunk_size``. Maps to `CatalogService.ListMutableTables`.
+        ``primary_key``, ``indexes`` and ``order_column`` (empty when none). Maps to `CatalogService.ListMutableTables`.
         """
         resp = self._call(
             self._catalog.ListMutableTables, catalog_pb2.ListMutableTablesRequest()

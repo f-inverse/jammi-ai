@@ -807,7 +807,7 @@ fn quantized_base_training_forward_with_dropout_reserves_the_dropout_stream() {
 
     // A second forward must advance it again, to 2 — the reservation fires
     // on EVERY training forward, not merely the first.
-    let _ = lora.forward(&x).unwrap();
+    lora.forward(&x).unwrap();
     assert_eq!(
         lora.dropout_position().unwrap(),
         Some(2),

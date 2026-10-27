@@ -276,6 +276,15 @@ does, and a database source reads, lists and verifies what it holds.
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
 
+A long error reaches the client (#749). A failure's message rode the gRPC trailers twice, in
+`grpc-message` and in the `grpc-status-details-bin` envelope, beside a typed detail that often
+carried it a third time. A long one, such as an internal error printing a plan, went past a default
+client's 8 KiB metadata limit, and the client raised "resource exhausted" with the real error lost.
+A 20,000-character error took 73,620 trailer bytes. A status now carries at most the first 1,536
+bytes of its message, noting what was cut. It leaves off a typed detail too large to fit, and the
+client reads that error from its code, so its class is kept. The server logs the full text at
+`WARN`.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

@@ -155,6 +155,12 @@ full `[server.limits]` reference and every default.
 | `max_subscriptions` (default 256) | `RESOURCE_EXHAUSTED` | `subscriptions` | Concurrently open `TriggerService.Subscribe` streams; released when the stream ends or the client disconnects. `0` = unbounded. |
 | `max_job_waits` (default 1024) | `RESOURCE_EXHAUSTED` | `job_waits` | Concurrently open `JobService.WaitJob` streams; same release rule. `0` = unbounded. |
 
+An error's message rides the gRPC trailers, which a default client caps at 8 KiB of metadata. A
+status carries at most the first 1,536 bytes of its message, ending in a note of how many bytes
+were cut, and leaves off its typed detail when that would not fit beside it; the client then reads
+the error from its code and message, so its class is kept. The full text is logged at `WARN` by
+`jammi_wire::error` ("an error's message was capped for the client"), in the request's span.
+
 ### Lease and worker timing
 
 One lease primitive (`[lease]`, `crates/jammi-db/src/catalog/lease.rs`) owns

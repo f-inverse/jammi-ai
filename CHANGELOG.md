@@ -159,7 +159,7 @@ fusion comparison, the asymmetric-binary threshold, the ANN cost column) say so.
 Workspace crates build without incremental compilation, so sccache caches them, and
 `ci/dev.sh --gc` prunes target artifacts no build has written for a week.
 
-The dependency audit is green again on the live advisory database, and database sources read what they hold.
+The dependency audit is green again on the live advisory database.
 
 - **Every advisory a reachable release fixes is fixed.** rustls 0.23.46, rustls-webpki 0.103.16,
   webpki-roots 1.0.11, tokio 1.54.1, ctutils 0.4.6 and zstd-sys 2.1.2, and DataFusion's file
@@ -170,14 +170,12 @@ The dependency audit is green again on the live advisory database, and database 
   ^0.13 and call only the unaffected bulk and read paths), and unsafe-libyaml (a substrait build
   dependency, linked into no binary). The two pyo3 exceptions name their real gate, arrow 59,
   in place of a release freeze.
+- **`ci/dev.sh` starts every container for `JAMMI_CI_PLATFORM`.** Its free-space probe ran
+  the image for the host's platform, so a CUDA-image run on an arm64 host failed before it
+  began.
 
-- **A Postgres `money` column reads as the amount it holds.** The driver passed `money`'s binary
-  form through as its value, an `int8` count of the currency's minor unit, so `12.34` read as
-  `1234` and `SUM` was 100 times too large; a filter on the column was refused by Postgres, which
-  has no operator between `money` and a number. A table with a `money` column is now read through
-  a derived table that converts the column to `numeric` in Postgres, so it is a
-  `Decimal128(19, s)` that Postgres filters and aggregates, `s` being the database's money scale.
-  Tables without one are read as before.
+Every request runs under its own tenant, a database is sent only what it reads as the engine
+does, and a database source reads, lists and verifies what it holds.
 
 - **Every request runs under its own tenant.** Flight SQL bound each query's tenant by
   overwriting one process-wide binding, so two tenants querying at once each read the other's
@@ -189,10 +187,18 @@ The dependency audit is green again on the live advisory database, and database 
   names no tenant runs global on every verb. SQL cannot set a query's scope, and a plan planned
   without one is refused. `TenantBoundProvider` is `ResolvedFlightScope`, a `FlightScope`, and
   `GrpcChain` has no `flight_binding`.
+- **A tenant reaches only the sources it sees, by name as by listing.** A source resolved from
+  its catalog row whichever tenant owned it, so a tenant, or a request naming none, that named
+  another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
+  owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
+  the catalogs a query sees and `information_schema` list the same set. The cookbook's tenancy
+  chapters taught the cross-tenant read as a caveat; they now measure it as a hard zero, and a
+  global source with no discriminator as what every tenant shares.
 - **A database is sent only what it reads as the engine does.** Federation handed a
   database the largest sub-plan over its tables whatever it contained, and some of it meant
   something else there or did not exist there: MySQL read `||` as OR, `DATE - DATE` as a
-  number, `=` on strings case-insensitively and sorted NULLs first; Postgres was sent
+  number, `=` on strings case-insensitively, sorted NULLs first and failed `date_trunc`
+  (#743); Postgres was sent
   `approx_distinct` (#750), a session's installed function in a `WHERE` (#765), and a decimal
   `AVG` with more places than the engine planned (#745); a plan holding `unnest` crashed the
   federation rule (#748). One allowlist, read through each database's semantics, now decides
@@ -200,15 +206,10 @@ The dependency audit is green again on the live advisory database, and database 
   non-string keys, averages numbers, counts distinct values and full-joins in the database;
   MySQL does none of those. Everything else stays in the engine, over the rows the database
   returns. The rows a database produces are a `RemoteExec`, a source no engine optimizer
-  reaches into, so a filter or sort above them stays above them (#739). A live test runs every
+  reaches into, so a filter or sort above them stays above them: a `WHERE` on a Postgres column
+  of a Postgres × Parquet join had returned the rows it should have removed (#739). A live test runs every
   admitted and refused construct over Postgres, over MySQL, and over the same rows in a file;
   the MySQL one runs in a new `Test (MySQL)` lane against MySQL 8.4 (`ci/dev.sh --with mysql`).
-- **A list column breaks down by item in every form.** `FROM t CROSS JOIN unnest(f(t.c)) AS
-  u(x)` failed to plan on every source: DataFusion plans a lateral `unnest` as a correlated
-  subquery over one empty row, which its decorrelation does not reach (#748). An optimizer rule,
-  `lateral_unnest`, plans the subquery's projections and unnests over the join's left side, its
-  outer references read as that side's columns, so the lateral and select-list forms answer alike
-  over a file, Postgres and MySQL.
 - **Every Postgres column reads as the value it holds, and none fails its source.** The
   driver named a column's type from its type name and failed the whole source's registration
   on one it did not know — a domain, `jsonb`, `citext`, `timetz` (#740) — failed every query
@@ -216,7 +217,8 @@ The dependency audit is green again on the live advisory database, and database 
   its column, failing the batch (#744). The engine now reads a source's columns from
   Postgres's own catalog and, column by column, reads a type as stored where the driver reads
   it correctly and through Postgres where it does not: a domain as its base type, `money` as
-  `numeric`, a `timestamp` as its instant at UTC (every session pins `TimeZone` to UTC), every
+  `numeric(19, s)` (its binary form read `12.34` as `1234`, so `SUM` was 100 times too large;
+  #741), a `timestamp` as its instant at UTC (every session pins `TimeZone` to UTC), every
   other type as its text.
 - **A Postgres source serves every schema, view and materialized view.** It served the base
   tables of `public` alone, so a table in any other schema, a view and a materialized view
@@ -232,13 +234,6 @@ The dependency audit is green again on the live advisory database, and database 
   the address and the cause; a reachable database leaves the query waiting on a busy pool.
   Every Postgres read runs through one path that keeps that error typed, where the driver's
   flattened it to text.
-- **A tenant reaches only the sources it sees, by name as by listing.** A source resolved from
-  its catalog row whichever tenant owned it, so a tenant, or a request naming none, that named
-  another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
-  owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
-  the catalogs a query sees and `information_schema` list the same set. The cookbook's tenancy
-  chapters taught the cross-tenant read as a caveat; they now measure it as a hard zero, and a
-  global source with no discriminator as what every tenant shares.
 - **A client lists a source's tables and their columns, on either transport.** A remote client
   had no way to: `list_sources` and `describe_source` carried no tables, and `information_schema`
   is off on a server, where a `SET` does not carry from one request to the next (#751).
@@ -265,27 +260,21 @@ The dependency audit is green again on the live advisory database, and database 
   connects) and one holding an unrelated CA (it is refused). **BREAKING** (Rust API):
   `SourceConnection.options`, a map passed to the driver that no remote client could set and the
   URL already carries, is gone.
-- **A mutable table has no chunk size.** `MutableTableDefinition.chunk_size`, its builder
-  method, `MutableTableDefinition.chunk_size` on the wire and the Python `chunk_size=` argument
+- **A list column breaks down by item in every form.** `FROM t CROSS JOIN unnest(f(t.c)) AS
+  u(x)` failed to plan on every source: DataFusion plans a lateral `unnest` as a correlated
+  subquery over one empty row, which its decorrelation does not reach (#748). An optimizer rule,
+  `lateral_unnest`, plans the subquery's projections and unnests over the join's left side, its
+  outer references read as that side's columns, so the lateral and select-list forms answer alike
+  over a file, Postgres and MySQL.
+- **A mutable table has no chunk size.** The definition's `chunk_size` and its builder
+  method, the wire field and the Python `chunk_size=` argument
   set a value no read consulted: `scan_after` returns its rows whole and a trigger replay steps
   by a fixed size of its own. **BREAKING** (Rust API, wire, Python): they are gone, and field 6
   of `jammi.v1.catalog.MutableTableDefinition` is reserved.
-
-- **A filter on a database column holds when the query also joins a file.** The engine ran such a
-  filter above the federated scan, and physical filter pushdown handed it to that scan, which took
-  it and then neither sent it to the database nor applied it: a `WHERE` on a Postgres column of a
-  Postgres × Parquet join returned the rows it should have removed. Every federated sub-plan is now
-  planned behind a `FederatedScanExec` that takes no filter from above, so the filter stays in the
-  engine's `FilterExec`.
-
-- **A MySQL source is sent only what MySQL reads as the engine does.** Federation wrote queries
-  in SQL that MySQL accepted and answered with another meaning: `a || b` as a logical OR,
-  `DATE - DATE` as a subtraction of `YYYYMMDD` numbers, an ascending sort with NULLs first,
-  `=` on strings by a case-insensitive collation; `date_trunc` failed. A MySQL table now carries
-  an allowlist of the plan nodes and expressions MySQL runs with the engine's meaning; a node
-  outside it is not federated and runs in the engine over the rows MySQL returns, and the scan
-  takes no filter or sort it was not handed by that list. Counts, numeric filters and limits are
-  still answered by MySQL.
+- **Every discarded result is handled as what it means** (#731). The workspace's 487 `let _ =`
+  sites are propagated, matched with each outcome named, or not produced. Three tests that passed
+  by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
+  while unwinding, and a guard keeps the pattern out.
 
 ## [0.55.0] - 2026-10-10
 

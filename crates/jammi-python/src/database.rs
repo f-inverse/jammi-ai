@@ -603,6 +603,16 @@ impl PyDatabase {
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
 
+    /// Remove a source the current tenant registered, with the result tables
+    /// and indexes built over it. A source it cannot remove — another
+    /// tenant's, a shared one it did not register, or none — raises NotFound
+    /// and removes nothing.
+    fn remove_source(&self, source_id: &str) -> PyResult<()> {
+        self.check_open()?;
+        crate::released(&self.runtime, self.local_session().remove_source(source_id))
+            .map_err(to_pyerr)
+    }
+
     /// The serialized `SourceDescription` of one registered source, or `None`
     /// when no source with that id is visible to the current tenant. Reaches
     /// the source to read its tables, where the listing reads the registry

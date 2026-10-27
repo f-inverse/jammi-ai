@@ -24,7 +24,8 @@ db = jammi.connect(engine)
 # `get_server_info` reports the engine's version, its features and the storage
 # backends it can write results to. `describe_source` reports one registered
 # source: the tables it serves, each with its columns, and the result tables
-# built on it; and `None` for a name that is not registered.
+# built on it; and `None` for a name that is not registered. `remove_source`
+# removes one.
 
 # %%
 info = db.get_server_info()
@@ -38,6 +39,12 @@ for table in source["tables"]:
 assert [(t["schema"], t["table"]) for t in source["tables"]] == [("public", "tiny_pairs")]
 assert source["tables"][0]["columns"].names == ["text_a", "text_b", "score"]
 assert db.describe_source("no_such_source") is None
+
+# `remove_source` removes a source and what was built over it; the name is then
+# free to register again.
+db.add_source("scratch", url=str(fixtures.path("tiny_pairs.csv")), format="csv")
+db.remove_source("scratch")
+assert db.describe_source("scratch") is None
 
 # %% [markdown]
 # ## Load a model before it is needed

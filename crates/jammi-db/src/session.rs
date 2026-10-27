@@ -609,7 +609,18 @@ impl JammiSession {
     /// deleting, never a row this call merely intended to delete. When step 1
     /// errors (`SourceBusy` or otherwise), step 2 never runs at all: no bytes
     /// are touched, and neither is the source row at step 3.
+    ///
+    /// A source the caller cannot remove — another tenant's, a GLOBAL one a
+    /// tenant reads, or none — is [`JammiError::NotFound`] before step 0, so
+    /// nothing is deleted: in particular not the caller's own result tables
+    /// over a GLOBAL source, which step 1 would otherwise delete while step 3
+    /// left the source in place.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
+        if !self.catalog.owns_source(source_id).await? {
+            return Err(JammiError::NotFound(crate::error::Missing::Source {
+                source_id: source_id.to_string(),
+            }));
+        }
         // 0. Capture each result table's ANN segment bundle URLs BEFORE the
         //    catalog delete: `delete_result_tables_for_source` cascades to
         //    `index_segments`, so the per-segment bundle paths must be read

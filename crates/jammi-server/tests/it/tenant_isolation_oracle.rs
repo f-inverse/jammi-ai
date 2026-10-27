@@ -396,8 +396,15 @@ fn cases() -> Vec<IsolationCase> {
             None,
             {
                 // STRICT delete predicate: a tenant removes only a source it owns —
-                // never a peer's, never a shared GLOBAL one.
+                // never a peer's, never a shared GLOBAL one — and one it cannot
+                // remove is a source NotFound, never a success that removed nothing.
                 let (_dir, cat_a, cat_b, cat_g) = ab_catalogs().await;
+                let refused = |err: JammiError, id: &str| {
+                    assert!(
+                        matches!(&err, JammiError::NotFound(Missing::Source { source_id }) if source_id == id),
+                        "expected a source NotFound for {id}, got {err:?}"
+                    );
+                };
                 cat_g
                     .register_source("global_src", SourceType::File, &parquet_connection())
                     .await
@@ -406,12 +413,15 @@ fn cases() -> Vec<IsolationCase> {
                     .register_source("src_a", SourceType::File, &parquet_connection())
                     .await
                     .unwrap();
-                cat_b.remove_source("src_a").await.unwrap();
+                refused(cat_b.remove_source("src_a").await.unwrap_err(), "src_a");
                 assert!(
                     cat_a.get_source("src_a").await.unwrap().is_some(),
                     "tenant B must not delete tenant A's source"
                 );
-                cat_b.remove_source("global_src").await.unwrap();
+                refused(
+                    cat_b.remove_source("global_src").await.unwrap_err(),
+                    "global_src",
+                );
                 assert!(
                     cat_g.get_source("global_src").await.unwrap().is_some(),
                     "a tenant must not delete a shared GLOBAL source"

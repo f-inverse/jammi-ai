@@ -7,6 +7,7 @@ use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::{JammiError, Missing};
 use jammi_db::source::SourceTable;
+use jammi_db::tenant::TenantId;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
@@ -1367,6 +1368,130 @@ async fn count_rows(
         .expect("COUNT(*) is Int64")
         .value(0);
     Ok(n)
+}
+
+/// A session removes only a source it owns. A source it cannot remove —
+/// another tenant's, a shared GLOBAL one, or one never registered — is a
+/// source NotFound, and nothing is deleted: not the source, and not the
+/// caller's own result table built over it, row or bytes.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_source_the_caller_cannot_remove_is_not_found_and_nothing_is_deleted(
+    backend: BackendKind,
+) {
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
+    let suffix = unique_suffix();
+    let (shared, owned, never) = (
+        format!("shared_{suffix}"),
+        format!("owned_{suffix}"),
+        format!("never_{suffix}"),
+    );
+    let (shared, owned, never) = (shared.as_str(), owned.as_str(), never.as_str());
+    let parquet = || SourceConnection {
+        url: Some(common::fixture_url("patents.parquet")),
+        format: Some(FileFormat::Parquet),
+        ..Default::default()
+    };
+    session
+        .add_source(shared, SourceType::File, parquet())
+        .await
+        .unwrap();
+    session
+        .with_tenant_scoped(tenant_a, |a| async move {
+            a.add_source(owned, SourceType::File, parquet()).await
+        })
+        .await
+        .unwrap();
+
+    // B's own ready result table over the GLOBAL source, with its bytes.
+    let table = format!("b_embeddings_{suffix}");
+    let bytes = dir.path().join(format!("{table}.parquet"));
+    std::fs::write(&bytes, b"b-bytes").unwrap();
+    let url = format!("file://{}", bytes.display());
+    let (table, url) = (table.as_str(), url.as_str());
+    session
+        .with_tenant_scoped(tenant_b, |b| async move {
+            b.catalog()
+                .create_result_table(CreateResultTableParams {
+                    table_name: table,
+                    source_id: shared,
+                    producer: Producer::Model {
+                        model_id: "b-model".to_string(),
+                        task: ModelTask::TextEmbedding,
+                    },
+                    kind: ResultTableKind::Model,
+                    derived_from: None,
+                    parquet_path: url,
+                    dimensions: Some(4),
+                    key_column: Some("id"),
+                    text_columns: None,
+                    storage_precision: StoragePrecision::F32,
+                    oversample: 4,
+                    created_at: jammi_db::catalog::lease::canonical_stamp_now(),
+                    writer_id: None,
+                    lease: None,
+                    job_attempt: None,
+                    replaces: None,
+                })
+                .await?;
+            b.catalog()
+                .update_result_table_status(table, ResultTableStatus::Ready, 3)
+                .await
+        })
+        .await
+        .unwrap();
+
+    for refused in [owned, shared, never] {
+        let err = session
+            .with_tenant_scoped(tenant_b, |b| async move { b.remove_source(refused).await })
+            .await
+            .expect_err("a source tenant B does not own is not removable by B");
+        assert_source_not_found(&err, refused);
+    }
+    let a_sees_owned = session
+        .with_tenant_scoped(
+            tenant_a,
+            |a| async move { a.catalog().get_source(owned).await },
+        )
+        .await
+        .unwrap();
+    assert!(a_sees_owned.is_some(), "B's refused remove kept A's source");
+    assert!(
+        session
+            .catalog()
+            .get_source(shared)
+            .await
+            .unwrap()
+            .is_some(),
+        "B's refused remove kept the GLOBAL source"
+    );
+    let b_table = session
+        .with_tenant_scoped(tenant_b, |b| async move {
+            b.catalog().get_result_table(table).await
+        })
+        .await
+        .unwrap();
+    assert!(
+        b_table.is_some(),
+        "B's refused remove kept B's own result table over the GLOBAL source"
+    );
+    assert!(bytes.exists(), "B's refused remove kept that table's bytes");
+
+    session
+        .with_tenant_scoped(tenant_a, |a| async move { a.remove_source(owned).await })
+        .await
+        .unwrap();
+    let err = session
+        .with_tenant_scoped(tenant_a, |a| async move { a.remove_source(owned).await })
+        .await
+        .expect_err("a removed source is gone");
+    assert_source_not_found(&err, owned);
 }
 
 fn assert_source_not_found(err: &JammiError, source_id: &str) {

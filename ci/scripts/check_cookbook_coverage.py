@@ -416,6 +416,7 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("refresh_embeddings", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.refresh_embeddings(")),
     ("register_channel", DirectCell("eval-channels/eval-channels.qmd", "db.register_channel(")),
     ("register_topic", Recipe("recipes/trigger_streams/example.py", "db.register_topic(")),
+    ("remove_source", Recipe("recipes/model_catalog/example.py", "db.remove_source(")),
     ("rrf_fuse", DirectCell("retrieval/retrieval.qmd", "db.rrf_fuse(")),
     ("search", Recipe("quickstart/quickstart.py", "db.search(")),
     ("session_id", Recipe("recipes/remote_session/example.py", "remote.session_id")),

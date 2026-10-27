@@ -276,6 +276,14 @@ does, and a database source reads, lists and verifies what it holds.
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
 
+A source is removed from Python, and only by its owner (#757). The Python client had no
+`remove_source`, so an app could delete a source only through a private stub. Both backends now
+carry it. A remove of a source the caller does not own reported success while removing nothing,
+and for a shared GLOBAL source it was worse: it deleted the caller's own result tables built over
+the source, bytes included, and left the source in place. A source the caller cannot remove —
+another tenant's, a GLOBAL one a tenant reads, a name never registered or already removed — is now
+`NotFound` before anything is deleted, on every surface.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

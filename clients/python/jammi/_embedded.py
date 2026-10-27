@@ -388,6 +388,14 @@ class EmbeddedBackend:
         description.ParseFromString(body)
         return source_description_to_dict(description)
 
+    def remove_source(self, source_id: str) -> None:
+        """Remove a source the current tenant registered, with the result
+        tables and indexes built over it. A source this tenant cannot remove —
+        another tenant's, a shared one it did not register, one never
+        registered or already removed — raises :class:`~jammi.errors.NotFound`
+        and removes nothing."""
+        self._native.remove_source(source_id)
+
     def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
         """The ANN index segments of one result table, in ``segment_id`` order.
 

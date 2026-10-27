@@ -1,4 +1,5 @@
 use crate::common;
+use arrow::array::RecordBatch;
 
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
@@ -1367,6 +1368,54 @@ async fn count_rows(
         .expect("COUNT(*) is Int64")
         .value(0);
     Ok(n)
+}
+
+/// A query that matches no row answers its columns all the same: one empty
+/// batch of the plan's schema, never no batches, whatever empties it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_query_with_no_rows_answers_its_columns(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let source_id = format!("patents_{}", unique_suffix());
+    session
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let table = format!("{source_id}.public.patents");
+    let columns = |batches: &[RecordBatch]| -> Vec<String> {
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    };
+    for query in [
+        format!("SELECT id, title FROM {table} WHERE 1 = 0"),
+        format!("SELECT id, title FROM {table} LIMIT 0"),
+        format!("SELECT id, title FROM {table} WHERE year > 3000 ORDER BY id"),
+        format!(
+            "SELECT year AS id, COUNT(*) AS title FROM {table} WHERE year > 3000 GROUP BY year"
+        ),
+    ] {
+        let batches = session.sql(&query).await.unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            0,
+            "{query}"
+        );
+        assert_eq!(columns(&batches), ["id", "title"], "{query}");
+    }
 }
 
 fn assert_source_not_found(err: &JammiError, source_id: &str) {

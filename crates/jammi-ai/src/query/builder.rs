@@ -365,10 +365,15 @@ impl QueryBuilder {
             .plan
             .execute(0, task_ctx)
             .map_err(|e| JammiError::from(e.context("Search execute")))?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| JammiError::from(e.context("Search collect")))?;
+        // A search with no hits is one empty batch of the plan's schema, so
+        // its columns reach the caller on every transport.
+        let batches = jammi_db::session::with_schema(
+            self.plan.schema(),
+            stream
+                .try_collect()
+                .await
+                .map_err(|e| JammiError::from(e.context("Search collect")))?,
+        );
 
         let inference = ChannelId::new("inference")?;
         let retrieved: Vec<ChannelId> = self

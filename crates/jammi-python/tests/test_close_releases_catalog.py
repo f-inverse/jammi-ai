@@ -259,14 +259,15 @@ def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path
     could have).
     """
     db = jammi_native.open_local(artifact_dir=str(tmp_path))
-    assert db.list_sources() == []
+    # An empty `ListSourcesResponse` serializes to no bytes at all.
+    assert db._list_sources_proto() == b""
 
     db.close()
     db.close()  # idempotent: a second close is a no-op, not an error
     db.close()
 
     with pytest.raises(FailedPrecondition, match="closed"):
-        db.list_sources()
+        db._list_sources_proto()
     with pytest.raises(FailedPrecondition, match="closed"):
         db.job("no-such-job")
     with pytest.raises(FailedPrecondition, match="closed"):
@@ -277,7 +278,7 @@ def test_use_after_close_raises_the_typed_error_and_close_is_idempotent(tmp_path
     # And the file really is free: a fresh handle on the same directory opens
     # in this process, so the closed handle is inert rather than wedged.
     fresh = jammi_native.open_local(artifact_dir=str(tmp_path))
-    assert fresh.list_sources() == []
+    assert fresh._list_sources_proto() == b""
     fresh.close()
 
 

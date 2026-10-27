@@ -1282,3 +1282,113 @@ fn string_column_values(batch: &RecordBatch, name: &str) -> Vec<String> {
         col.data_type()
     );
 }
+
+/// The `(id, name)` rows of `table` a read sees: under `tenant`'s scope when
+/// one is given (its own rows and the global ones), else unscoped (the global
+/// rows alone).
+async fn names_seen(
+    session: &jammi_db::session::JammiSession,
+    tenant: Option<jammi_db::TenantId>,
+    table: &str,
+) -> Vec<(i64, String)> {
+    let sql = format!("SELECT id, name FROM {table} ORDER BY id");
+    let batches = match tenant {
+        Some(t) => {
+            session
+                .with_tenant_scoped(t, |scope| async move { scope.sql(&sql).await })
+                .await
+        }
+        None => session.sql(&sql).await,
+    }
+    .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    rows
+}
+
+/// A statement does its work while its stream is polled, which can be after
+/// the scope that planned it has ended — a caller drains a `sql_stream` after
+/// its `with_tenant_scoped` closure returned; a Flight SQL response streams
+/// after its handler returned. An `INSERT`, `UPDATE` and `DELETE` planned under
+/// a tenant each run as that tenant however late, and on whatever task, their
+/// stream is drained: the row is the tenant's own, not a global one, and the
+/// tenant's later statements find it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_statement_drained_after_its_scope_runs_as_its_planning_tenant(backend: BackendKind) {
+    use std::str::FromStr;
+
+    use crate::common::drain_after_scope;
+
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let tenant = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let id = unique_id("widgets");
+    let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    let table = format!("mutable.public.{}", id.as_str());
+
+    drain_after_scope(
+        &session,
+        tenant,
+        &format!("INSERT INTO {table} (id, name, score) VALUES (1, 'planned', 1.0)"),
+    )
+    .await;
+    assert_eq!(
+        names_seen(&session, Some(tenant), &table).await,
+        vec![(1, "planned".to_string())],
+        "the tenant sees the row its INSERT wrote"
+    );
+    assert_eq!(
+        names_seen(&session, None, &table).await,
+        vec![],
+        "the row is the tenant's own, not a global one"
+    );
+
+    drain_after_scope(
+        &session,
+        tenant,
+        &format!("UPDATE {table} SET name = 'updated' WHERE id = 1"),
+    )
+    .await;
+    assert_eq!(
+        names_seen(&session, Some(tenant), &table).await,
+        vec![(1, "updated".to_string())],
+        "the tenant's UPDATE rewrote its own row"
+    );
+
+    drain_after_scope(
+        &session,
+        tenant,
+        &format!("DELETE FROM {table} WHERE id = 1"),
+    )
+    .await;
+    assert_eq!(
+        names_seen(&session, Some(tenant), &table).await,
+        vec![],
+        "the tenant's DELETE removed its own row"
+    );
+}

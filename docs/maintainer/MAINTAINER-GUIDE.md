@@ -4568,8 +4568,9 @@ to exact search.
   `decode_ipc_stream` (or `error_from_status`).
 - **Remote `sql` (Flight SQL lane):** `DataClient::sql` (`crates/jammi-client/src/lib.rs`)
   opens a `FlightSqlServiceClient` over the *same* tonic channel and stamps the **bound**
-  session id (not a fresh one) → server `TenantBoundProvider` scopes the query to the bound
-  tenant (shared-binding path, [§7]).
+  session id (not a fresh one) → the server's tenant-binding layer (`TenantResolverLayer`)
+  runs the query — its planning and every frame of its result stream — inside the bound
+  tenant's own scope; `TenantBoundProvider` refuses a request outside it.
 - **Eval IR metrics (numerics path):** `EvalRunner` encodes each query →
   `result_store.search_vectors` → `cosine_distance` (top-k heap, sorted `(dist,_row_id)`) →
   `RetrievalMetrics::recall_at_ks`/`compute_query`/`aggregate` → serialize through
@@ -5114,7 +5115,19 @@ auto-available to every encoder.)
   over the *same* `SessionTransport` (`crates/jammi-client/src/lib.rs`); separate transports
   silently un-scope tenant bindings.
 - **Handlers must use `scoped`, never sticky `bind_tenant`** — all handlers share one
-  `Arc<InferenceSession>`; `bind_tenant` would race across concurrent requests.
+  `Arc<InferenceSession>`; `bind_tenant` would race across concurrent requests (#738: the
+  Flight lane once did, and concurrent tenants read each other's rows). The tenant-binding
+  layer already runs every handler, and every poll of its response body, inside the request's
+  scope; `scoped` re-installs it for work a handler hands to a task of its own. The
+  `server tenant scope` guard fails any sticky tenant write under `crates/jammi-server/src`.
+- **Work done while a stream is polled carries its planning tenant.** A statement's work can
+  run after its planning scope ended (a Flight SQL response streams after its handler
+  returned; a caller drains `sql_stream` after its `with_tenant_scoped` closure) or on a task
+  DataFusion spawned — where no scope reaches, and a read falls back to the sticky binding. So
+  an operator that does tenant-dependent work while polled reads the tenant when it plans and
+  carries it: `MutableTableSink`, `RowRewriteExec`, `StoreStatementExec`, `VectorSearchExec`
+  (and `TenantScopedModels` for the model bind). A new such operator does the same, with a
+  test that drains its stream on another task after the planning scope ended.
 - **gRPC-Web layer order is load-bearing.** `GrpcWebTrailersLayer` *before* `GrpcWebLayer`
   (`crates/jammi-server/src/runtime.rs`); reorder and gRPC-Web error handling breaks (raw gRPC
   unaffected).

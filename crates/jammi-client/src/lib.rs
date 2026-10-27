@@ -171,7 +171,7 @@ impl DataClient {
     /// over the *same* tonic channel the typed-RPC verbs use, stamps the
     /// [`SESSION_HEADER`] with [`Self::session_id`] — the identical id
     /// `bind_tenant` bound the tenant scope against — so the server's
-    /// `TenantBoundProvider` resolves this query to that bound tenant, then runs
+    /// tenant-binding layer resolves this query to that bound tenant, then runs
     /// `execute` → `do_get(ticket)` per endpoint and concatenates the streamed
     /// batches. Stamping the bound session id (not a fresh one) is what keeps a
     /// `--tenant A` query scoped to tenant A rather than silently unscoped.

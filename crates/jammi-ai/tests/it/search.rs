@@ -912,3 +912,65 @@ async fn hydration_carries_a_source_key_named_row_id_once_and_refuses_other_coll
         "a non-key source column named like a result column is refused: {err}"
     );
 }
+
+/// A search does its work when it runs, which can be after the scope that
+/// built it has ended. Built under a tenant over that tenant's own embedding
+/// table, an exact search run once the scope is gone — on a task of its own,
+/// where nothing of the scope is left — still searches the table: its scan
+/// resolves the table as the tenant that built the search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_run_after_its_scope_searches_as_the_tenant_that_built_it() {
+    use std::str::FromStr;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session
+        .add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let tenant = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let (model, columns) = (tiny_bert_model(), ["abstract".to_string()]);
+    session
+        .with_tenant_scoped(tenant, |_scope| {
+            session.generate_text_embeddings(
+                "patents",
+                &model,
+                &columns,
+                "id",
+                jammi_db::store::CachePolicy::Bypass,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+
+    let search = session
+        .with_tenant_scoped(tenant, |_scope| {
+            session.search(
+                "patents",
+                vec![0.5_f32; 32],
+                5,
+                None,
+                SearchMethod::Exact,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+    let results = tokio::spawn(search.run()).await.unwrap().unwrap();
+
+    let rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 5, "the search found the tenant's own rows");
+}

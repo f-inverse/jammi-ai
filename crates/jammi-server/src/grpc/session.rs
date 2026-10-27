@@ -108,9 +108,9 @@ pub enum TenantScope {
 
 /// The single tenant-binding seam. One resolver resolves each request's
 /// transport metadata to a [`TenantScope`]; the async tenant-binding tower layer
-/// ([`crate::tenant_resolver_layer`]) applies it to every engine service, and
-/// the Flight SQL provider applies it to the `db.sql` lane. There is exactly one
-/// binder — no separate interceptor.
+/// ([`crate::tenant_resolver_layer`]) applies it to every engine service, the
+/// Flight SQL `db.sql` lane included. There is exactly one binder — no separate
+/// interceptor.
 ///
 /// The engine default is [`SessionIdTenantResolver`] (OSS-cooperative:
 /// `jammi-session-id` → [`SessionStore`]). A downstream composing the seam
@@ -160,7 +160,7 @@ impl SessionIdTenantResolver {
     }
 
     /// Construct the engine default resolver as the boxed trait object the
-    /// [`crate::runtime::GrpcChain`] field and the Flight provider hold.
+    /// [`crate::runtime::GrpcChain`] field and the tenant-binding layer hold.
     pub fn arc(store: SessionStore) -> Arc<dyn TenantResolver> {
         Arc::new(Self::new(store))
     }

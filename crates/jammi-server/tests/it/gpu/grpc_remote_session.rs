@@ -128,7 +128,6 @@ async fn start_gpu_engine_server() -> GpuEngineServer {
     let chain = jammi_server::runtime::GrpcChain {
         addr: ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: None,
         engine: Some(session),

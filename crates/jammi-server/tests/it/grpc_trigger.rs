@@ -214,7 +214,6 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
     let chain = jammi_server::runtime::GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store_for_server.clone(),
         trigger: Some(trigger),
         engine: None,

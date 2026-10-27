@@ -433,3 +433,49 @@ async fn read_recent(ctx: &jammi_db::session::QueryContext) -> Vec<arrow::array:
         .await
         .unwrap()
 }
+
+/// The catalog row of the result table `name`, read under the admin scope so
+/// it is found whichever tenant owns it.
+async fn result_table_row(
+    session: &JammiSession,
+    name: &str,
+) -> Option<jammi_db::catalog::result_repo::ResultTableRecord> {
+    session
+        .with_admin_scope(|_admin| async move { session.catalog().get_result_table(name).await })
+        .await
+        .unwrap()
+}
+
+/// A `CREATE TABLE … AS` and a `DROP TABLE` run while their stream is polled,
+/// which can be after the scope that planned them has ended. Each runs as the
+/// tenant it was planned under however late, and on whatever task, its stream
+/// is drained: the table is created owned by that tenant, and dropped by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_statement_drained_after_its_scope_runs_as_its_planning_tenant() {
+    use std::str::FromStr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (session, _store, patents) = session_with_store(dir.path()).await;
+    let tenant = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+
+    common::drain_after_scope(
+        &session,
+        tenant,
+        &format!("CREATE TABLE late AS SELECT id, title FROM {patents}.public.patents"),
+    )
+    .await;
+    let row = result_table_row(&session, "late")
+        .await
+        .expect("the statement created the table");
+    assert_eq!(
+        row.tenant_id,
+        Some(tenant.to_string()),
+        "the table is owned by the tenant that planned the statement"
+    );
+
+    common::drain_after_scope(&session, tenant, "DROP TABLE late").await;
+    assert!(
+        result_table_row(&session, "late").await.is_none(),
+        "the tenant's DROP TABLE removed its own table"
+    );
+}

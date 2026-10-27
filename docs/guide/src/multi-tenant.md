@@ -100,9 +100,18 @@ header; every Flight SQL query the same connection issues afterwards
 inherits the binding through the same resolver — the engine-default
 `SessionIdTenantResolver` — applied by the single async tenant-binding layer
 (`TenantResolverLayer`) that fronts both the `CatalogService` and the Flight
-SQL provider. Browser clients reach the same `CatalogService` over HTTP/1.1
+SQL service. Browser clients reach the same `CatalogService` over HTTP/1.1
 via the gRPC-Web shim (`application/grpc-web+proto`) — no separate REST
 surface, same `jammi-session-id` header semantics.
+
+The layer runs each request inside that request's own tenant scope — its
+handler, and every frame of a streamed result — so connections bound to
+different tenants can query and write at the same time and each sees only its
+own rows (plus the global ones). A statement that does its work while its
+result streams (an `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE … AS` or
+`DROP TABLE` over Flight SQL) runs as the tenant that issued it. A connection
+that binds no tenant runs explicitly unscoped: it sees only global rows, and a
+source it registers is global, whatever another connection ran before it.
 
 ```python
 import grpc
@@ -153,8 +162,8 @@ to both transports, so there is nothing separate to wire up for Flight.
    `Ok(TenantScope::Tenant(t))`.
 3. **The engine binds it.** The async `TenantResolverLayer` maps the resolved
    scope onto the `SessionTenant` request extension every verb handler reads,
-   and the Flight SQL provider (`TenantBoundProvider`) binds the same scope for
-   `db.sql` — you write only `resolve`.
+   and runs the request — a Flight SQL `db.sql` query included — inside that
+   scope — you write only `resolve`.
 
 Because `resolve` runs *in front of* every handler, the tenant the engine acts
 on is the one the credential proves, not one the caller asserts. The
@@ -207,7 +216,7 @@ use std::sync::Arc;
 use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
 
 let chain = GrpcChain {
-    // .. addr, flight_ctx, flight_binding, store, trigger, engine, tiers, metrics ..
+    // .. addr, flight_ctx, store, trigger, engine, tiers, metrics ..
     tenant_resolver: Arc::new(AuthResolver),
     ..chain_defaults
 };

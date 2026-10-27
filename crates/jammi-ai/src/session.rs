@@ -993,9 +993,9 @@ impl InferenceSession {
         self.inner.config()
     }
 
-    /// Shared handle to the engine's tenant binding. The OSS server's
-    /// Flight SQL `TenantBoundProvider` updates this for the duration of
-    /// each query so the analyzer rule scopes rows to the bound tenant.
+    /// Shared handle to the engine's tenant binding — the one the analyzer
+    /// rule, the catalog and the mutable tables read. A served engine never
+    /// writes it: the server runs each request inside its own tenant scope.
     pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {
         self.inner.tenant_binding_arc()
     }

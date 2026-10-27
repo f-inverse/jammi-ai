@@ -430,3 +430,26 @@ pub async fn kill_child_at_checkpoint(path: &str, dir: &std::path::Path, checkpo
     }
     child.kill().await.expect("SIGKILL the parked child");
 }
+
+/// Plan `sql` under `tenant`'s scope, then drain its stream on another task
+/// once that scope has ended — the way a Flight SQL response streams after
+/// its handler returned, and a caller drains a `sql_stream` after its
+/// `with_tenant_scoped` closure did. A statement does its work while its
+/// stream is polled, so this is how a test sees which tenant that work ran
+/// as when nothing of the planning scope is left.
+pub async fn drain_after_scope(
+    session: &jammi_db::session::JammiSession,
+    tenant: jammi_db::TenantId,
+    sql: &str,
+) {
+    use futures::TryStreamExt;
+
+    let stream = session
+        .with_tenant_scoped(tenant, |scope| async move { scope.sql_stream(sql).await })
+        .await
+        .unwrap_or_else(|e| panic!("plan `{sql}`: {e}"));
+    tokio::spawn(stream.try_collect::<Vec<_>>())
+        .await
+        .expect("the draining task ran")
+        .unwrap_or_else(|e| panic!("run `{sql}`: {e}"));
+}

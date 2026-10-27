@@ -142,11 +142,9 @@ async fn probe_chain(addr: SocketAddr, resolver: Arc<dyn TenantResolver>) -> (Gr
             .expect("session"),
     );
     let flight_ctx = session.context().clone();
-    let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
         addr,
         flight_ctx,
-        flight_binding,
         store: SessionStore::new(),
         trigger: None,
         engine: None,

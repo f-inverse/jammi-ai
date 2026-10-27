@@ -126,11 +126,9 @@ async fn transport_only_chain(addr: SocketAddr) -> (GrpcChain, TempDir, Arc<Jamm
             .expect("session"),
     );
     let flight_ctx = session.context().clone();
-    let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
         addr,
         flight_ctx,
-        flight_binding,
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: None,
@@ -496,11 +494,9 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
         .await
         .expect("session");
     let flight_ctx = session.context().clone();
-    let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
         addr,
         flight_ctx,
-        flight_binding,
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(session),
@@ -823,11 +819,9 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
     }
 
     let flight_ctx = session.context().clone();
-    let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
         addr: super::common::grpc::ephemeral_addr(),
         flight_ctx,
-        flight_binding,
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(session),

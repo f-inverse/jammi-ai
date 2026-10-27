@@ -346,7 +346,6 @@ pub fn chain_over_session(
     let chain = jammi_server::runtime::GrpcChain {
         addr,
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger,
         engine: Some(session),

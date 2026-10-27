@@ -35,6 +35,8 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
+use crate::tenant::TenantId;
+
 use super::provider::{count_batch, MutableTableProvider};
 
 /// What a rewrite does to the rows it selects.
@@ -246,6 +248,7 @@ impl ExtensionPlanner for RowRewritePlanner {
             Arc::clone(&node.target),
             node.rewrite,
             Arc::clone(input),
+            node.target.tenant.current_tenant(),
         ))))
     }
 }
@@ -256,6 +259,11 @@ pub struct RowRewriteExec {
     target: Arc<MutableTableProvider>,
     rewrite: Rewrite,
     input: Arc<dyn ExecutionPlan>,
+    /// The tenant the statement was planned under — the one its input
+    /// selected rows as. The rewrite runs while this node's stream is polled,
+    /// after the planning scope may have ended, so it runs as this tenant
+    /// rather than whatever is ambient by then.
+    tenant: Option<TenantId>,
     properties: Arc<PlanProperties>,
 }
 
@@ -273,6 +281,7 @@ impl RowRewriteExec {
         target: Arc<MutableTableProvider>,
         rewrite: Rewrite,
         input: Arc<dyn ExecutionPlan>,
+        tenant: Option<TenantId>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(count_schema().inner().clone()),
@@ -284,6 +293,7 @@ impl RowRewriteExec {
             target,
             rewrite,
             input,
+            tenant,
             properties,
         }
     }
@@ -292,6 +302,7 @@ impl RowRewriteExec {
         target: Arc<MutableTableProvider>,
         rewrite: Rewrite,
         input: Arc<dyn ExecutionPlan>,
+        tenant: Option<TenantId>,
         context: Arc<TaskContext>,
     ) -> DfResult<RecordBatch> {
         let schema = input.schema();
@@ -309,7 +320,7 @@ impl RowRewriteExec {
             Rewrite::Update => Some(rows(width)?),
         };
         let rewritten = target
-            .rewrite_rows(old, new)
+            .rewrite_rows(tenant, old, new)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         count_batch(rewritten)
@@ -353,6 +364,7 @@ impl ExecutionPlan for RowRewriteExec {
             Arc::clone(&self.target),
             self.rewrite,
             input,
+            self.tenant,
         )))
     }
 
@@ -371,6 +383,7 @@ impl ExecutionPlan for RowRewriteExec {
             Arc::clone(&self.target),
             self.rewrite,
             Arc::clone(&self.input),
+            self.tenant,
             context,
         );
         Ok(Box::pin(RecordBatchStreamAdapter::new(

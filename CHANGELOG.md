@@ -6,6 +6,26 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **Concurrent tenants over Flight SQL each see only their own rows (#738).** The Flight SQL
+  lane bound each query's tenant by overwriting one value the whole server shared, so two
+  tenants querying at once read each other's rows about half the time, and a connection that
+  bound no tenant inherited whichever tenant had queried last: it listed that tenant's private
+  sources, and a source it registered as global became that tenant's. Flight SQL now sits behind
+  the same tenant-binding layer as every gRPC service, and the layer runs each request — its
+  handler and every frame of its streamed response — inside that request's own scope; a caller
+  bound to no tenant runs explicitly unscoped. **BREAKING** (Rust): `GrpcChain` has no
+  `flight_binding`, `TenantBoundProvider::new` takes only the base state,
+  `serve_flight_with_catalog_service` takes no binding, `TenantBinding::shared_arc` is gone,
+  and `AssembledChain::mount_tenant_scoped` requires its service's body to be an
+  `http_body::Body` (every tonic service's is).
+- **A statement runs as the tenant that issued it, however late its result is drained.** An
+  `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE … AS` or `DROP TABLE` does its work while its
+  result streams: over Flight SQL after the handler has returned, in process when a caller drains
+  `sql_stream` after its `with_tenant_scoped` closure. It ran as whatever tenant was in force by
+  then, so concurrent Flight SQL writes were stamped with, or refused as, another tenant, and a
+  late-drained in-process statement wrote global rows. Each statement now carries the tenant it
+  was planned under to that work, and so does a vector search's scan.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

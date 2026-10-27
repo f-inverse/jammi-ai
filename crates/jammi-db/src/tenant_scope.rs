@@ -28,7 +28,8 @@ tokio::task_local! {
     /// Task-local tenant override consulted by [`TenantBinding::current`].
     ///
     /// Set by [`crate::session::JammiSession::with_tenant_scoped`] for the
-    /// duration of one closure (typically one gRPC request handler). When
+    /// duration of one closure, and by [`TenantBinding::scope_with`] for one
+    /// served request (its handler and every poll of its response). When
     /// present, it shadows the session's shared [`TenantBinding::shared`]
     /// for the lifetime of the executing task — including across `.await`
     /// points and recursive calls inside the closure — without mutating
@@ -86,26 +87,32 @@ impl SourceTenantColumns {
 /// The binding overlays two values:
 ///
 /// 1. A **task-local override** (`CURRENT_TENANT_OVERRIDE`) installed for
-///    the duration of one [`crate::session::JammiSession::with_tenant_scoped`]
-///    closure. Concurrent tasks each carry their own override — reads see
-///    the override of the task that initiated them, with no shared-state
-///    write involved.
+///    the duration of one scope — a
+///    [`crate::session::JammiSession::with_tenant_scoped`] closure, or one
+///    request the server's tenant-binding layer runs ([`Self::scope_with`]).
+///    Concurrent tasks each carry their own override — reads see the override
+///    of the task that initiated them, with no shared-state write involved.
 /// 2. A **shared default** (`Arc<RwLock<TenantContext>>`) mutated by the
 ///    sticky session-level binding APIs ([`crate::session::JammiSession::bind_tenant`],
-///    [`crate::session::JammiSession::with_tenant`], the Flight SQL
-///    [`SessionStateProvider`] in `jammi-server`). Sticky-binding callers
+///    [`crate::session::JammiSession::with_tenant`]). Sticky-binding callers
 ///    that hold the session behind `Arc` and serialise their requests still
-///    work unchanged.
+///    work unchanged. A served session never writes it: every request is a
+///    scope of its own.
 ///
 /// [`Self::current`] returns the override when present, the shared value
 /// otherwise. Every reader on the engine side consults [`Self::current`];
 /// no reader peeks at the inner `RwLock` directly.
 ///
+/// A statement's work can happen after the scope that planned it has ended —
+/// a stream drained after its `with_tenant_scoped` closure returned, a Flight
+/// SQL response polled after its handler returned — or on a task the engine
+/// spawned, where no scope reaches. An operator that does tenant-dependent
+/// work while its stream is polled therefore reads the binding when it is
+/// planned, and carries that tenant to the work itself.
+///
 /// `Clone` is cheap (an `Arc` clone); the binding is shared between the
 /// session, the [`TenantScopeAnalyzerRule`], the [`crate::catalog::Catalog`],
 /// and the mutable-table provider/sink.
-///
-/// [`SessionStateProvider`]: https://docs.rs/datafusion-flight-sql-server/latest/datafusion_flight_sql_server/session/trait.SessionStateProvider.html
 #[derive(Debug, Clone)]
 pub struct TenantBinding {
     shared: Arc<RwLock<TenantContext>>,
@@ -137,8 +144,6 @@ impl TenantBinding {
     }
 
     /// Snapshot the sticky shared value, ignoring any task-local override.
-    /// Used by the constructor helpers in tests and by the Flight SQL
-    /// `SessionStateProvider` which mutates the shared value directly.
     pub fn read_shared(&self) -> TenantContext {
         *self.shared.read().expect("tenant binding lock poisoned")
     }
@@ -150,23 +155,45 @@ impl TenantBinding {
         *self.shared.write().expect("tenant binding lock poisoned") = ctx;
     }
 
-    /// Shared handle to the inner `Arc<RwLock<TenantContext>>`. Used by the
-    /// server-side Flight SQL provider in `jammi-server`, which mutates the
-    /// shared value from a request interceptor that does not (yet) thread
-    /// the binding through a `with_tenant_scoped` closure.
-    pub fn shared_arc(&self) -> Arc<RwLock<TenantContext>> {
-        Arc::clone(&self.shared)
-    }
-
     /// Run `f` with `ctx` installed as the task-local override for the
     /// duration of the returned future. Concurrent calls on different tasks
     /// each see their own `ctx` — no shared state is mutated, so there is no
     /// race window between binding and read.
-    pub async fn scope<F, T>(&self, ctx: TenantContext, f: F) -> T
+    pub fn scope<F, T>(&self, ctx: TenantContext, f: F) -> impl Future<Output = T>
     where
         F: Future<Output = T>,
     {
-        CURRENT_TENANT_OVERRIDE.scope(ctx, f).await
+        Self::scope_with(ctx, f)
+    }
+
+    /// [`Self::scope`] with no binding in hand: the override is one task-local
+    /// for the whole process, so installing it needs no particular session's
+    /// binding. The server's tenant-binding layer runs each request inside its
+    /// resolved scope with this, and an operator re-installs the tenant it was
+    /// planned under around work its stream does after that scope has ended.
+    ///
+    /// Returns the task-local's own future rather than wrapping it in an
+    /// `async fn`: a request handler's future nests every future it awaits, and
+    /// the deepest of them sit close to the compiler's type-layout depth limit.
+    pub fn scope_with<F, T>(ctx: TenantContext, f: F) -> impl Future<Output = T>
+    where
+        F: Future<Output = T>,
+    {
+        CURRENT_TENANT_OVERRIDE.scope(ctx, f)
+    }
+
+    /// Run `f` with `ctx` installed as the task-local override, synchronously:
+    /// the one-poll form of [`Self::scope_with`], for wrapping each poll of a
+    /// stream or response body driven outside any scoped future.
+    pub fn sync_scope_with<R>(ctx: TenantContext, f: impl FnOnce() -> R) -> R {
+        CURRENT_TENANT_OVERRIDE.sync_scope(ctx, f)
+    }
+
+    /// The task-local override in force on the current task, if any — `None`
+    /// outside every scope, where a read falls back to a binding's sticky
+    /// shared value.
+    pub fn scoped_context() -> Option<TenantContext> {
+        CURRENT_TENANT_OVERRIDE.try_with(|c| *c).ok()
     }
 
     /// Returns `true` when the current task is executing inside a

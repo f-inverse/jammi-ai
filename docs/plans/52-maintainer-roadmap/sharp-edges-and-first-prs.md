@@ -67,10 +67,6 @@ the maintainer guide.
 
 ### Server edge
 
-- **Flight SQL multi-tenant concurrency (the biggest one)** — `TenantBoundProvider`
-  mutates a process-global `TenantBinding`; concurrent multi-tenant Flight SQL can race
-  on a stale binding. **Route multi-tenant through gRPC.** Planned fix: per-plan
-  `ConfigExtension`.
 - **`list_topics` pagination unimplemented** (returns everything in one response).
   **`SessionStore` is unbounded & in-process** (no eviction/TTL; `RwLock` panics on
   poison). **`InferenceService.Predict` is heavier than `Infer`** (reconstructs the

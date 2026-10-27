@@ -30,6 +30,7 @@ use datafusion::physical_plan::DisplayFormatType;
 use futures::StreamExt;
 
 use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, TxOptions};
+use crate::tenant::TenantId;
 
 use super::definition::MutableTableDefinition;
 use super::{keys_predicate, owned_rows, MutableBackend};
@@ -62,7 +63,13 @@ impl TryFrom<InsertOp> for KeyConflict {
 pub struct MutableTableSink {
     def: Arc<MutableTableDefinition>,
     backend: Arc<dyn MutableBackend>,
-    tenant: crate::tenant_scope::TenantBinding,
+    /// The tenant the statement was planned under, which its rows are
+    /// stamped with. `DataSinkExec` runs [`DataSink::write_all`] while its
+    /// stream is polled — after the planning scope may have ended (a Flight
+    /// SQL response streams after its handler returned), or on a task the
+    /// engine spawned — so the tenant is taken when the statement plans, not
+    /// read from whatever is ambient when the rows are written.
+    tenant: Option<TenantId>,
     on_conflict: KeyConflict,
 }
 
@@ -70,7 +77,7 @@ impl MutableTableSink {
     pub fn new(
         def: Arc<MutableTableDefinition>,
         backend: Arc<dyn MutableBackend>,
-        tenant: crate::tenant_scope::TenantBinding,
+        tenant: Option<TenantId>,
         on_conflict: KeyConflict,
     ) -> Self {
         Self {
@@ -116,10 +123,10 @@ impl DataSink for MutableTableSink {
 
         let def = Arc::clone(&self.def);
         let backend_for_closure = Arc::clone(&self.backend);
-        // Snapshot the tenant binding once per write_all call (not per row).
-        // The DataSink contract is "exactly one write_all per DML statement"
-        // so this is the natural unit of consistency.
-        let session_tenant = self.tenant.current_tenant();
+        // One tenant for the whole statement: the DataSink contract is
+        // "exactly one write_all per DML statement", and this sink was
+        // planned for exactly one.
+        let session_tenant = self.tenant;
         let table_name = def.id.as_str().to_string();
         let on_conflict = self.on_conflict;
         let written = self

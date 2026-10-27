@@ -16,6 +16,8 @@ use jammi_db::error::Result;
 use jammi_db::index::{Admission, SearchMethod, ValidatedQuery};
 use jammi_db::session::QueryContext;
 use jammi_db::store::ResultStore;
+use jammi_db::tenant::TenantContext;
+use jammi_db::tenant_scope::TenantBinding;
 
 /// Vector search over an embedding table, by the request's [`SearchMethod`],
 /// among the rows its [`Admission`] admits: the `k` nearest admitted rows,
@@ -37,6 +39,12 @@ pub struct VectorSearchExec {
     admission: Admission,
     result_store: Arc<ResultStore>,
     session_ctx: QueryContext,
+    /// The tenant the search was planned under. The search runs while this
+    /// node's stream is polled — possibly after the planning scope has ended,
+    /// or on a task the engine spawned — and an exact search plans its own
+    /// scan of the table there, so it runs inside this tenant's scope: the
+    /// table resolves as the tenant that asked for it.
+    tenant: TenantContext,
     properties: Arc<PlanProperties>,
 }
 
@@ -61,6 +69,7 @@ impl VectorSearchExec {
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         );
+        let tenant = TenantContext::from_option(result_store.catalog().current_tenant());
         Ok(Self {
             table,
             query_vector,
@@ -69,6 +78,7 @@ impl VectorSearchExec {
             admission,
             result_store,
             session_ctx,
+            tenant,
             properties: Arc::new(properties),
         })
     }
@@ -161,11 +171,14 @@ impl ExecutionPlan for VectorSearchExec {
         let ctx = self.session_ctx.clone();
 
         let admission = self.admission.clone();
+        let tenant = self.tenant;
         let result_stream = stream::once(async move {
-            let search_results = result_store
-                .search_vectors(&ctx, &table, &query, k, method, &admission)
-                .await
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            let search_results = TenantBinding::scope_with(
+                tenant,
+                result_store.search_vectors(&ctx, &table, &query, k, method, &admission),
+            )
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
             // Convert Vec<(row_id, cosine_distance)> to RecordBatch
             let row_ids: Vec<&str> = search_results.iter().map(|(id, _)| id.as_str()).collect();

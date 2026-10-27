@@ -33,6 +33,7 @@ use datafusion::prelude::Expr;
 
 use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
 use crate::error::JammiError;
+use crate::tenant::TenantId;
 
 use super::definition::{MutableTableDefinition, MutableTableError};
 use super::sink::{
@@ -124,18 +125,19 @@ impl MutableTableProvider {
     /// transaction first re-reads the rows at the selected keys: a row
     /// another writer changed or removed in between fails the statement
     /// with [`MutableTableError::WriteConflict`] before anything is written,
-    /// rather than overwriting that writer's change. A selected row the
-    /// session reads but does not own (a global row, for a tenant-bound
-    /// session) is left in place. Returns the number of rows rewritten.
+    /// rather than overwriting that writer's change. A selected row `tenant`
+    /// reads but does not own (a global row, for a tenant-bound session) is
+    /// left in place. `tenant` is the one the statement was planned under — the
+    /// tenant its rows were selected as. Returns the number of rows rewritten.
     pub(crate) async fn rewrite_rows(
         &self,
+        tenant: Option<TenantId>,
         old: RecordBatch,
         new: Option<RecordBatch>,
     ) -> Result<u64, JammiError> {
         let (old, new) = distinct_rows(&self.def, old, new)?;
         let def = Arc::clone(&self.def);
         let backend = Arc::clone(&self.backend);
-        let tenant = self.tenant.current_tenant();
         let settled = self
             .backend
             .catalog_backend()
@@ -209,10 +211,13 @@ impl TableProvider for MutableTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // The rows are stamped with the tenant in force now, while the
+        // statement plans: the sink writes them while its stream is polled,
+        // when that tenant's scope may be gone.
         let sink = Arc::new(MutableTableSink::new(
             Arc::clone(&self.def),
             Arc::clone(&self.backend),
-            self.tenant.clone(),
+            self.tenant.current_tenant(),
             KeyConflict::try_from(insert_op)?,
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))

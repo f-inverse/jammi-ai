@@ -170,7 +170,6 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
     let chain = jammi_server::runtime::GrpcChain {
         addr: "127.0.0.1:0".parse().expect("loopback :0 parses"),
         flight_ctx: session.context().clone(),
-        flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
         trigger: Some(trigger),
         engine: None,

@@ -60,6 +60,8 @@ use crate::store::building::BuildingTable;
 use crate::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use crate::store::mutable::rewrite::RowRewriteNode;
 use crate::store::{ResultStore, ResultTableOrigin, SinkKind};
+use crate::tenant::TenantContext;
+use crate::tenant_scope::TenantBinding;
 
 #[cfg(doc)]
 use crate::catalog::result_repo::CreateResultTableParams;
@@ -776,11 +778,13 @@ impl ExtensionPlanner for MaterializationPlanner {
                 ))
             })?;
         let ctx = QueryContext::from(SessionContext::new_with_state(session_state.clone()));
+        let tenant = TenantContext::from_option(store.catalog().current_tenant());
         Ok(Some(Arc::new(StoreStatementExec::new(
             node.statement.clone(),
             physical_inputs.to_vec(),
             ctx,
             ResultStore::clone(&store),
+            tenant,
         ))))
     }
 }
@@ -793,6 +797,12 @@ pub struct StoreStatementExec {
     input: Vec<Arc<dyn ExecutionPlan>>,
     ctx: QueryContext,
     store: ResultStore,
+    /// The tenant the statement was planned under. The verb runs while this
+    /// node's stream is polled — after the planning scope may have ended (a
+    /// Flight SQL response streams after its handler returned), or on a task
+    /// the engine spawned — so it runs inside this tenant's scope: the table a
+    /// `CREATE TABLE … AS` makes is its own, and a `DROP TABLE` drops its own.
+    tenant: TenantContext,
     properties: Arc<PlanProperties>,
 }
 
@@ -810,6 +820,7 @@ impl StoreStatementExec {
         input: Vec<Arc<dyn ExecutionPlan>>,
         ctx: QueryContext,
         store: ResultStore,
+        tenant: TenantContext,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema().inner().clone()),
@@ -822,6 +833,7 @@ impl StoreStatementExec {
             input,
             ctx,
             store,
+            tenant,
             properties,
         }
     }
@@ -886,6 +898,7 @@ impl ExecutionPlan for StoreStatementExec {
             children,
             self.ctx.clone(),
             self.store.clone(),
+            self.tenant,
         )))
     }
 
@@ -906,8 +919,9 @@ impl ExecutionPlan for StoreStatementExec {
             self.ctx.clone(),
             self.store.clone(),
         );
+        let tenant = self.tenant;
         let stream = futures::stream::once(async move {
-            Self::run(statement, input, ctx, store, context)
+            TenantBinding::scope_with(tenant, Self::run(statement, input, ctx, store, context))
                 .await
                 .map(|()| futures::stream::empty())
                 .map_err(|e| DataFusionError::External(Box::new(e)))

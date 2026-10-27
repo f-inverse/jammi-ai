@@ -378,11 +378,11 @@ impl JammiSession {
         self.tenant.current_tenant()
     }
 
-    /// Shared handle to the underlying tenant binding. Used by server-side
-    /// composition (Flight SQL + gRPC) to plumb the per-session tenant value
-    /// from a `TenantBoundProvider` / interceptor (in the `jammi-server`
-    /// crate) into the engine without re-creating the binding for every
-    /// request.
+    /// Shared handle to the underlying tenant binding — the one the analyzer
+    /// rule, the catalog and the mutable tables read. A component that does
+    /// tenant-dependent work outside the caller's scope (a model bind on the
+    /// inference runner's task) reads it where its plan is built and carries
+    /// that tenant to the work.
     pub fn tenant_binding_arc(&self) -> crate::tenant_scope::TenantBinding {
         self.tenant.clone()
     }

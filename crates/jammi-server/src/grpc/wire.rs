@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
+use jammi_db::tenant::TenantContext;
+use jammi_db::tenant_scope::TenantBinding;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{attach_error_detail, attach_trigger_detail};
@@ -62,7 +64,13 @@ pub fn session_tenant_traced<T>(request: &Request<T>) -> Option<TenantId> {
 /// `TenantScope` handle the closure receives is the marker that the scope is
 /// active on this task; `f` calls the verb on the [`jammi_ai::Session`]
 /// (which delegates to the same engine) and observes the same task-local. An
-/// unscoped session runs the call directly.
+/// unscoped request installs the explicit unscoped override the same way —
+/// never no override at all, which would leave the call reading the session's
+/// sticky binding, a value every request shares.
+///
+/// The tenant-binding layer already runs each handler inside its request's
+/// scope; this re-installs it for the work a handler hands to a task of its
+/// own (a `WaitJob` stream's polling loop), where that scope does not reach.
 ///
 /// Generic over the call's error type: most verbs return [`JammiError`], but the
 /// trigger and audit verbs return their own error enums (`TriggerError`,
@@ -80,7 +88,7 @@ where
 {
     match tenant {
         Some(t) => session.with_tenant_scoped(t, |_scope| f()).await,
-        None => f().await,
+        None => TenantBinding::scope_with(TenantContext::Unscoped, f()).await,
     }
 }
 

@@ -711,7 +711,6 @@ impl OssServer {
         GrpcChain {
             addr: self.flight_addr,
             flight_ctx: self.session.context().clone(),
-            flight_binding: self.session.tenant_binding_arc(),
             store: self.session_store.clone(),
             trigger,
             engine: Some(Arc::clone(&self.session)),
@@ -1390,8 +1389,6 @@ pub struct GrpcChain {
     /// The engine session's query context; each Flight SQL request derives
     /// its own state from it.
     pub flight_ctx: QueryContext,
-    /// Tenant binding the Flight SQL provider mutates per request.
-    pub flight_binding: jammi_db::tenant_scope::TenantBinding,
     /// Session store shared between the `CatalogService` tenant trio (writers)
     /// and the engine-default `SessionIdTenantResolver` (reader).
     pub store: SessionStore,
@@ -1542,7 +1539,8 @@ impl AssembledChain {
     /// runs: `Ok(scope)` binds the `SessionTenant` extension the handler reads
     /// ([`TenantScope::Tenant`](crate::grpc::session::TenantScope::Tenant) →
     /// `Some`, [`TenantScope::Global`](crate::grpc::session::TenantScope::Global)
-    /// → `None`) and calls it; `Err(status)` returns that status and the handler
+    /// → `None`) and calls it inside that scope — the handler and every poll of
+    /// its response body; `Err(status)` returns that status and the handler
     /// NEVER runs — see [`crate::tenant_resolver_layer`] for the full per-request
     /// contract. The wrapper forwards the inner service's `NamedService::NAME`,
     /// so the mounted ledger and the proto route both stay keyed to the
@@ -1580,8 +1578,8 @@ impl AssembledChain {
             + Sync
             + 'static,
         S::Future: Send + 'static,
-        ResBody: Default + 'static,
-        tonic::codegen::http::Response<ResBody>: axum::response::IntoResponse,
+        ResBody: http_body::Body<Data = bytes::Bytes> + Default + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
     {
         let scoped = self.tenant_resolver_layer.clone().layer(svc);
         self.mounted.push(S::NAME.to_string());
@@ -1945,7 +1943,6 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     let GrpcChain {
         addr,
         flight_ctx,
-        flight_binding,
         store,
         trigger,
         engine,
@@ -1965,25 +1962,26 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // truncating to a SMALLER, surprising cap.
     let max_message_bytes: usize = usize::try_from(limits.max_message_bytes).unwrap_or(usize::MAX);
 
-    // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
-    // as the gRPC plane. The provider resolves each query's scope and binds it,
-    // closing the cross-transport bypass where an authenticated gRPC plane would
-    // still let Flight bind from an unauthenticated header (#220).
-    let provider = TenantBoundProvider::new(
-        flight_ctx.state(),
-        flight_binding,
-        Arc::clone(&tenant_resolver),
-    );
-    let flight_svc = FlightServiceServer::new(JammiFlightService::new(Arc::new(provider)))
-        .max_decoding_message_size(max_message_bytes);
-
     // The single binder. One `TenantResolverLayer` (holding the one resolver)
-    // wraps every engine service uniformly — no branch, no separate interceptor,
-    // so nothing can double-bind or clobber the resolved tenant. MUST-FIX 1 — the
-    // wrapping applies only to the services THIS function builds; downstream
-    // services mounted via `AssembledChain::mount` (a platform's own pre-auth
-    // `Login`/`Bootstrap`, etc.) stay un-gated by the engine resolver.
+    // wraps every engine service uniformly — Flight SQL included, no branch, no
+    // separate interceptor, so nothing can double-bind or clobber the resolved
+    // tenant. MUST-FIX 1 — the wrapping applies only to the services THIS
+    // function builds; downstream services mounted via `AssembledChain::mount`
+    // (a platform's own pre-auth `Login`/`Bootstrap`, etc.) stay un-gated by
+    // the engine resolver.
     let resolver_layer = TenantResolverLayer::new(tenant_resolver);
+
+    // Flight SQL — MUST-FIX 2: the `db.sql` lane is bound by the SAME layer as
+    // the gRPC plane, so an authenticated gRPC plane can never leave Flight
+    // binding from an unauthenticated header (#220), and each Flight request —
+    // its planning and every poll of its result stream — runs inside its own
+    // resolved scope, never a value concurrent requests share (#738).
+    let flight_svc = resolver_layer.layer(
+        FlightServiceServer::new(JammiFlightService::new(Arc::new(TenantBoundProvider::new(
+            flight_ctx.state(),
+        ))))
+        .max_decoding_message_size(max_message_bytes),
+    );
 
     // Bind one engine service onto `routes` under the resolver layer. `$server`
     // is the bare `*ServiceServer::new(inner)`; the layer forwards its
@@ -2004,9 +2002,7 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // into the seam and cannot grow in place (its `add_service` is by-value with
     // no `Default`). `Routes` is the composition point tonic provides for exactly
     // this — every service mounted onto it, engine or downstream, then inherits
-    // the gRPC-web framing + trailer repair the serve path applies. Flight SQL is
-    // NOT wrapped by the layer: its `db.sql` lane binds inside the
-    // `TenantBoundProvider` (threaded with the same resolver above).
+    // the gRPC-web framing + trailer repair the serve path applies.
     let mut routes = tonic::service::Routes::new(flight_svc);
     let mut mounted = vec!["Flight SQL".to_string()];
 

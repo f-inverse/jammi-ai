@@ -212,18 +212,11 @@ pub(crate) fn gguf_num_layers(model_type: &str, config: &serde_json::Value) -> O
         .map(|v| v as usize)
 }
 
-/// BERT-family checkpoints wrap every tensor under an optional `"bert."`
-/// prefix (`BertForX` vs. a raw `BertModel` checkpoint) — mirrors
-/// `jammi_encoders::bert::BertBuilder::build`'s own
-/// `frozen_vb.contains_tensor("bert.embeddings.word_embeddings.weight")`
-/// probe, applied here against the GGUF tensor-name set instead of a
-/// safetensors `VarBuilder`.
+/// The key prefix a BERT-family checkpoint keeps its encoder under, asked
+/// of the GGUF tensor-name set through the encoder's own
+/// [`jammi_encoders::bert::checkpoint_prefix`] probe.
 fn bert_prefix(tensor_infos: &HashMap<String, gguf_file::TensorInfo>) -> &'static str {
-    if tensor_infos.contains_key("bert.embeddings.word_embeddings.weight") {
-        "bert."
-    } else {
-        ""
-    }
+    jammi_encoders::bert::checkpoint_prefix(|name| tensor_infos.contains_key(name))
 }
 
 /// Every matmul-site linear module's fully-qualified tensor-name PREFIX

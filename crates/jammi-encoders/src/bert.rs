@@ -8,12 +8,17 @@
 //! [`jammi_lora::LoraBuildConfig`] selects which of them carry trainable
 //! adapters.
 //!
-//! Two safetensors layouts are supported transparently:
-//!   * Raw `BertModel` checkpoints — keys at the root
+//! Three safetensors layouts are supported transparently:
+//!   * Raw `BertModel` / `RobertaModel` checkpoints — keys at the root
 //!     (`embeddings.word_embeddings.weight`).
 //!   * `BertForX` checkpoints — keys under a `"bert."` prefix.
+//!   * `RobertaForX` checkpoints (RoBERTa, CamemBERT, XLM-RoBERTa) — keys
+//!     under a `"roberta."` prefix.
 //!
-//! Detection is via a single `contains_tensor` probe at build time.
+//! Detection is via [`checkpoint_prefix`], one probe at build time.
+//!
+//! RoBERTa and its relatives number positions from `pad_token_id + 1`, where
+//! BERT numbers them from 0 ([`BertConfig::roberta_padding_idx`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -51,10 +56,53 @@ pub struct BertConfig {
     pub type_vocab_size: usize,
     #[serde(default = "default_layer_norm_eps")]
     pub layer_norm_eps: f64,
-    /// Detected from the `model_type` field. Determines the safetensors-key
-    /// prefix (`"bert."`, `"roberta."`, etc., or `""` for raw `BertModel`).
+    /// The `model_type` field: `"bert"`, or a RoBERTa-family alias whose
+    /// positions follow [`BertConfig::roberta_padding_idx`].
     #[serde(default)]
     pub model_type: Option<String>,
+    /// The padding token's id, from which a RoBERTa-family checkpoint numbers
+    /// its positions.
+    #[serde(default)]
+    pub pad_token_id: Option<u32>,
+}
+
+impl BertConfig {
+    /// `Some(padding_idx)` for a RoBERTa-family checkpoint (RoBERTa,
+    /// CamemBERT, XLM-RoBERTa): its real tokens take positions
+    /// `padding_idx + 1, padding_idx + 2, …` and its padding takes
+    /// `padding_idx` itself, as `transformers`'
+    /// `create_position_ids_from_input_ids` numbers them. `None` for BERT,
+    /// whose positions are `0, 1, …`.
+    pub fn roberta_padding_idx(&self) -> Option<u32> {
+        match self.model_type.as_deref() {
+            Some("roberta" | "camembert" | "xlm-roberta") => Some(self.pad_token_id.unwrap_or(1)),
+            _ => None,
+        }
+    }
+
+    /// The longest token sequence the position table holds: every position
+    /// for BERT, all but the `padding_idx + 1` reserved ones for RoBERTa
+    /// (512 of a RoBERTa-base's 514).
+    pub fn max_sequence_length(&self) -> usize {
+        match self.roberta_padding_idx() {
+            Some(padding_idx) => self
+                .max_position_embeddings
+                .saturating_sub(padding_idx as usize + 1),
+            None => self.max_position_embeddings,
+        }
+    }
+}
+
+/// The key prefix a BERT-family checkpoint keeps its encoder under:
+/// `"bert."` for `BertForX`, `"roberta."` for `RobertaForX` (CamemBERT and
+/// XLM-RoBERTa included), `""` for a raw encoder. `has_tensor` answers
+/// whether the checkpoint holds a tensor of that name; the safetensors and
+/// GGUF loaders both ask through this one probe.
+pub fn checkpoint_prefix(has_tensor: impl Fn(&str) -> bool) -> &'static str {
+    ["bert.", "roberta."]
+        .into_iter()
+        .find(|prefix| has_tensor(&format!("{prefix}embeddings.word_embeddings.weight")))
+        .unwrap_or("")
 }
 
 fn default_type_vocab_size() -> usize {
@@ -73,6 +121,8 @@ struct BertEmbeddings {
     position_embeddings: Embedding,
     token_type_embeddings: Embedding,
     layer_norm: LayerNorm,
+    /// [`BertConfig::roberta_padding_idx`].
+    roberta_padding_idx: Option<u32>,
 }
 
 impl BertEmbeddings {
@@ -103,17 +153,36 @@ impl BertEmbeddings {
             position_embeddings,
             token_type_embeddings,
             layer_norm,
+            roberta_padding_idx: config.roberta_padding_idx(),
         })
     }
 
-    fn forward(&self, input_ids: &Tensor, token_type_ids: &Tensor) -> Result<Tensor, EncoderError> {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor, EncoderError> {
         let (_batch, seq) = input_ids.dims2()?;
         let word_emb = self.word_embeddings.forward(input_ids)?;
         let token_type_emb = self.token_type_embeddings.forward(token_type_ids)?;
         let embeddings = (&word_emb + token_type_emb)?;
-        let position_ids = Tensor::arange(0u32, seq as u32, input_ids.device())?;
-        let position_emb = self.position_embeddings.forward(&position_ids)?;
-        let embeddings = embeddings.broadcast_add(&position_emb)?;
+        let embeddings = match self.roberta_padding_idx {
+            None => {
+                let position_ids = Tensor::arange(0u32, seq as u32, input_ids.device())?;
+                embeddings.broadcast_add(&self.position_embeddings.forward(&position_ids)?)?
+            }
+            Some(padding_idx) => {
+                // `cumsum(mask) * mask + padding_idx`: the attention mask,
+                // not the token ids, marks padding, so a batch padded with
+                // any id numbers its real tokens as `transformers` does.
+                let mask = mask.to_dtype(DType::F32)?;
+                let position_ids = (mask.cumsum(1)? * &mask)?
+                    .affine(1.0, f64::from(padding_idx))?
+                    .to_dtype(DType::U32)?;
+                (embeddings + self.position_embeddings.forward(&position_ids)?)?
+            }
+        };
         self.layer_norm.forward(&embeddings)
     }
 }
@@ -275,7 +344,8 @@ pub struct Bert {
     layers: Vec<BertLayer>,
     pooling: Pooling,
     hidden_size: usize,
-    max_position_embeddings: usize,
+    /// [`BertConfig::max_sequence_length`].
+    max_sequence_length: usize,
 }
 
 impl Bert {
@@ -296,9 +366,9 @@ impl Bert {
         self.hidden_size
     }
 
-    /// Maximum input sequence length (`max_position_embeddings`).
+    /// Maximum input sequence length ([`BertConfig::max_sequence_length`]).
     pub fn max_seq_length(&self) -> usize {
-        self.max_position_embeddings
+        self.max_sequence_length
     }
 
     /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
@@ -321,14 +391,14 @@ impl Bert {
         mask: &Tensor,
     ) -> Result<Tensor, EncoderError> {
         let (_batch, seq) = input_ids.dims2()?;
-        if seq > self.max_position_embeddings {
+        if seq > self.max_sequence_length {
             return Err(EncoderError::SequenceTooLong {
                 seq,
-                max: self.max_position_embeddings,
+                max: self.max_sequence_length,
             });
         }
         let token_type_ids = Tensor::zeros(input_ids.shape(), DType::U32, input_ids.device())?;
-        let mut hidden = self.embeddings.forward(input_ids, &token_type_ids)?;
+        let mut hidden = self.embeddings.forward(input_ids, &token_type_ids, mask)?;
         let extended = extended_attention_mask(mask)?;
         // BERT has no local-attention layers at all, so the fused masks
         // bundle only ever populates `global` — see `FusedAttentionMasks`'s
@@ -674,14 +744,7 @@ impl<'a> BertBuilder<'a> {
             VarBuilder::from_varmap(varmap, DType::F32, device)
         };
 
-        // Two checkpoint layouts: raw `BertModel` (no prefix) vs `BertForX`
-        // (`"bert."` wrapper). Probe for the embeddings tensor under the
-        // wrapped layout; fall back to root if absent.
-        let prefix: &str = if frozen_vb.contains_tensor("bert.embeddings.word_embeddings.weight") {
-            "bert."
-        } else {
-            ""
-        };
+        let prefix = checkpoint_prefix(|name| frozen_vb.contains_tensor(name));
         let base_vb = if prefix.is_empty() {
             frozen_vb.clone()
         } else {
@@ -765,7 +828,7 @@ impl<'a> BertBuilder<'a> {
             layers,
             pooling: self.pooling,
             hidden_size: config.hidden_size,
-            max_position_embeddings: config.max_position_embeddings,
+            max_sequence_length: config.max_sequence_length(),
         })
     }
 }
@@ -871,6 +934,51 @@ mod tests {
             .map(|i| ((i as f32 + phase) * 0.0137).sin() * 0.2)
             .collect();
         Linear::new(Tensor::from_vec(v, (rows, cols), device).unwrap(), None)
+    }
+
+    fn config_of(model_type: &str, pad_token_id: Option<u32>) -> BertConfig {
+        serde_json::from_value(serde_json::json!({
+            "hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2,
+            "intermediate_size": 64, "vocab_size": 256, "max_position_embeddings": 514,
+            "model_type": model_type, "pad_token_id": pad_token_id,
+        }))
+        .unwrap()
+    }
+
+    /// RoBERTa and its relatives number positions from `pad_token_id + 1`,
+    /// so a 514-row table holds 512 tokens; BERT holds every row.
+    #[test]
+    fn roberta_family_positions_start_past_the_padding_index() {
+        for model_type in ["roberta", "camembert", "xlm-roberta"] {
+            let config = config_of(model_type, Some(1));
+            assert_eq!(config.roberta_padding_idx(), Some(1), "{model_type}");
+            assert_eq!(config.max_sequence_length(), 512, "{model_type}");
+        }
+        assert_eq!(
+            config_of("roberta", None).roberta_padding_idx(),
+            Some(1),
+            "RoBERTa's pad id when its config names none"
+        );
+        let bert = config_of("bert", Some(0));
+        assert_eq!(bert.roberta_padding_idx(), None);
+        assert_eq!(bert.max_sequence_length(), 514);
+    }
+
+    #[test]
+    fn checkpoint_prefix_names_the_wrapper_the_encoder_sits_under() {
+        let holding = |name: &'static str| move |probe: &str| probe == name;
+        assert_eq!(
+            checkpoint_prefix(holding("bert.embeddings.word_embeddings.weight")),
+            "bert."
+        );
+        assert_eq!(
+            checkpoint_prefix(holding("roberta.embeddings.word_embeddings.weight")),
+            "roberta."
+        );
+        assert_eq!(
+            checkpoint_prefix(holding("embeddings.word_embeddings.weight")),
+            ""
+        );
     }
 
     fn declined_flash() -> FlashDecision {

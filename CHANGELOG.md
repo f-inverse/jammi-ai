@@ -276,6 +276,21 @@ does, and a database source reads, lists and verifies what it holds.
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
 
+A BERT-family checkpoint is served through the head it was trained with (#747). A BERT sequence
+classifier applied its `classifier` to the raw `[CLS]` hidden state and never loaded the pooler that
+`BertForSequenceClassification` trains it over, so a Hub checkpoint answered close to chance with
+no error (a five-class review model scored 12% where `transformers` scores 59%). It now reads
+`tanh(bert.pooler.dense(h))`, and a checkpoint with no pooler is refused by name. RoBERTa,
+CamemBERT and XLM-RoBERTa classifiers, which did not load at all, run their own
+`classifier.dense` → `tanh` → `classifier.out_proj` head over an encoder under `roberta.`.
+
+- **RoBERTa-family positions.** The encoder numbered every model's positions from 0, which is
+  BERT's rule. RoBERTa, CamemBERT and XLM-RoBERTa number them from `pad_token_id + 1`, so every
+  embedding from one of them was off (cosine 0.81 to `transformers` on the tiny fixture). They now
+  follow their own rule, and their longest input is 512 tokens, not 514.
+- **The guide.** The classification page describes each architecture's real head, and the
+  embedding page no longer recommends `all-mpnet-base-v2`, an MPNet model the engine does not load.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

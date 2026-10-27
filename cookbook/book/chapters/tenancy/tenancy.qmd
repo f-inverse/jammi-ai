@@ -10,9 +10,9 @@ feature flag · **Checked:** tenancy (`rails.tenant` / `assert_listing_isolated`
 The engine's tenancy contract is short, and this chapter does not restate it as prose — it
 **measures** it, live over the ogbn-arxiv papers, as three
 isolation properties plus one consequence. Every number is a verdict: a hard zero where
-isolation must hold, a positive count where the honest caveat says data is visible.
+isolation must hold, a positive count where data is shared by design.
 
-The model has exactly two genuine isolation layers and one honest caveat:
+The model has three isolation layers and one thing shared by design:
 
 1. **catalog-listing isolation** — `list_sources` filters the registry to
    `tenant_id = $cur OR IS NULL`; tenant A's listing excludes B's registration.
@@ -21,9 +21,11 @@ The model has exactly two genuine isolation layers and one honest caveat:
    a discriminator — a `tenant_id` column, or the column the source declared as its
    `tenant_column` when it was registered — so the SAME tagged source returns disjoint
    rows under A vs B.
-3. **the caveat** — a discriminator-**less** source is globally readable: A sees ALL of
-   B's rows when it names the source. The engine does not authenticate; access-gating
-   lives above it.
+3. **name resolution** — a source tenant B registers does not resolve for A: naming it is
+   `NotFound`, whether or not its rows carry a discriminator.
+4. **shared by design** — a *global* source, registered with no tenant bound, is every
+   tenant's; without a discriminator, every tenant reads all of it. The engine does not
+   authenticate; access-gating lives above it.
 
 The two tenants are an honest, disjoint partition of the papers: every paper
 belongs to exactly one tenant by its subject class, the subjects dealt out so the
@@ -130,37 +132,50 @@ print(f"B-tagged rows that leaked to A: {discriminator_leak}")
 This is the isolation layer that actually scopes *data*: one physical source, disjoint
 reads, enforced by the analyzer because the discriminator column exists.
 
-## Property 3 — the caveat: a discriminator-less source is globally readable
+## Property 3 — a tenant's source is its own; a global one is every tenant's
 
-The honest limit, asserted as a *positive* count, not hidden. A source with **no**
-discriminator — no `tenant_id` column and no declared `tenant_column` — gets no scan rewrite — it is globally readable by any tenant that names
-it. We register B's papers under B with no discriminator column, then read it under A: A
-sees **all** of B's rows.
+A source tenant B registers resolves for B alone: tenant A naming it gets `NotFound`, the
+same answer as for a source that does not exist, whether or not its rows carry a
+discriminator. What every tenant reads is a *global* source — one registered with no tenant
+bound — and with no discriminator column there is nothing to scope its rows by, so every
+tenant reads all of it. We register B's papers under B with no discriminator, then name
+them under A; then register them globally and read them under A.
 
 ```{python}
+from jammi.errors import NotFound
+
 with tenant(db, TENANT_B):
     write_src("papers_b_nodisc", pa.table({"paper_id": b_papers}))
 
 with tenant(db, TENANT_A):
-    seen_global = [r["paper_id"] for r in db.sql(
-        "SELECT paper_id FROM papers_b_nodisc.public.papers_b_nodisc").to_pylist()]
+    try:
+        db.sql("SELECT paper_id FROM papers_b_nodisc.public.papers_b_nodisc")
+        private_read = "read"
+    except NotFound:
+        private_read = "not found"
 
-caveat_visible = len(set(seen_global) & set(b_papers))
-print(f"tenant A reads B's discriminator-less source: {caveat_visible} of {len(b_papers)} "
-      f"B rows visible")
+write_src("papers_shared", pa.table({"paper_id": b_papers}))  # no tenant bound: global
+with tenant(db, TENANT_A):
+    seen_shared = [r["paper_id"] for r in db.sql(
+        "SELECT paper_id FROM papers_shared.public.papers_shared").to_pylist()]
+
+shared_visible = len(set(seen_shared) & set(b_papers))
+print(f"tenant A naming B's source: {private_read}")
+print(f"tenant A reads the global source with no discriminator: {shared_visible} of "
+      f"{len(b_papers)} rows")
 print("the engine does not authenticate — access-gating lives above it")
 ```
 
-This is the claim that is easy to overstate: a
-*separate per-tenant source* is hidden from the **listing** (Property 1), but its rows are
-**not** hidden from a direct named read. Data isolation is the discriminator column
-(Property 2), not source separation.
+Between tenants, the scope a source is registered under isolates it; within one shared
+source, its discriminator column does (Property 2).
 
 ```{python}
 claim("a tenant's listing shows no other tenant's source", listing_leak == 0)
 claim("the discriminator scopes the rows: none of B's reach A", discriminator_leak == 0)
-claim("a source with no discriminator is globally readable: A reads every one of B's rows",
-      caveat_visible == len(b_papers), f"{caveat_visible} of {len(b_papers)}")
+claim("a source B registers is not found by A, with no discriminator to scope it",
+      private_read == "not found")
+claim("a global source with no discriminator is read whole by every tenant",
+      shared_visible == len(b_papers), f"{shared_visible} of {len(b_papers)}")
 ```
 
 ## Property 4 — the same recipe, scoped per tenant
@@ -303,11 +318,11 @@ never at a tenant's first query.
 
 ## What this chapter does not claim
 
-The engine isolates at the catalog listing and at a discriminator-column scan rewrite —
-over a `tenant_id` column or the column a source declared when it was registered.
-It does **not** authenticate, and a discriminator-less source is globally readable — the
-caveat is measured (Property 3), not glossed. Tenant isolation as a complete access-control
-story is built *above* the engine (a discriminator column on every tenant-scoped table, or
-a Flight SQL / gRPC interceptor that binds the scope from an authenticated principal). What
-the engine guarantees — and what this chapter measures as hard zeros and a positive caveat
-count — is exactly those two layers and that one honest limit.
+The engine isolates at the catalog listing, at name resolution, and at a
+discriminator-column scan rewrite — over a `tenant_id` column or the column a source
+declared when it was registered. It does **not** authenticate, and a global source with no
+discriminator is every tenant's — measured (Property 3), not glossed. Tenant isolation as a
+complete access-control story is built *above* the engine (a Flight SQL / gRPC interceptor
+that binds the scope from an authenticated principal). What the engine guarantees — and
+what this chapter measures as hard zeros and a positive shared count — is exactly those
+three layers and that one thing shared by design.

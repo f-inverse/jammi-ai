@@ -57,20 +57,24 @@ def tenant(db, tenant_id: str):
     a shared source; ``tenant_scope`` only accepts a UUID, so the global case binds
     in place with ``set_tenant`` and restores the prior scope manually. Either way
     the same ``db`` is yielded so a block reads naturally. The bound scope drives
-    the engine's two isolation layers:
+    the engine's isolation layers:
 
     * **catalog-listing** — ``list_sources`` / ``list`` filter to
       ``tenant_id = $cur OR tenant_id IS NULL``, so the block sees only this
       tenant's registrations plus globals;
+    * **name resolution** — a source another tenant registered does not resolve
+      here: naming it, in SQL or a verb, is ``NotFound``, as for a source that
+      does not exist;
     * **discriminator-column row filtering** — a ``TableScan`` over a source whose
       schema carries a ``tenant_id`` column is rewritten with
       ``tenant_id = $cur OR IS NULL``, so the same source yields disjoint rows
       under different tenants.
 
-    It does **not** make a source that lacks a ``tenant_id`` column invisible: a
-    discriminator-less source named directly in SQL is globally readable (the
-    engine does not authenticate — access-gating lives above it). ``tenant_id`` is
-    an opaque UUID; the engine validates the form, never who the tenant is.
+    A *global* source — one registered with no tenant bound — resolves for every
+    tenant, and if it lacks a ``tenant_id`` column every tenant reads all of its
+    rows: global means shared, and the engine does not authenticate (access-gating
+    lives above it). ``tenant_id`` is an opaque UUID; the engine validates the
+    form, never who the tenant is.
     """
     if tenant_id == "":
         prior = db.tenant()
@@ -110,7 +114,7 @@ def assert_rows_isolated(rows_seen: list[str], forbidden: set[str], *, tenant_id
     the ``TableScan``, so ``rows_seen`` (keys a query under ``tenant_id`` returned
     from such a source) must be disjoint from ``forbidden`` (rows tagged for another
     tenant). This holds only because the source carries the discriminator column —
-    not for a discriminator-less source (see :func:`tenant`).
+    not for a global source without one (see :func:`tenant`).
     """
     leaked = set(rows_seen) & forbidden
     if leaked:

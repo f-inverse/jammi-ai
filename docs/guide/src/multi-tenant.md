@@ -285,7 +285,9 @@ grant — see [Security Posture](./security.md) for the full comparison.
 Two sessions on the same process, bound to different tenants, will:
 
 1. **Read each other as invisible:** `list_sources()` returns the calling
-   tenant's sources plus any globally-scoped (`tenant_id IS NULL`) sources.
+   tenant's sources plus any globally-scoped (`tenant_id IS NULL`) sources,
+   and naming another tenant's source, in SQL or a verb, is `NotFound`, as
+   for a source that does not exist.
 2. **Write into different lanes:** a `register_source` from Alice produces
    a row tagged `tenant_id = alice`; Bob's `list_sources` does not see it.
 3. **Share globally-scoped rows:** an unscoped (`tenant_id IS NULL`)

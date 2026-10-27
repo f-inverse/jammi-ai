@@ -236,7 +236,9 @@ The dependency audit is green again on the live advisory database, and database 
   its catalog row whichever tenant owned it, so a tenant, or a request naming none, that named
   another tenant's source in SQL or a verb read its rows (#746). A source now resolves for its
   owner, for every tenant when it is global, and for any caller in an admin scope; its tables,
-  the catalogs a query sees and `information_schema` list the same set.
+  the catalogs a query sees and `information_schema` list the same set. The cookbook's tenancy
+  chapters taught the cross-tenant read as a caveat; they now measure it as a hard zero, and a
+  global source with no discriminator as what every tenant shares.
 - **A client lists a source's tables and their columns, on either transport.** A remote client
   had no way to: `list_sources` and `describe_source` carried no tables, and `information_schema`
   is off on a server, where a `SET` does not carry from one request to the next (#751).

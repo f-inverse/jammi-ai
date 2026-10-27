@@ -10,8 +10,8 @@ own. This chapter makes them first-class and works each one end to end.
 - **Provenance** — a result rides its audit trail: the `source` fact (how its
   context was assembled) and the `context_ref` member keys (which rows informed
   it).
-- **Tenancy** — the engine isolates by tenant at two genuine layers, with one
-  honest caveat.
+- **Tenancy** — the engine isolates by tenant at three layers, and shares one
+  thing by design.
 - **Measurement** — every recipe ends in a real number, measured live, and in
   the claim that number backs, checked on the run that showed it. A recipe
   without a measured verdict is not done.
@@ -86,7 +86,7 @@ claim("and every row it names reads back as a paper",
 
 ## Rail 2 — Tenancy: what the engine isolates, and what it does not
 
-The engine's model has **two genuine isolation layers and one honest caveat**
+The engine's model has **three isolation layers and one thing shared by design**
 (the full showcase is on the Air Routes on-ramp in tier 01):
 
 - **Catalog-listing isolation (a hard zero).** `set_tenant(t)` binds an opaque
@@ -96,9 +96,12 @@ The engine's model has **two genuine isolation layers and one honest caveat**
   injects `tenant_id = $cur OR IS NULL` onto a `TableScan` **only** when the
   table's schema carries a `tenant_id` column. `rails.assert_rows_isolated` is
   the oracle.
-- **The caveat.** A discriminator-less source is **globally readable** — no
-  column to filter on, and the engine does not authenticate. Access-gating
-  lives *above* the engine.
+- **Name resolution (a hard zero).** A source another tenant registered does
+  not resolve: naming it, in SQL or a verb, is `NotFound`, as for a source
+  that does not exist.
+- **Shared by design.** A *global* source, registered with no tenant bound, is
+  every tenant's; without a discriminator column, every tenant reads all of it.
+  The engine does not authenticate: access-gating lives *above* the engine.
 
 Here the two layers run over the papers, split by era between two tenants:
 
@@ -144,10 +147,10 @@ claim("tenant A reads exactly its own rows of the shared source", sorted(seen) =
 ```
 
 > **Bridge note.** The monograph and the graph-conformal literature assume a
-> single global graph; tenancy is the axis they are silent on. Two layers are
-> *substrate* properties; the caveat says cross-tenant data isolation is a
-> property you opt into (a discriminator column) or gate above (an
-> interceptor), not a blanket guarantee.
+> single global graph; tenancy is the axis they are silent on. The three layers
+> are *substrate* properties; who a tenant is, and so which scope a connection
+> binds, is decided above the engine (an interceptor), and a global source is
+> shared by design.
 
 ## Rail 3 — Measurement: a measured verdict or it is not done
 

@@ -275,7 +275,7 @@ Any encoder model on HuggingFace Hub with safetensors weights. Supported archite
 **BERT family** — BERT, RoBERTa, DistilBERT, CamemBERT, XLM-RoBERTa:
 
 - `sentence-transformers/all-MiniLM-L6-v2` (384-dim, fast)
-- `sentence-transformers/all-mpnet-base-v2` (768-dim, higher quality)
+- `sentence-transformers/all-distilroberta-v1` (768-dim, RoBERTa)
 - `BAAI/bge-small-en-v1.5`, `BAAI/bge-base-en-v1.5`
 
 **ModernBERT** — modernized encoder with rotary embeddings, 8192-token context, GeGLU:

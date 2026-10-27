@@ -306,7 +306,7 @@ mod live {
         let (session, _dir) = setup_with_patents().await;
 
         // Emotion classifier: BERT-based, 6 labels, has tokenizer.json + model.safetensors,
-        // single-layer classifier head (classifier.weight + classifier.bias).
+        // classifier over the pooler (bert.pooler.dense, then classifier).
         let model = ModelSource::parse("bhadresh-savani/bert-base-uncased-emotion");
         let valid_labels = ["sadness", "joy", "love", "anger", "fear", "surprise"];
 
@@ -371,6 +371,108 @@ mod live {
             any_confident,
             "At least one row should have confidence > 0.2"
         );
+    }
+
+    /// What `transformers` computed for real BERT-family checkpoints
+    /// (`tests/fixtures/generate_bert_family_hub_goldens.py`), at the commit
+    /// each was measured at.
+    #[derive(serde::Deserialize)]
+    struct HubGoldens {
+        texts: Vec<String>,
+        models: std::collections::BTreeMap<String, HubModelGoldens>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HubModelGoldens {
+        revision: String,
+        #[serde(default)]
+        id2label: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        probabilities: Vec<Vec<f32>>,
+        #[serde(default)]
+        embeddings: Vec<Vec<f32>>,
+    }
+
+    fn hub_goldens() -> HubGoldens {
+        let path = common::fixture("bert_family_hub_goldens.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The goldens' texts, run as one padded batch through `model_id`'s own forward.
+    async fn hub_forward(
+        model_id: &str,
+        task: ModelTask,
+        texts: &[String],
+    ) -> jammi_datafusion::BackendOutput {
+        let dir = tempdir().unwrap();
+        let session = InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap();
+        let guard = session
+            .model_cache()
+            .get_or_load(&ModelSource::hf(model_id), task)
+            .await
+            .unwrap_or_else(|e| panic!("{model_id} loads: {e}"));
+        let content: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(StringArray::from(texts.to_vec())) as arrow::array::ArrayRef];
+        guard.model.forward(&content, task).await.unwrap()
+    }
+
+    /// A BERT classifier reads its pooler, and a RoBERTa or XLM-RoBERTa one
+    /// its dense head: every class probability is `transformers'` to 1e-4.
+    #[tokio::test]
+    #[serial(bert_family_hub)]
+    async fn live_bert_family_classifiers_match_transformers() {
+        let goldens = hub_goldens();
+        for (model_id, expected) in goldens
+            .models
+            .iter()
+            .filter(|(_, m)| !m.probabilities.is_empty())
+        {
+            let output = hub_forward(model_id, ModelTask::Classification, &goldens.texts).await;
+            for (row, want) in expected.probabilities.iter().enumerate() {
+                assert!(output.row_status[row], "{model_id} row {row} was served");
+                let served: std::collections::BTreeMap<String, f32> =
+                    serde_json::from_str(&output.string_outputs[1][row]).unwrap();
+                for (index, want) in want.iter().enumerate() {
+                    let label = &expected.id2label[&index.to_string()];
+                    let got = served[label];
+                    assert!(
+                        (got - want).abs() <= 1e-4,
+                        "{model_id} (goldens at {}) row {row} `{label}`: served {got}, transformers {want}",
+                        expected.revision
+                    );
+                }
+            }
+        }
+    }
+
+    /// A RoBERTa sentence-embedding model numbers positions as RoBERTa does:
+    /// its embedding is `transformers`' mean-pooled, normalized one.
+    #[tokio::test]
+    #[serial(bert_family_hub)]
+    async fn live_roberta_sentence_embeddings_match_transformers() {
+        let goldens = hub_goldens();
+        for (model_id, expected) in goldens
+            .models
+            .iter()
+            .filter(|(_, m)| !m.embeddings.is_empty())
+        {
+            let output = hub_forward(model_id, ModelTask::TextEmbedding, &goldens.texts).await;
+            let width = expected.embeddings[0].len();
+            for (row, want) in expected.embeddings.iter().enumerate() {
+                assert!(output.row_status[row], "{model_id} row {row} was served");
+                let got = &output.float_outputs[0][row * width..(row + 1) * width];
+                let dot: f32 = got.iter().zip(want).map(|(a, b)| a * b).sum();
+                let norm = got.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let cosine = dot / norm;
+                assert!(
+                    cosine >= 1.0 - 1e-5,
+                    "{model_id} (goldens at {}) row {row}: cosine {cosine} to transformers",
+                    expected.revision
+                );
+            }
+        }
     }
 
     #[tokio::test]

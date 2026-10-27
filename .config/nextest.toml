@@ -18,6 +18,7 @@ training_set_stream = { max-threads = 1 }
 # same repo into the on-disk cache across processes. Live lane only.
 patentclip = { max-threads = 1 }
 real_clap = { max-threads = 1 }
+bert_family_hub = { max-threads = 1 }
 
 # A ratchet on the slowest test: on a hosted runner it measures ~400 s, and a
 # test still running at ten minutes fails rather than growing the suite's
@@ -36,6 +37,10 @@ test-group = 'patentclip'
 [[profile.default.overrides]]
 filter = 'package(jammi-ai) & binary(it) & test(/::live_real_clap_/)'
 test-group = 'real_clap'
+
+[[profile.default.overrides]]
+filter = 'package(jammi-ai) & binary(it) & test(/::live_bert_family_classifiers_|::live_roberta_sentence_embeddings_/)'
+test-group = 'bert_family_hub'
 
 # CI: every failure is reported (one red binary never hides the rest), and the
 # per-test timings land in JUnit for the run's own record.

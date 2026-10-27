@@ -506,11 +506,61 @@ impl CandleTextForward for ModernBertClassificationForward {
     }
 }
 
-/// BERT-family sequence classification forward pass.
-/// Applies CLS pooling + linear classifier + softmax on top of Bert.
+/// BERT-family sequence classification: encoder → `[CLS]` → the head the
+/// checkpoint's architecture trained → softmax.
 struct BertClassificationForward {
     bert: Bert,
-    classifier: candle_nn::Linear,
+    head: BertFamilyClassifierHead,
+}
+
+/// The two sequence-classification heads `transformers` puts over a
+/// BERT-family encoder's `[CLS]` hidden state.
+enum BertFamilyClassifierHead {
+    /// `BertForSequenceClassification`: `classifier(tanh(pooler.dense(h)))`.
+    Pooled {
+        pooler: candle_nn::Linear,
+        classifier: candle_nn::Linear,
+    },
+    /// `RobertaForSequenceClassification` (CamemBERT and XLM-RoBERTa share
+    /// it): `classifier.out_proj(tanh(classifier.dense(h)))`.
+    Roberta {
+        dense: candle_nn::Linear,
+        out_proj: candle_nn::Linear,
+    },
+}
+
+impl BertFamilyClassifierHead {
+    /// Load the head `model_type` names from the checkpoint's root.
+    fn load(
+        model_type: &str,
+        hidden_size: usize,
+        num_classes: usize,
+        vb: &VarBuilder,
+    ) -> std::result::Result<Self, String> {
+        let linear = |out: usize, name: &str| {
+            candle_nn::linear(hidden_size, out, vb.pp(name))
+                .map_err(|e| format!("the checkpoint's `{name}` layer does not load: {e}"))
+        };
+        Ok(match model_type {
+            "bert" => Self::Pooled {
+                pooler: linear(hidden_size, "bert.pooler.dense")?,
+                classifier: linear(num_classes, "classifier")?,
+            },
+            _ => Self::Roberta {
+                dense: linear(hidden_size, "classifier.dense")?,
+                out_proj: linear(num_classes, "classifier.out_proj")?,
+            },
+        })
+    }
+
+    /// Class logits from the `[CLS]` hidden state.
+    fn forward(&self, cls: &Tensor) -> candle_core::Result<Tensor> {
+        let (inner, outer) = match self {
+            Self::Pooled { pooler, classifier } => (pooler, classifier),
+            Self::Roberta { dense, out_proj } => (dense, out_proj),
+        };
+        cls.apply(inner)?.tanh()?.apply(outer)
+    }
 }
 
 impl CandleTextForward for BertClassificationForward {
@@ -531,14 +581,14 @@ impl CandleTextForward for BertClassificationForward {
             .map_err(|e| {
                 JammiError::Inference(format!("BERT classification forward failed: {e}"))
             })?;
-        // CLS pooling: take first token
         let cls = hidden
             .i((.., 0, ..))
             .map_err(|e| JammiError::Inference(format!("CLS pooling failed: {e}")))?
             .contiguous()
             .map_err(|e| JammiError::Inference(format!("CLS contiguous failed: {e}")))?;
-        let logits = cls
-            .apply(&self.classifier)
+        let logits = self
+            .head
+            .forward(&cls)
             .map_err(|e| JammiError::Inference(format!("Classifier forward failed: {e}")))?;
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
@@ -3375,15 +3425,19 @@ impl ModelBackend for CandleBackend {
                             message: format!("Failed to construct BERT model: {e}"),
                         })?;
                     let num_classes = id2label.as_ref().map_or(2, |m| m.len());
-                    let hidden_size = bert_config.hidden_size;
-                    let classifier =
-                        candle_nn::linear(hidden_size, num_classes, vb.pp("classifier")).map_err(
-                            |e| JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to load BERT classifier head: {e}"),
-                            },
-                        )?;
-                    Box::new(BertClassificationForward { bert, classifier })
+                    let head = BertFamilyClassifierHead::load(
+                        model_type,
+                        bert_config.hidden_size,
+                        num_classes,
+                        &vb,
+                    )
+                    .map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "Failed to load the {model_type} classification head: {e}"
+                        ),
+                    })?;
+                    Box::new(BertClassificationForward { bert, head })
                 }
                 "bert" | "roberta" | "camembert" | "xlm-roberta" => {
                     let bert_config: BertConfig = serde_json::from_value(model_config.clone())

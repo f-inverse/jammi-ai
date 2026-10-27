@@ -63,9 +63,10 @@ Each `RecordBatch` has prefix columns plus classification-specific columns:
 
 Classification models must have `id2label` in their `config.json`. Supported architectures:
 
-**BERT family** — BERT, RoBERTa, DistilBERT, CamemBERT, XLM-RoBERTa:
-- Loads `classifier.weight` + `classifier.bias` from safetensors
-- CLS token pooling + linear classifier + softmax
+**BERT family** — each architecture's own `…ForSequenceClassification` head over the `[CLS]` token, then softmax:
+- BERT: the pooler, `tanh(bert.pooler.dense(h))`, then the `classifier` linear
+- RoBERTa, CamemBERT, XLM-RoBERTa: `classifier.dense`, `tanh`, then `classifier.out_proj`
+- DistilBERT: `pre_classifier`, ReLU, then the `classifier` linear
 
 **ModernBERT** — uses the built-in `ModernBertForSequenceClassification`:
 - CLS or MEAN pooling (configured via `classifier_pooling` in config)

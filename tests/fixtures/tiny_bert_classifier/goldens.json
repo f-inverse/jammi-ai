@@ -1,0 +1,99 @@
+{
+ "texts": [
+  "the model is good",
+  "a novel approach based on neural network learning with high energy results",
+  "this is not the data we use",
+  "quantum",
+  "the protein structure of each cell surface was not what we present"
+ ],
+ "input_ids": [
+  [
+   2,
+   41,
+   89,
+   42,
+   113,
+   3
+  ],
+  [
+   2,
+   5,
+   103,
+   101,
+   97,
+   49,
+   100,
+   99,
+   98,
+   50,
+   106,
+   107,
+   102,
+   3
+  ],
+  [
+   2,
+   51,
+   42,
+   63,
+   41,
+   90,
+   53,
+   74,
+   3
+  ],
+  [
+   2,
+   88,
+   3
+  ],
+  [
+   2,
+   41,
+   109,
+   105,
+   44,
+   77,
+   108,
+   111,
+   67,
+   63,
+   86,
+   53,
+   104,
+   3
+  ]
+ ],
+ "id2label": {
+  "0": "negative",
+  "1": "neutral",
+  "2": "positive"
+ },
+ "probabilities": [
+  [
+   0.3723836,
+   0.103017,
+   0.5245994
+  ],
+  [
+   0.2606848,
+   0.1547139,
+   0.5846014
+  ],
+  [
+   0.3111418,
+   0.0918627,
+   0.5969955
+  ],
+  [
+   0.3808362,
+   0.1438768,
+   0.4752871
+  ],
+  [
+   0.3946166,
+   0.1640128,
+   0.4413706
+  ]
+ ]
+}

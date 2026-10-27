@@ -106,6 +106,13 @@ struct GpuEngineServer {
     engine: Arc<InferenceSession>,
 }
 
+impl GpuEngineServer {
+    /// Shut the server down and wait for its task to end.
+    async fn stop(self) {
+        crate::common::grpc::stop(self.shutdown, self.handle).await;
+    }
+}
+
 /// Spin up an in-process gRPC + Flight SQL server whose `InferenceSession` is
 /// pinned to the first CUDA device (`require_gpu = true`), so every RPC against
 /// it (including the Flight SQL reads below) runs the real CUDA-served path.

@@ -1,4 +1,4 @@
-use crate::error::{JammiError, Result};
+use crate::error::{JammiError, Missing, Result};
 use crate::source::{SourceConnection, SourceDefinition, SourceType};
 use crate::tenant::TenantId;
 
@@ -272,17 +272,53 @@ impl Catalog {
         })
     }
 
+    /// Whether the session's tenant may remove `source_id`: a row it owns
+    /// under the STRICT predicate [`Self::remove_source`] deletes by — its
+    /// own tenant's, or a GLOBAL row for an unscoped session. A GLOBAL source
+    /// a tenant reads, and another tenant's source, are not its to remove.
+    pub async fn owns_source(&self, source_id: &str) -> Result<bool> {
+        let sid = source_id.to_string();
+        let tenant = self.current_tenant();
+        let owned = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT source_id FROM sources WHERE source_id = $1 \
+                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+                            &[
+                                SqlValue::TextOwned(sid),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            |row| row.get::<String>("source_id"),
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        Ok(owned.is_some())
+    }
+
     /// Remove a source from the catalog. Scoped strictly to the session's
     /// tenant — a tenant cannot delete another tenant's source, nor a shared
     /// GLOBAL (`tenant_id IS NULL`) source it did not create; only an unscoped
     /// session manages GLOBAL rows. Uses the STRICT delete predicate
     /// (`tenant_id = $cur OR (tenant_id IS NULL AND $cur IS NULL)`) shared with
     /// [`Catalog::delete_model`], not the read path's `OR tenant_id IS NULL`
-    /// leak.
+    /// leak. A delete that matched no row — a source never registered, already
+    /// removed, or not the tenant's to remove — is a source
+    /// [`JammiError::NotFound`], as [`Catalog::delete_model`]'s is.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         let sid = source_id.to_string();
         let tenant = self.current_tenant();
-        self.backend()
+        let deleted = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
@@ -294,11 +330,15 @@ impl Catalog {
                             SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
-                    .await?;
-                    Ok(())
+                    .await
                 })
             })
             .await?;
+        if deleted == 0 {
+            return Err(JammiError::NotFound(Missing::Source {
+                source_id: source_id.to_string(),
+            }));
+        }
         Ok(())
     }
 }

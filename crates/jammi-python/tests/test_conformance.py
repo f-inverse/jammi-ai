@@ -104,6 +104,7 @@ _REMOTE_VERBS = {
     "sql",
     "list_sources",
     "describe_source",
+    "remove_source",
     "set_tenant",
     "tenant_scope",
     "tenant",

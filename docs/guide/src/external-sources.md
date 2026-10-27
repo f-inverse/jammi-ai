@@ -44,6 +44,14 @@ for table in db.describe_source("pg_data")["tables"]:
     print(f"{table['schema']}.{table['table']}", table["columns"].names)
 ```
 
+`remove_source` removes a source with the result tables and indexes built over it, on
+either transport. A tenant removes only a source it registered: another tenant's source,
+a shared one, or a name never registered is `NotFound`, and nothing is removed.
+
+```python
+db.remove_source("papers")
+```
+
 A query over a Postgres source whose database has stopped answering fails at once — an
 `Unavailable` error (gRPC `UNAVAILABLE`, the retryable class) naming the database's address
 and why it was not reached — and answers again, with no re-registration, once the database

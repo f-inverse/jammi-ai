@@ -79,12 +79,11 @@ def test_infer_round_trip_matches_embedded(live_server, tmp_path):
         remote.close()
 
 
-def test_infer_empty_source_is_a_schema_less_empty_table(live_server, tmp_path):
-    """Inference over an empty source yields zero batches; both transports
-    surface that as a schema-less empty `pyarrow.Table` (no columns, no rows).
-    Embedded: the binding returns `pa.table({})` for an empty batch list. Remote:
-    the server has no schema to encode, sends an empty `ArrowBatch`, and the
-    client decodes it to the same `pa.table({})`."""
+def test_infer_over_an_empty_source_is_its_columns_with_no_rows(live_server, tmp_path):
+    """Inference over an empty source yields no rows, and both transports
+    surface that as the inference result's columns with no rows (#759): the
+    engine answers a read-back with no rows as an empty batch of its schema, so
+    the embedded binding builds the table from it and the server encodes it."""
     empty_path = tmp_path / "empty.parquet"
     pq.write_table(
         pa.table(
@@ -112,7 +111,7 @@ def test_infer_empty_source_is_a_schema_less_empty_table(live_server, tmp_path):
 
         for name, table in results.items():
             assert table.num_rows == 0, name
-            assert table.num_columns == 0, name
+            assert {"_row_id", "_status", "vector"} <= set(table.schema.names), name
         assert results["remote"].schema == results["embedded"].schema
     finally:
         # Only the remote client's gRPC channel needs an explicit close in a

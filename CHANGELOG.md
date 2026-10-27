@@ -276,6 +276,14 @@ does, and a database source reads, lists and verifies what it holds.
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
 
+A result with no rows keeps its columns (#759). On the embedded engine a query that matched no
+row — a filter matching nothing, `LIMIT 0`, a `GROUP BY` or `ORDER BY` over no rows — returned a
+`pyarrow.Table` with no columns, because the engine collected no batches and the conversion had no
+schema to build from. `search` and `lexical_search` with no hits, and `infer` over an empty source, did the same on both transports,
+where the server's reply then carried no schema either. `JammiSession::sql` and a search's run now
+answer a result with no rows as one empty batch of the plan's schema, so every surface returns
+zero rows of the result's columns.
+
 ## [0.55.0] - 2026-10-10
 
 A newcomer's first query returns the right answer: every recipe and chapter of the cookbook

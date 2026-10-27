@@ -730,13 +730,16 @@ impl JammiSession {
     }
 
     /// Execute a SQL query and collect results as Arrow `RecordBatch`es.
+    /// A result with no rows is one empty batch of the plan's schema, never
+    /// no batches, so its columns survive to every caller.
     ///
     /// The Flight SQL surface carries query + data-DML only;
     /// topic lifecycle is the typed `register_topic` / `drop_topic` surface, not
     /// a SQL statement.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(query).await?;
-        Ok(df.collect().await?)
+        let schema = Arc::clone(df.schema().inner());
+        Ok(with_schema(schema, df.collect().await?))
     }
 
     /// [`Self::sql`]'s streamed twin: plan `query` and return the
@@ -1488,6 +1491,19 @@ impl<'a> std::ops::Deref for TenantScope<'a> {
 
     fn deref(&self) -> &Self::Target {
         self.session
+    }
+}
+
+/// `batches`, or one empty batch of `schema` when there are none: a result
+/// with no rows that still names its columns.
+pub fn with_schema(
+    schema: arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Vec<RecordBatch> {
+    if batches.is_empty() {
+        vec![RecordBatch::new_empty(schema)]
+    } else {
+        batches
     }
 }
 

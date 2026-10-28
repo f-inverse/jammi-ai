@@ -8,18 +8,29 @@
 //! Jammi's [`StorageRegistry`].
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use datafusion::catalog::Session;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use datafusion::catalog::{ScanArgs, ScanResult, Session};
+use datafusion::common::{Constraints, Statistics};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
 use futures::{future, stream, StreamExt, TryStreamExt};
+use object_store::path::Path;
 use object_store::ObjectMeta;
+use parking_lot::Mutex;
 
 use super::FileFormat;
 use crate::error::{JammiError, Result};
@@ -177,25 +188,55 @@ pub async fn create_listing_table(
     // other spelling added later never flips which files the source serves.
     let resolved_for_persistence = (candidates.len() > 1).then(|| ext.to_string());
 
-    let parts = part_schemas(format, &df_format, session, &driver, &table_url, &files).await?;
+    // A directory's files are the parts of one table (#755): checked here,
+    // and a file DataFusion lists after this build by the query that reads it
+    // (#777). A URL naming one file lists only itself.
+    let names_a_directory = files
+        .iter()
+        .any(|file| file.location != *table_url.prefix());
+    let part_reader = names_a_directory
+        .then(|| part_reader(format, &df_format))
+        .flatten();
+    let parts = match &part_reader {
+        Some(reader) => part_schemas(reader, session, &driver, &table_url, &files).await?,
+        None => Vec::new(),
+    };
     if let Some(why) = disagreement(format, &parts) {
-        return Err(JammiError::InvalidArgument {
-            argument: "url".into(),
-            reason: format!(
-                "the files under '{url}' are not parts of one table: {why}; register each file \
-                 as its own source to read them as separate tables"
-            ),
-        });
+        return Err(not_one_table(url, &why));
     }
     let schema = df_format.infer_schema(session, &driver, &files).await?;
     let schema = nullable_where_absent(&schema, &parts);
 
     let options = ListingOptions::new(df_format).with_file_extension(ext);
-    let config = ListingTableConfig::new(table_url)
+    let config = ListingTableConfig::new(table_url.clone())
         .with_listing_options(options)
         .with_schema(schema);
-    let table = ListingTable::try_new(config)?;
-    Ok((Arc::new(table), resolved_for_persistence))
+    let table = Arc::new(ListingTable::try_new(config)?);
+    let provider: Arc<dyn TableProvider> = match (part_reader, reference(format, &parts)) {
+        (Some(reader), Some(reference)) => Arc::new(PartsOfOneTable {
+            table,
+            format: format.clone(),
+            reader,
+            store: driver,
+            table_url,
+            url: url.to_string(),
+            reference,
+            checked: Mutex::new(files.iter().map(FileVersion::of).collect()),
+        }),
+        _ => table,
+    };
+    Ok((provider, resolved_for_persistence))
+}
+
+/// The refusal of a directory whose files are not parts of one table.
+fn not_one_table(url: impl std::fmt::Display, why: &str) -> JammiError {
+    JammiError::InvalidArgument {
+        argument: "url".into(),
+        reason: format!(
+            "the files under '{url}' are not parts of one table: {why}; register each file as \
+             its own source to read them as separate tables"
+        ),
+    }
 }
 
 /// The reader a CSV source's files are read with.
@@ -211,29 +252,29 @@ const PARQUET_PARTS: &str = "A directory is read as one table, so every file's c
 const CSV_PARTS: &str = "CSV columns are read by position, so every file in a directory must \
                          have the same header, in the same order";
 
-/// Each of a listing's `files` with the schema its format reads from that
-/// file alone, named by its path under `table_url`, in path order (the order
+/// The reader a part's schema is read with, or `None` for JSON, whose
+/// records each carry their own keys and are unchecked (see `disagreement`).
+fn part_reader(format: &FileFormat, table_reader: &Reader) -> Option<Reader> {
+    match format {
+        // The footers DataFusion's own inference then reads from its cache.
+        FileFormat::Parquet => Some(Arc::clone(table_reader)),
+        // A CSV part's header alone: no record is read to infer a type from.
+        FileFormat::Csv => Some(Arc::new(csv_format().with_schema_infer_max_rec(0))),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// Each of a listing's `files` with the schema `reader` reads from that file
+/// alone, named by its path under `table_url`, in path order (the order
 /// DataFusion merges a directory's schema in): the parts [`disagreement`]
-/// checks. Empty when there is nothing to check: a single file, or JSON.
+/// checks.
 async fn part_schemas(
-    format: &FileFormat,
     reader: &Reader,
     session: &dyn Session,
     store: &DynObjectStore,
     table_url: &ListingTableUrl,
     files: &[ObjectMeta],
 ) -> Result<Vec<(String, SchemaRef)>> {
-    if files.len() < 2 {
-        return Ok(Vec::new());
-    }
-    let reader: Reader = match format {
-        // The footers DataFusion's own inference then reads from its cache.
-        FileFormat::Parquet => Arc::clone(reader),
-        // A CSV part's header alone: no record is read to infer a type from.
-        FileFormat::Csv => Arc::new(csv_format().with_schema_infer_max_rec(0)),
-        FileFormat::Json | FileFormat::JsonLines => return Ok(Vec::new()),
-    };
-    let reader = &reader;
     let mut in_order: Vec<&ObjectMeta> = files.iter().collect();
     in_order.sort_by(|a, b| a.location.cmp(&b.location));
     stream::iter(in_order)
@@ -294,12 +335,28 @@ fn disagreement(format: &FileFormat, parts: &[(String, SchemaRef)]) -> Option<St
     }
 }
 
+/// The part a file DataFusion lists later is checked against: the widest
+/// Parquet part, which holds the table's columns, or the first CSV part's
+/// header. `None` for JSON, or no parts.
+fn reference(format: &FileFormat, parts: &[(String, SchemaRef)]) -> Option<(String, SchemaRef)> {
+    match format {
+        FileFormat::Parquet => widest(parts).cloned(),
+        FileFormat::Csv => parts.first().cloned(),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// The widest of `parts`: the first of the widest in path order, since
+/// `min_by_key` keeps the first of equals.
+fn widest(parts: &[(String, SchemaRef)]) -> Option<&(String, SchemaRef)> {
+    parts
+        .iter()
+        .min_by_key(|(_, schema)| Reverse(schema.fields().len()))
+}
+
 /// Where Parquet `parts` fail to nest in the widest of them, if anywhere.
 fn parquet_disagreement(parts: &[(String, SchemaRef)]) -> Option<String> {
-    // `min_by_key` keeps the first of equals: the first widest file in path order.
-    let (widest, table) = parts
-        .iter()
-        .min_by_key(|(_, schema)| Reverse(schema.fields().len()))?;
+    let (widest, table) = widest(parts)?;
     let table: HashMap<&str, &Field> = table
         .fields()
         .iter()
@@ -399,4 +456,170 @@ fn nullable_where_absent(schema: &Schema, parts: &[(String, SchemaRef)]) -> Sche
         })
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// One version of a listed file: a file rewritten in place is a new version,
+/// checked again.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FileVersion {
+    location: Path,
+    size: u64,
+    last_modified: DateTime<Utc>,
+}
+
+impl FileVersion {
+    fn of(file: &ObjectMeta) -> Self {
+        Self {
+            location: file.location.clone(),
+            size: file.size,
+            last_modified: file.last_modified,
+        }
+    }
+}
+
+/// A directory source's table, which checks each file a query reads that
+/// the source's build did not (#777).
+///
+/// DataFusion lists a directory's files for each query, from its listing
+/// cache when the listing is there. The cache keeps a listing until it is
+/// evicted, and never keeps one larger than itself, so a file added after
+/// the source was built can be read before the source is built again. The
+/// files a scan reads are in the plan DataFusion's own scan returns; one
+/// this table has not checked is held to the build's check, against
+/// `reference`, before the plan is returned, so a file that is not a part of
+/// the table fails the query, naming it, rather than reading as NULLs. A file
+/// that is a part is remembered and not read again.
+#[derive(Debug)]
+struct PartsOfOneTable {
+    table: Arc<ListingTable>,
+    format: FileFormat,
+    reader: Reader,
+    store: DynObjectStore,
+    table_url: ListingTableUrl,
+    url: String,
+    reference: (String, SchemaRef),
+    checked: Mutex<HashSet<FileVersion>>,
+}
+
+impl PartsOfOneTable {
+    /// Check the files `plan` reads that this table has not checked.
+    async fn check_files_read_by(
+        &self,
+        session: &dyn Session,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<()> {
+        let mut read = Vec::new();
+        files_read_by(plan, &mut read);
+        let unchecked: Vec<ObjectMeta> = {
+            let checked = self.checked.lock();
+            read.into_iter()
+                .filter(|file| !checked.contains(&FileVersion::of(file)))
+                .cloned()
+                .collect()
+        };
+        if unchecked.is_empty() {
+            return Ok(());
+        }
+        let parts = part_schemas(
+            &self.reader,
+            session,
+            &self.store,
+            &self.table_url,
+            &unchecked,
+        )
+        .await?;
+        for part in parts {
+            if let Some(why) = disagreement(&self.format, &[self.reference.clone(), part]) {
+                return Err(not_one_table(&self.url, &why));
+            }
+        }
+        self.checked
+            .lock()
+            .extend(unchecked.iter().map(FileVersion::of));
+        Ok(())
+    }
+}
+
+/// Every file the scans in `plan` read, into `files`.
+fn files_read_by<'a>(plan: &'a Arc<dyn ExecutionPlan>, files: &mut Vec<&'a ObjectMeta>) {
+    let scanned = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>());
+    if let Some(config) = scanned {
+        files.extend(
+            config
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .map(|file| &file.object_meta),
+        );
+    }
+    for child in plan.children() {
+        files_read_by(child, files);
+    }
+}
+
+#[async_trait]
+impl TableProvider for PartsOfOneTable {
+    fn schema(&self) -> SchemaRef {
+        self.table.schema()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.table.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table.table_type()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.table.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let plan = self.table.scan(state, projection, filters, limit).await?;
+        self.check_files_read_by(state, &plan)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(plan)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DfResult<ScanResult> {
+        let scan = self.table.scan_with_args(state, args).await?;
+        self.check_files_read_by(state, scan.plan())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(scan)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        self.table.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.table.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.table.insert_into(state, input, insert_op).await
+    }
 }

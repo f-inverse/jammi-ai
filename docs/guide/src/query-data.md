@@ -67,9 +67,9 @@ db.add_source("orders", url="/data/exports/orders.parquet", format="parquet")
 db.add_source("customers", url="/data/exports/customers.parquet", format="parquet")
 ```
 
-The files are checked each time a process builds the source, so a file added later that does not
-agree is refused the next time the source is built, such as at a restart or on another server. The
-source's queries then fail with the same error until its files agree.
+The files are checked when the source is built, and a file added later is checked by the first
+query that reads it. A file that does not agree fails that query, and every later one, with the
+same error, naming the file, until it is removed or the files agree.
 
 ## Run a SQL query
 

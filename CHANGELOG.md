@@ -296,6 +296,12 @@ does, and a database source reads, lists and verifies what it holds.
   target was also ignored for any dependency that logs through the `log` crate, as this one does,
   because the log filter read the `log` bridge's callsite rather than the record's own target; it
   now reads the record's.
+- **A file added to a directory source is checked by the query that reads it** (#777). The
+  check above ran when a source was built, but DataFusion lists a directory again for a query
+  whenever its listing is not cached, as it never is for a listing over 1 MiB, so a file added
+  later was read unchecked until the next build. A directory source now checks each file a query
+  reads that it has not checked, so a file that is not a part of the table fails the query,
+  naming it.
 
 ## [0.55.0] - 2026-10-10
 

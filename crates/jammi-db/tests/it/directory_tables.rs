@@ -388,3 +388,68 @@ async fn a_file_added_after_registration_is_refused_when_the_source_is_next_buil
         assert!(err.contains(file), "the refusal must name {file}: {err}");
     }
 }
+
+/// Drop the directory listings this session's DataFusion keeps, as it does
+/// on its own for a directory whose listing outgrows its cache: the next
+/// query lists the directory afresh.
+fn forget_listings(session: &JammiSession) {
+    if let Some(listings) = session
+        .context()
+        .runtime_env()
+        .cache_manager
+        .get_list_files_cache()
+    {
+        listings.clear();
+    }
+}
+
+/// The number of rows `sql` answers.
+async fn row_count(session: &JammiSession, sql: &str) -> usize {
+    let batches = session.sql(sql).await.unwrap();
+    batches.iter().map(|batch| batch.num_rows()).sum()
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_file_added_while_the_source_is_served_is_checked_by_the_query_that_reads_it(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let exports = unrelated_exports(dir.path());
+    let customers = std::fs::read(exports.join("customers.parquet")).unwrap();
+    std::fs::remove_file(exports.join("customers.parquet")).unwrap();
+    let people = folder(dir.path(), "people");
+    std::fs::write(people.join("a.csv"), "first,last\nAda,Lovelace\n").unwrap();
+    let suffix = unique_suffix();
+    let (mixed, csv) = (format!("mixed_{suffix}"), format!("people_{suffix}"));
+    add_directory(&session, &mixed, &exports, FileFormat::Parquet)
+        .await
+        .unwrap();
+    add_directory(&session, &csv, &people, FileFormat::Csv)
+        .await
+        .unwrap();
+    let orders = format!("SELECT * FROM {mixed}.public.mixed");
+    assert_eq!(row_count(&session, &orders).await, 3);
+
+    // A part of the table is read as one.
+    write_parquet(
+        &exports.join("more_orders.parquet"),
+        vec![("order_id", int64s(&[4]), true)],
+    );
+    forget_listings(&session);
+    assert_eq!(row_count(&session, &orders).await, 4);
+
+    // A file of another table is refused by name, not read as NULLs.
+    std::fs::write(exports.join("customers.parquet"), customers).unwrap();
+    std::fs::write(people.join("b.csv"), "last,first\nHopper,Grace\n").unwrap();
+    forget_listings(&session);
+    for (sql, file) in [
+        (orders, "customers.parquet"),
+        (format!("SELECT * FROM {csv}.public.people"), "b.csv"),
+    ] {
+        let err = session.sql(&sql).await.unwrap_err();
+        assert_refused_naming(&err, &[file]);
+    }
+}

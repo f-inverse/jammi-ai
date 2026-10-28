@@ -285,6 +285,10 @@ does, and a database source reads, lists and verifies what it holds.
   before fails with that error when it is next built. A Parquet partition that added a column
   still reads as part of the table, now also when it declares the column non-nullable, which
   failed every query. A JSON directory is unchanged: the union of its records' keys.
+- **Windows runs the client** (#760). The installation guide said only that Windows is not
+  supported, which is true of the in-process engine alone. It now has a Windows section: run
+  `jammi-server` in Docker or WSL2, install `jammi-ai` alone, and name a source's files as the
+  server sees them, since the server opens them. The README's Windows note points to it.
 
 ## [0.55.0] - 2026-10-10
 

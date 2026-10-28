@@ -106,7 +106,9 @@ job.wait()
 - Python 3.9+
 - Linux (x86_64) or macOS (Apple Silicon or Intel)
 
-> **Windows** is not yet supported due to a dependency on POSIX memory-mapping APIs.
+> **Windows:** the in-process engine (`jammi-ai[embedded]`) is not available, because it depends on
+> POSIX memory-mapping APIs. The `jammi-ai` client runs on Windows against a `jammi-server` in Docker
+> or WSL2; see [Installation: Windows](https://f-inverse.github.io/jammi-ai/installation.html#windows).
 
 ## Running the server
 

@@ -14,6 +14,7 @@ mod create_table_as;
 #[cfg(any(feature = "live-postgres-tests", feature = "live-mysql-tests"))]
 mod database_tls;
 mod datafusion_version;
+mod directory_tables;
 mod docs_config_fences;
 mod domain_hash_prefix_free_gate;
 mod ephemeral;

@@ -7,19 +7,26 @@
 //! cloud schemes work end-to-end without DataFusion having to know about
 //! Jammi's [`StorageRegistry`].
 
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
+use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
-use futures::{future, TryStreamExt};
+use futures::{future, stream, StreamExt, TryStreamExt};
 use object_store::ObjectMeta;
 
 use super::FileFormat;
 use crate::error::{JammiError, Result};
-use crate::storage::{CloudConfig, StorageRegistry, StorageUrl};
+use crate::storage::{CloudConfig, DynObjectStore, StorageRegistry, StorageUrl};
+
+/// A DataFusion file reader, which infers a file's schema and scans it.
+type Reader = Arc<dyn datafusion::datasource::file_format::FileFormat>;
 
 /// List every object under `table_url` whose path matches `ext` (DataFusion's
 /// own extension + glob predicate) AND whose size is nonzero.
@@ -100,6 +107,11 @@ async fn list_matching_files(
 /// `.` — a typed `JammiError::Config`, not a listing that silently matches
 /// nothing (or, worse, matches every file if a caller's off-by-one produced
 /// an extension-less glob).
+///
+/// A listing of several files registers as ONE table, its files the parts
+/// of it (#755): files that do not agree on that table's columns are a typed
+/// `JammiError::InvalidArgument` naming two of them (see `disagreement`),
+/// never one table of the union of their columns.
 pub async fn create_listing_table(
     registry: &StorageRegistry,
     url: &StorageUrl,
@@ -125,11 +137,11 @@ pub async fn create_listing_table(
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 
-    let df_format: Arc<dyn datafusion::datasource::file_format::FileFormat> = match format {
+    let df_format: Reader = match format {
         FileFormat::Parquet => {
             Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())
         }
-        FileFormat::Csv => Arc::new(datafusion::datasource::file_format::csv::CsvFormat::default()),
+        FileFormat::Csv => Arc::new(csv_format()),
         // DataFusion's `JsonFormat` reads line-delimited JSON, so the two
         // JSON formats share it and differ only in the files they list.
         FileFormat::Json | FileFormat::JsonLines => {
@@ -165,7 +177,18 @@ pub async fn create_listing_table(
     // other spelling added later never flips which files the source serves.
     let resolved_for_persistence = (candidates.len() > 1).then(|| ext.to_string());
 
+    let parts = part_schemas(format, &df_format, session, &driver, &table_url, &files).await?;
+    if let Some(why) = disagreement(format, &parts) {
+        return Err(JammiError::InvalidArgument {
+            argument: "url".into(),
+            reason: format!(
+                "the files under '{url}' are not parts of one table: {why}; register each file \
+                 as its own source to read them as separate tables"
+            ),
+        });
+    }
     let schema = df_format.infer_schema(session, &driver, &files).await?;
+    let schema = nullable_where_absent(&schema, &parts);
 
     let options = ListingOptions::new(df_format).with_file_extension(ext);
     let config = ListingTableConfig::new(table_url)
@@ -173,4 +196,207 @@ pub async fn create_listing_table(
         .with_schema(schema);
     let table = ListingTable::try_new(config)?;
     Ok((Arc::new(table), resolved_for_persistence))
+}
+
+/// The reader a CSV source's files are read with.
+fn csv_format() -> CsvFormat {
+    CsvFormat::default()
+}
+
+/// What a directory's Parquet parts must agree on.
+const PARQUET_PARTS: &str = "A directory is read as one table, so every file's columns must be \
+                             in its widest file, with the same types";
+
+/// What a directory's CSV parts must agree on.
+const CSV_PARTS: &str = "CSV columns are read by position, so every file in a directory must \
+                         have the same header, in the same order";
+
+/// Each of a listing's `files` with the schema its format reads from that
+/// file alone, named by its path under `table_url`, in path order (the order
+/// DataFusion merges a directory's schema in): the parts [`disagreement`]
+/// checks. Empty when there is nothing to check: a single file, or JSON.
+async fn part_schemas(
+    format: &FileFormat,
+    reader: &Reader,
+    session: &dyn Session,
+    store: &DynObjectStore,
+    table_url: &ListingTableUrl,
+    files: &[ObjectMeta],
+) -> Result<Vec<(String, SchemaRef)>> {
+    if files.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let reader: Reader = match format {
+        // The footers DataFusion's own inference then reads from its cache.
+        FileFormat::Parquet => Arc::clone(reader),
+        // A CSV part's header alone: no record is read to infer a type from.
+        FileFormat::Csv => Arc::new(csv_format().with_schema_infer_max_rec(0)),
+        FileFormat::Json | FileFormat::JsonLines => return Ok(Vec::new()),
+    };
+    let reader = &reader;
+    let mut in_order: Vec<&ObjectMeta> = files.iter().collect();
+    in_order.sort_by(|a, b| a.location.cmp(&b.location));
+    stream::iter(in_order)
+        .map(|file| async move {
+            let schema = reader
+                .infer_schema(session, store, std::slice::from_ref(file))
+                .await?;
+            Ok::<_, JammiError>((under(table_url, file), schema))
+        })
+        // Boxed, as DataFusion's own inference boxes this stream: unboxed,
+        // its borrowing futures fail the callers' `Send` bound
+        // (https://github.com/rust-lang/rust/issues/64552).
+        .boxed()
+        // As many files at once as DataFusion's own inference reads.
+        .buffered(session.config_options().execution.meta_fetch_concurrency)
+        .try_collect()
+        .await
+}
+
+/// `file`'s path under the listing's URL, the name an error gives it.
+fn under(table_url: &ListingTableUrl, file: &ObjectMeta) -> String {
+    match file.location.prefix_match(table_url.prefix()) {
+        Some(segments) => segments
+            .map(|segment| segment.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => file.location.to_string(),
+    }
+}
+
+/// Where a directory's `parts` fail to form one table, if anywhere.
+///
+/// A directory registers as one table read across all its files, so they
+/// must agree on that table's columns: DataFusion would otherwise read them
+/// as the union of every file's columns, NULL wherever a file lacks one — a
+/// folder of unrelated exports registered as one table of meaningless rows.
+/// What agreeing means follows how each format's reader finds a file's
+/// columns:
+///
+/// - Parquet finds them by name, so a part may lack some of the table's
+///   columns (a later partition that added one, the earlier rows reading it
+///   as NULL). Every file's columns must be in the directory's widest file,
+///   each of a type that merges with that file's, as DataFusion merges the
+///   table's schema.
+/// - CSV finds them by position, so every file's header must name the same
+///   columns in the same order: a reordered header would read its values
+///   under the wrong columns.
+/// - A JSON record carries its own keys, so a JSON directory is the union of
+///   its records' keys, as one file of sparse records already is. Unchecked.
+///
+/// Every build of a source checks its listing, so a file added after
+/// registration is refused the next time a process builds the source.
+fn disagreement(format: &FileFormat, parts: &[(String, SchemaRef)]) -> Option<String> {
+    match format {
+        FileFormat::Parquet => parquet_disagreement(parts),
+        FileFormat::Csv => csv_disagreement(parts),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// Where Parquet `parts` fail to nest in the widest of them, if anywhere.
+fn parquet_disagreement(parts: &[(String, SchemaRef)]) -> Option<String> {
+    // `min_by_key` keeps the first of equals: the first widest file in path order.
+    let (widest, table) = parts
+        .iter()
+        .min_by_key(|(_, schema)| Reverse(schema.fields().len()))?;
+    let table: HashMap<&str, &Field> = table
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.as_ref()))
+        .collect();
+    for (file, schema) in parts {
+        let mut absent = Vec::new();
+        for field in schema.fields() {
+            let Some(&wide) = table.get(field.name().as_str()) else {
+                absent.push(field.name().as_str());
+                continue;
+            };
+            if wide.data_type() != field.data_type() && wide.clone().try_merge(field).is_err() {
+                return Some(format!(
+                    "'{file}' has '{}' as {} where '{widest}', the directory's widest file, has \
+                     {}. {PARQUET_PARTS}",
+                    field.name(),
+                    field.data_type(),
+                    wide.data_type()
+                ));
+            }
+        }
+        if !absent.is_empty() {
+            return Some(format!(
+                "'{file}' has {}, which '{widest}', the directory's widest file, does not. \
+                 {PARQUET_PARTS}",
+                quoted(&absent)
+            ));
+        }
+    }
+    None
+}
+
+/// Where CSV `parts` fail to share the first one's header, if anywhere.
+fn csv_disagreement(parts: &[(String, SchemaRef)]) -> Option<String> {
+    let names = |schema: &SchemaRef| -> Vec<String> {
+        schema.fields().iter().map(|f| f.name().clone()).collect()
+    };
+    let (first, header) = parts.first()?;
+    let header = names(header);
+    parts[1..].iter().find_map(|(file, schema)| {
+        let found = names(schema);
+        let why = match found
+            .iter()
+            .zip(&header)
+            .position(|(theirs, ours)| theirs != ours)
+        {
+            Some(at) => format!(
+                "'{file}' has '{}' as column {} where '{first}' has '{}'",
+                found[at],
+                at + 1,
+                header[at]
+            ),
+            None if found.len() != header.len() => format!(
+                "'{file}' has {} columns where '{first}' has {}",
+                found.len(),
+                header.len()
+            ),
+            None => return None,
+        };
+        Some(format!("{why}. {CSV_PARTS}"))
+    })
+}
+
+/// `names`, quoted: the first ten of them, and how many more.
+fn quoted(names: &[&str]) -> String {
+    let mut shown: Vec<String> = names
+        .iter()
+        .take(10)
+        .map(|name| format!("'{name}'"))
+        .collect();
+    if names.len() > 10 {
+        shown.push(format!("{} more", names.len() - 10));
+    }
+    shown.join(", ")
+}
+
+/// `schema` with every column some part lacks made nullable: a part's rows
+/// read a column it lacks as NULL, where DataFusion's merge, seeing only the
+/// files that hold the column, keeps their non-nullable declaration.
+fn nullable_where_absent(schema: &Schema, parts: &[(String, SchemaRef)]) -> SchemaRef {
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    for (_, part) in parts {
+        for field in part.fields() {
+            *held.entry(field.name().as_str()).or_default() += 1;
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let lacked = held.get(field.name().as_str()).copied().unwrap_or(0) < parts.len();
+            field
+                .as_ref()
+                .clone()
+                .with_nullable(field.is_nullable() || lacked)
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }

@@ -275,6 +275,16 @@ does, and a database source reads, lists and verifies what it holds.
   sites are propagated, matched with each outcome named, or not produced. Three tests that passed
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
+- **A directory is one table** (#755). A directory source read its files as the union of their
+  columns, NULL wherever a file lacked one, so a folder of unrelated exports registered as one
+  table of meaningless rows; a CSV directory, read by position, read a reordered header's values
+  under the wrong columns. A directory's files are now the parts of one table, checked whenever
+  the source is built: every Parquet file's columns must be in the directory's widest file, with
+  the same types, and every CSV file must have the same header in the same order. A directory
+  that does not agree is refused, naming two of its files, and a source registered over one
+  before fails with that error when it is next built. A Parquet partition that added a column
+  still reads as part of the table, now also when it declares the column non-nullable, which
+  failed every query. A JSON directory is unchanged: the union of its records' keys.
 
 ## [0.55.0] - 2026-10-10
 

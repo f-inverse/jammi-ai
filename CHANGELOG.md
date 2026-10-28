@@ -275,6 +275,33 @@ does, and a database source reads, lists and verifies what it holds.
   sites are propagated, matched with each outcome named, or not produced. Three tests that passed
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
+- **A directory is one table** (#755). A directory source read its files as the union of their
+  columns, NULL wherever a file lacked one, so a folder of unrelated exports registered as one
+  table of meaningless rows; a CSV directory, read by position, read a reordered header's values
+  under the wrong columns. A directory's files are now the parts of one table, checked whenever
+  the source is built: every Parquet file's columns must be in the directory's widest file, with
+  the same types, and every CSV file must have the same header in the same order. A directory
+  that does not agree is refused, naming two of its files, and a source registered over one
+  before fails with that error when it is next built. A Parquet partition that added a column
+  still reads as part of the table, now also when it declares the column non-nullable, which
+  failed every query. A JSON directory is unchanged: the union of its records' keys.
+- **Windows runs the client** (#760). The installation guide said only that Windows is not
+  supported, which is true of the in-process engine alone. It now has a Windows section: run
+  `jammi-server` in Docker or WSL2, install `jammi-ai` alone, and name a source's files as the
+  server sees them, since the server opens them. The README's Windows note points to it.
+- **The server does not log SQL statements** (#761). The Flight SQL service logged every
+  statement's full text, its literal values included, at INFO. Its target,
+  `datafusion_flight_sql_server`, is now held to `warn` unless the log filter names it, so
+  `level = "info,datafusion_flight_sql_server=info"` logs statements again. A directive naming a
+  target was also ignored for any dependency that logs through the `log` crate, as this one does,
+  because the log filter read the `log` bridge's callsite rather than the record's own target; it
+  now reads the record's.
+- **A file added to a directory source is checked by the query that reads it** (#777). The
+  check above ran when a source was built, but DataFusion lists a directory again for a query
+  whenever its listing is not cached, as it never is for a listing over 1 MiB, so a file added
+  later was read unchecked until the next build. A directory source now checks each file a query
+  reads that it has not checked, so a file that is not a part of the table fails the query,
+  naming it.
 
 ## [0.55.0] - 2026-10-10
 

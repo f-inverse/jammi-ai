@@ -45,6 +45,32 @@ jammi sources add patents --url /data/patents.parquet --format parquet
 | JSON | `FileFormat::Json` | `"json"` | Line-delimited JSON |
 | JSON Lines | `FileFormat::JsonLines` | `"jsonl"` or `"ndjson"` | Same line-delimited reader as JSON; `.jsonl` preferred, `.ndjson` used when no `.jsonl` files match. Resolved once at registration and pinned — a later directory change never flips it. |
 
+## A directory is one table
+
+A source whose URL names a directory registers **one** table, named after the directory, read
+across every file directly in it with the format's extension (files in subdirectories are not
+read). The files are the parts of that table, so they must agree on its columns. A directory whose
+files do not is refused when it is registered, and the error names two of the files:
+
+- **Parquet** columns are read by name, in any order. A file may lack some of the table's columns,
+  as a later partition that added one does, and its rows read them as NULL. Every file's columns
+  must be in the directory's widest file, with the same types.
+- **CSV** columns are read by position, so every file must have the same header, in the same
+  order.
+- **JSON** records carry their own keys, so a JSON directory's table has every key any record
+  has, NULL where a record lacks one.
+
+To register files that hold different tables, add each file as its own source:
+
+```python
+db.add_source("orders", url="/data/exports/orders.parquet", format="parquet")
+db.add_source("customers", url="/data/exports/customers.parquet", format="parquet")
+```
+
+The files are checked when the source is built, and a file added later is checked by the first
+query that reads it. A file that does not agree fails that query, and every later one, with the
+same error, naming the file, until it is removed or the files agree.
+
 ## Run a SQL query
 
 Sources are accessible via three-part SQL names: `<source_id>.public.<table_name>`. The table name is derived from the file name (e.g., `patents.parquet` becomes `patents`).

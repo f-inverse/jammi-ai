@@ -240,6 +240,9 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# The `log` bridge `tracing-subscriber` installs; named for the real target of
+# an event it carries. The version `tracing-subscriber` resolves in `Cargo.lock`.
+tracing-log = "0.2"
 # Vendor-neutral OTLP trace export, behind `jammi-ai`'s `telemetry-otlp`
 # feature. One tonic: `opentelemetry-otlp`'s `grpc-tonic` transport pins tonic
 # `^0.14.1` / prost `^0.14`, matching this workspace's own `tonic = "0.14"` /

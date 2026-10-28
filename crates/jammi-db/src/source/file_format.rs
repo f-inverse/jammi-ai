@@ -7,19 +7,37 @@
 //! cloud schemes work end-to-end without DataFusion having to know about
 //! Jammi's [`StorageRegistry`].
 
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::catalog::Session;
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use datafusion::catalog::{ScanArgs, ScanResult, Session};
+use datafusion::common::{Constraints, Statistics};
+use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::TableProvider;
-use futures::{future, TryStreamExt};
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
+use futures::{future, stream, StreamExt, TryStreamExt};
+use object_store::path::Path;
 use object_store::ObjectMeta;
+use parking_lot::Mutex;
 
 use super::FileFormat;
 use crate::error::{JammiError, Result};
-use crate::storage::{CloudConfig, StorageRegistry, StorageUrl};
+use crate::storage::{CloudConfig, DynObjectStore, StorageRegistry, StorageUrl};
+
+/// A DataFusion file reader, which infers a file's schema and scans it.
+type Reader = Arc<dyn datafusion::datasource::file_format::FileFormat>;
 
 /// List every object under `table_url` whose path matches `ext` (DataFusion's
 /// own extension + glob predicate) AND whose size is nonzero.
@@ -100,6 +118,11 @@ async fn list_matching_files(
 /// `.` — a typed `JammiError::Config`, not a listing that silently matches
 /// nothing (or, worse, matches every file if a caller's off-by-one produced
 /// an extension-less glob).
+///
+/// A listing of several files registers as ONE table, its files the parts
+/// of it (#755): files that do not agree on that table's columns are a typed
+/// `JammiError::InvalidArgument` naming two of them (see `disagreement`),
+/// never one table of the union of their columns.
 pub async fn create_listing_table(
     registry: &StorageRegistry,
     url: &StorageUrl,
@@ -125,11 +148,11 @@ pub async fn create_listing_table(
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 
-    let df_format: Arc<dyn datafusion::datasource::file_format::FileFormat> = match format {
+    let df_format: Reader = match format {
         FileFormat::Parquet => {
             Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())
         }
-        FileFormat::Csv => Arc::new(datafusion::datasource::file_format::csv::CsvFormat::default()),
+        FileFormat::Csv => Arc::new(csv_format()),
         // DataFusion's `JsonFormat` reads line-delimited JSON, so the two
         // JSON formats share it and differ only in the files they list.
         FileFormat::Json | FileFormat::JsonLines => {
@@ -165,12 +188,438 @@ pub async fn create_listing_table(
     // other spelling added later never flips which files the source serves.
     let resolved_for_persistence = (candidates.len() > 1).then(|| ext.to_string());
 
+    // A directory's files are the parts of one table (#755): checked here,
+    // and a file DataFusion lists after this build by the query that reads it
+    // (#777). A URL naming one file lists only itself.
+    let names_a_directory = files
+        .iter()
+        .any(|file| file.location != *table_url.prefix());
+    let part_reader = names_a_directory
+        .then(|| part_reader(format, &df_format))
+        .flatten();
+    let parts = match &part_reader {
+        Some(reader) => part_schemas(reader, session, &driver, &table_url, &files).await?,
+        None => Vec::new(),
+    };
+    if let Some(why) = disagreement(format, &parts) {
+        return Err(not_one_table(url, &why));
+    }
     let schema = df_format.infer_schema(session, &driver, &files).await?;
+    let schema = nullable_where_absent(&schema, &parts);
 
     let options = ListingOptions::new(df_format).with_file_extension(ext);
-    let config = ListingTableConfig::new(table_url)
+    let config = ListingTableConfig::new(table_url.clone())
         .with_listing_options(options)
         .with_schema(schema);
-    let table = ListingTable::try_new(config)?;
-    Ok((Arc::new(table), resolved_for_persistence))
+    let table = Arc::new(ListingTable::try_new(config)?);
+    let provider: Arc<dyn TableProvider> = match (part_reader, reference(format, &parts)) {
+        (Some(reader), Some(reference)) => Arc::new(PartsOfOneTable {
+            table,
+            format: format.clone(),
+            reader,
+            store: driver,
+            table_url,
+            url: url.to_string(),
+            reference,
+            checked: Mutex::new(files.iter().map(FileVersion::of).collect()),
+        }),
+        _ => table,
+    };
+    Ok((provider, resolved_for_persistence))
+}
+
+/// The refusal of a directory whose files are not parts of one table.
+fn not_one_table(url: impl std::fmt::Display, why: &str) -> JammiError {
+    JammiError::InvalidArgument {
+        argument: "url".into(),
+        reason: format!(
+            "the files under '{url}' are not parts of one table: {why}; register each file as \
+             its own source to read them as separate tables"
+        ),
+    }
+}
+
+/// The reader a CSV source's files are read with.
+fn csv_format() -> CsvFormat {
+    CsvFormat::default()
+}
+
+/// What a directory's Parquet parts must agree on.
+const PARQUET_PARTS: &str = "A directory is read as one table, so every file's columns must be \
+                             in its widest file, with the same types";
+
+/// What a directory's CSV parts must agree on.
+const CSV_PARTS: &str = "CSV columns are read by position, so every file in a directory must \
+                         have the same header, in the same order";
+
+/// The reader a part's schema is read with, or `None` for JSON, whose
+/// records each carry their own keys and are unchecked (see `disagreement`).
+fn part_reader(format: &FileFormat, table_reader: &Reader) -> Option<Reader> {
+    match format {
+        // The footers DataFusion's own inference then reads from its cache.
+        FileFormat::Parquet => Some(Arc::clone(table_reader)),
+        // A CSV part's header alone: no record is read to infer a type from.
+        FileFormat::Csv => Some(Arc::new(csv_format().with_schema_infer_max_rec(0))),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// Each of a listing's `files` with the schema `reader` reads from that file
+/// alone, named by its path under `table_url`, in path order (the order
+/// DataFusion merges a directory's schema in): the parts [`disagreement`]
+/// checks.
+async fn part_schemas(
+    reader: &Reader,
+    session: &dyn Session,
+    store: &DynObjectStore,
+    table_url: &ListingTableUrl,
+    files: &[ObjectMeta],
+) -> Result<Vec<(String, SchemaRef)>> {
+    let mut in_order: Vec<&ObjectMeta> = files.iter().collect();
+    in_order.sort_by(|a, b| a.location.cmp(&b.location));
+    stream::iter(in_order)
+        .map(|file| async move {
+            let schema = reader
+                .infer_schema(session, store, std::slice::from_ref(file))
+                .await?;
+            Ok::<_, JammiError>((under(table_url, file), schema))
+        })
+        // Boxed, as DataFusion's own inference boxes this stream: unboxed,
+        // its borrowing futures fail the callers' `Send` bound
+        // (https://github.com/rust-lang/rust/issues/64552).
+        .boxed()
+        // As many files at once as DataFusion's own inference reads.
+        .buffered(session.config_options().execution.meta_fetch_concurrency)
+        .try_collect()
+        .await
+}
+
+/// `file`'s path under the listing's URL, the name an error gives it.
+fn under(table_url: &ListingTableUrl, file: &ObjectMeta) -> String {
+    match file.location.prefix_match(table_url.prefix()) {
+        Some(segments) => segments
+            .map(|segment| segment.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => file.location.to_string(),
+    }
+}
+
+/// Where a directory's `parts` fail to form one table, if anywhere.
+///
+/// A directory registers as one table read across all its files, so they
+/// must agree on that table's columns: DataFusion would otherwise read them
+/// as the union of every file's columns, NULL wherever a file lacks one — a
+/// folder of unrelated exports registered as one table of meaningless rows.
+/// What agreeing means follows how each format's reader finds a file's
+/// columns:
+///
+/// - Parquet finds them by name, so a part may lack some of the table's
+///   columns (a later partition that added one, the earlier rows reading it
+///   as NULL). Every file's columns must be in the directory's widest file,
+///   each of a type that merges with that file's, as DataFusion merges the
+///   table's schema.
+/// - CSV finds them by position, so every file's header must name the same
+///   columns in the same order: a reordered header would read its values
+///   under the wrong columns.
+/// - A JSON record carries its own keys, so a JSON directory is the union of
+///   its records' keys, as one file of sparse records already is. Unchecked.
+///
+/// Every build of a source checks its listing, so a file added after
+/// registration is refused the next time a process builds the source.
+fn disagreement(format: &FileFormat, parts: &[(String, SchemaRef)]) -> Option<String> {
+    match format {
+        FileFormat::Parquet => parquet_disagreement(parts),
+        FileFormat::Csv => csv_disagreement(parts),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// The part a file DataFusion lists later is checked against: the widest
+/// Parquet part, which holds the table's columns, or the first CSV part's
+/// header. `None` for JSON, or no parts.
+fn reference(format: &FileFormat, parts: &[(String, SchemaRef)]) -> Option<(String, SchemaRef)> {
+    match format {
+        FileFormat::Parquet => widest(parts).cloned(),
+        FileFormat::Csv => parts.first().cloned(),
+        FileFormat::Json | FileFormat::JsonLines => None,
+    }
+}
+
+/// The widest of `parts`: the first of the widest in path order, since
+/// `min_by_key` keeps the first of equals.
+fn widest(parts: &[(String, SchemaRef)]) -> Option<&(String, SchemaRef)> {
+    parts
+        .iter()
+        .min_by_key(|(_, schema)| Reverse(schema.fields().len()))
+}
+
+/// Where Parquet `parts` fail to nest in the widest of them, if anywhere.
+fn parquet_disagreement(parts: &[(String, SchemaRef)]) -> Option<String> {
+    let (widest, table) = widest(parts)?;
+    let table: HashMap<&str, &Field> = table
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.as_ref()))
+        .collect();
+    for (file, schema) in parts {
+        let mut absent = Vec::new();
+        for field in schema.fields() {
+            let Some(&wide) = table.get(field.name().as_str()) else {
+                absent.push(field.name().as_str());
+                continue;
+            };
+            if wide.data_type() != field.data_type() && wide.clone().try_merge(field).is_err() {
+                return Some(format!(
+                    "'{file}' has '{}' as {} where '{widest}', the directory's widest file, has \
+                     {}. {PARQUET_PARTS}",
+                    field.name(),
+                    field.data_type(),
+                    wide.data_type()
+                ));
+            }
+        }
+        if !absent.is_empty() {
+            return Some(format!(
+                "'{file}' has {}, which '{widest}', the directory's widest file, does not. \
+                 {PARQUET_PARTS}",
+                quoted(&absent)
+            ));
+        }
+    }
+    None
+}
+
+/// Where CSV `parts` fail to share the first one's header, if anywhere.
+fn csv_disagreement(parts: &[(String, SchemaRef)]) -> Option<String> {
+    let names = |schema: &SchemaRef| -> Vec<String> {
+        schema.fields().iter().map(|f| f.name().clone()).collect()
+    };
+    let (first, header) = parts.first()?;
+    let header = names(header);
+    parts[1..].iter().find_map(|(file, schema)| {
+        let found = names(schema);
+        let why = match found
+            .iter()
+            .zip(&header)
+            .position(|(theirs, ours)| theirs != ours)
+        {
+            Some(at) => format!(
+                "'{file}' has '{}' as column {} where '{first}' has '{}'",
+                found[at],
+                at + 1,
+                header[at]
+            ),
+            None if found.len() != header.len() => format!(
+                "'{file}' has {} columns where '{first}' has {}",
+                found.len(),
+                header.len()
+            ),
+            None => return None,
+        };
+        Some(format!("{why}. {CSV_PARTS}"))
+    })
+}
+
+/// `names`, quoted: the first ten of them, and how many more.
+fn quoted(names: &[&str]) -> String {
+    let mut shown: Vec<String> = names
+        .iter()
+        .take(10)
+        .map(|name| format!("'{name}'"))
+        .collect();
+    if names.len() > 10 {
+        shown.push(format!("{} more", names.len() - 10));
+    }
+    shown.join(", ")
+}
+
+/// `schema` with every column some part lacks made nullable: a part's rows
+/// read a column it lacks as NULL, where DataFusion's merge, seeing only the
+/// files that hold the column, keeps their non-nullable declaration.
+fn nullable_where_absent(schema: &Schema, parts: &[(String, SchemaRef)]) -> SchemaRef {
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    for (_, part) in parts {
+        for field in part.fields() {
+            *held.entry(field.name().as_str()).or_default() += 1;
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let lacked = held.get(field.name().as_str()).copied().unwrap_or(0) < parts.len();
+            field
+                .as_ref()
+                .clone()
+                .with_nullable(field.is_nullable() || lacked)
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// One version of a listed file: a file rewritten in place is a new version,
+/// checked again.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FileVersion {
+    location: Path,
+    size: u64,
+    last_modified: DateTime<Utc>,
+}
+
+impl FileVersion {
+    fn of(file: &ObjectMeta) -> Self {
+        Self {
+            location: file.location.clone(),
+            size: file.size,
+            last_modified: file.last_modified,
+        }
+    }
+}
+
+/// A directory source's table, which checks each file a query reads that
+/// the source's build did not (#777).
+///
+/// DataFusion lists a directory's files for each query, from its listing
+/// cache when the listing is there. The cache keeps a listing until it is
+/// evicted, and never keeps one larger than itself, so a file added after
+/// the source was built can be read before the source is built again. The
+/// files a scan reads are in the plan DataFusion's own scan returns; one
+/// this table has not checked is held to the build's check, against
+/// `reference`, before the plan is returned, so a file that is not a part of
+/// the table fails the query, naming it, rather than reading as NULLs. A file
+/// that is a part is remembered and not read again.
+#[derive(Debug)]
+struct PartsOfOneTable {
+    table: Arc<ListingTable>,
+    format: FileFormat,
+    reader: Reader,
+    store: DynObjectStore,
+    table_url: ListingTableUrl,
+    url: String,
+    reference: (String, SchemaRef),
+    checked: Mutex<HashSet<FileVersion>>,
+}
+
+impl PartsOfOneTable {
+    /// Check the files `plan` reads that this table has not checked.
+    async fn check_files_read_by(
+        &self,
+        session: &dyn Session,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<()> {
+        let mut read = Vec::new();
+        files_read_by(plan, &mut read);
+        let unchecked: Vec<ObjectMeta> = {
+            let checked = self.checked.lock();
+            read.into_iter()
+                .filter(|file| !checked.contains(&FileVersion::of(file)))
+                .cloned()
+                .collect()
+        };
+        if unchecked.is_empty() {
+            return Ok(());
+        }
+        let parts = part_schemas(
+            &self.reader,
+            session,
+            &self.store,
+            &self.table_url,
+            &unchecked,
+        )
+        .await?;
+        for part in parts {
+            if let Some(why) = disagreement(&self.format, &[self.reference.clone(), part]) {
+                return Err(not_one_table(&self.url, &why));
+            }
+        }
+        self.checked
+            .lock()
+            .extend(unchecked.iter().map(FileVersion::of));
+        Ok(())
+    }
+}
+
+/// Every file the scans in `plan` read, into `files`.
+fn files_read_by<'a>(plan: &'a Arc<dyn ExecutionPlan>, files: &mut Vec<&'a ObjectMeta>) {
+    let scanned = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>());
+    if let Some(config) = scanned {
+        files.extend(
+            config
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .map(|file| &file.object_meta),
+        );
+    }
+    for child in plan.children() {
+        files_read_by(child, files);
+    }
+}
+
+#[async_trait]
+impl TableProvider for PartsOfOneTable {
+    fn schema(&self) -> SchemaRef {
+        self.table.schema()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.table.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table.table_type()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.table.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let plan = self.table.scan(state, projection, filters, limit).await?;
+        self.check_files_read_by(state, &plan)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(plan)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DfResult<ScanResult> {
+        let scan = self.table.scan_with_args(state, args).await?;
+        self.check_files_read_by(state, scan.plan())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(scan)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        self.table.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.table.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.table.insert_into(state, input, insert_op).await
+    }
 }

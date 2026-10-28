@@ -126,7 +126,50 @@ pip install jammi-ai                        # the client alone, for a remote ser
 `jammi.connect("file://…")` runs the engine in-process and needs it installed;
 `connect("grpc://…")` needs only the client. Requires Python 3.9+. Wheels are
 built for Linux (x86_64 and aarch64, glibc 2.28+) and macOS (Apple Silicon and
-Intel); the CUDA engine is Linux x86_64. Windows is not supported.
+Intel); the CUDA engine is Linux x86_64. The engine has no Windows build; on
+Windows, use the client against a server, as below.
+
+### Windows
+
+The in-process engine does not run on Windows: it depends on POSIX
+memory-mapping APIs, and no `jammi-ai-native` wheel is built for it. The
+`jammi-ai` client is pure Python and runs on Windows against a `jammi-server`
+in Docker or WSL2.
+
+1. Start the server in Docker (Docker Desktop), or run the Linux `jammi-server`
+   binary in WSL2:
+
+   ```powershell
+   docker run --rm -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 -v jammi_data:/var/lib/jammi -v K:\data:/data:ro ghcr.io/f-inverse/jammi-ai-server:latest
+   ```
+
+   The second `-v` makes a Windows folder readable inside the container as
+   `/data`. A server in WSL2 reads Windows drives as `/mnt/k/...`.
+
+2. Install the client alone, and connect to the server:
+
+   ```powershell
+   pip install jammi-ai
+   ```
+
+   ```python
+   import jammi
+
+   db = jammi.connect("grpc://127.0.0.1:8081")
+   ```
+
+3. Name files as the **server** sees them. A source's URL is opened by the
+   server, not the client, so a Windows path such as `K:\data\patents.parquet`
+   is not found; pass the path inside the container or WSL2:
+
+   ```python
+   db.add_source("patents", url="/data/patents.parquet", format="parquet")
+   ```
+
+`jammi.connect("file://…")` runs the engine in-process, so it is not available
+on Windows. Don't install `jammi-ai[embedded]` there: pip finds no
+`jammi-ai-native` wheel for Windows, tries every earlier release in turn, and
+ends with `ResolutionImpossible`.
 
 ## From source
 

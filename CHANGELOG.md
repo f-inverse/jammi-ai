@@ -289,6 +289,13 @@ does, and a database source reads, lists and verifies what it holds.
   supported, which is true of the in-process engine alone. It now has a Windows section: run
   `jammi-server` in Docker or WSL2, install `jammi-ai` alone, and name a source's files as the
   server sees them, since the server opens them. The README's Windows note points to it.
+- **The server does not log SQL statements** (#761). The Flight SQL service logged every
+  statement's full text, its literal values included, at INFO. Its target,
+  `datafusion_flight_sql_server`, is now held to `warn` unless the log filter names it, so
+  `level = "info,datafusion_flight_sql_server=info"` logs statements again. A directive naming a
+  target was also ignored for any dependency that logs through the `log` crate, as this one does,
+  because the log filter read the `log` bridge's callsite rather than the record's own target; it
+  now reads the record's.
 
 ## [0.55.0] - 2026-10-10
 

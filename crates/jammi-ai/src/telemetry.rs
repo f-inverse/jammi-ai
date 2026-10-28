@@ -39,6 +39,7 @@ use jammi_db::error::{JammiError, Result};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
 use tracing::{span, Event, Metadata, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
@@ -50,12 +51,28 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 /// either — a layer with no filter of its own is interested in every
 /// callsite in the process, transport internals included. Every layer reads
 /// it as a per-layer filter, so each is [`EventsDecidedAtDispatch`].
+///
+/// The Flight SQL service logs every statement's text, literals included, at
+/// INFO (#761). Its target is held to `warn` unless the filter names it, so an
+/// operator opts in to statement logging by naming it
+/// (`info,datafusion_flight_sql_server=info`).
 fn log_filter(logging: &LoggingConfig, host_default: &str) -> EventsDecidedAtDispatch {
-    EventsDecidedAtDispatch(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(logging.level.as_deref().unwrap_or(host_default))),
-    )
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(logging.level.as_deref().unwrap_or(host_default)));
+    let filter = if filter.to_string().contains(STATEMENT_LOG_TARGET) {
+        filter
+    } else {
+        filter.add_directive(
+            format!("{STATEMENT_LOG_TARGET}=warn")
+                .parse()
+                .expect("a target and a level are a directive"),
+        )
+    };
+    EventsDecidedAtDispatch(filter)
 }
+
+/// The target the Flight SQL service logs each statement's text under.
+const STATEMENT_LOG_TARGET: &str = "datafusion_flight_sql_server";
 
 /// The log formatter a host installs over `writer`, filtered by `RUST_LOG`
 /// when set, else by `[logging] level`, else by `host_default`; JSON or text
@@ -108,8 +125,12 @@ impl<S: Subscriber> Filter<S> for EventsDecidedAtDispatch {
     }
 
     fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
-        Filter::<S>::enabled(&self.0, event.metadata(), cx)
-            && Filter::<S>::event_enabled(&self.0, event, cx)
+        // An event the `log` bridge carries has the bridge's callsite, one per
+        // level, whose target is `log`: the record's own target is in its
+        // fields, and a directive naming that target is decided on it.
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        Filter::<S>::enabled(&self.0, meta, cx) && Filter::<S>::event_enabled(&self.0, event, cx)
     }
 
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
@@ -546,6 +567,43 @@ mod tests {
         });
         assert!(output.contains("needs attention"), "{output}");
         assert!(!output.contains("probe reach EOF"), "{output}");
+    }
+
+    /// The line the Flight SQL service logs for every statement, at INFO,
+    /// with the statement's text. It logs through the `log` crate, so the
+    /// line reaches the subscriber through the `log` bridge, as it does in
+    /// the server.
+    fn a_statement_is_logged() {
+        // Another test in this process may have installed the bridge first;
+        // either way it is installed.
+        tracing_log::LogTracer::init().unwrap_or(());
+        tracing_log::log::info!(
+            target: "datafusion_flight_sql_server::service",
+            "get_flight_info_statement with query=SELECT * FROM t WHERE email = 'ada@example.com'"
+        );
+        tracing::info!("routine progress");
+    }
+
+    /// A statement's text, and the literals in it, stay out of the log at
+    /// whatever level is configured, and the engine's own lines stay in.
+    #[test]
+    fn a_statement_stays_out_of_the_log_unless_its_target_is_named() {
+        for level in [None, Some("info"), Some("debug")] {
+            let logging = LoggingConfig {
+                level: level.map(Into::into),
+                ..LoggingConfig::default()
+            };
+            let output = emitted_with(&logging, "info", a_statement_is_logged);
+            assert!(output.contains("routine progress"), "{level:?}: {output}");
+            assert!(!output.contains("ada@example.com"), "{level:?}: {output}");
+        }
+
+        let named = LoggingConfig {
+            level: Some("info,datafusion_flight_sql_server=info".into()),
+            ..LoggingConfig::default()
+        };
+        let output = emitted_with(&named, "info", a_statement_is_logged);
+        assert!(output.contains("ada@example.com"), "{output}");
     }
 
     /// With no endpoint the host installs the formatter alone, and the

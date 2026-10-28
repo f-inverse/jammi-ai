@@ -79,7 +79,18 @@ Logs are emitted as structured records, JSON or human-readable text per
 `logging.format` (`LogFormat`). The filter comes from `logging.level` (`info`
 when unset), with `RUST_LOG` as an optional override. Output always goes to
 stdout — a server runs non-interactively by design — and ANSI colour is enabled
-only when stdout is a terminal.
+only when stdout is a terminal. A directive naming a target applies to it
+whether the code logs through `tracing` or the `log` crate.
+
+SQL statements are not logged. The Flight SQL service logs each statement's
+full text, its literal values included, at INFO under the
+`datafusion_flight_sql_server` target; that target is held to `warn` at every
+level unless the filter names it. To log statements, name it:
+
+```toml
+[logging]
+level = "info,datafusion_flight_sql_server=info"
+```
 
 ```json
 {"timestamp":"2026-06-15T04:17:33.114Z","level":"INFO","fields":{"message":"job completed"},"target":"jammi_ai::fine_tune::worker","span":{"job_id":"job-7af3","worker_id":"worker-2","tenant_id":"acme","name":"run_claimed_job"}}

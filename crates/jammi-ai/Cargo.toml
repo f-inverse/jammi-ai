@@ -144,6 +144,9 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 # `telemetry::fmt_layer`, the log formatter every host installs.
 tracing-subscriber.workspace = true
+# The log filter reads a `log`-crate event's real target, which the bridge
+# carries in the event's fields rather than its callsite.
+tracing-log.workspace = true
 http = { workspace = true, optional = true }
 
 [dev-dependencies]

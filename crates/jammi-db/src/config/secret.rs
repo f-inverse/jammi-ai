@@ -355,6 +355,67 @@ impl<'de> Visitor<'de> for SecretSourceVisitor {
     // `expecting` — the accepted shapes — so nothing is listed twice.
 }
 
+/// The prefix of every variable a source's `${NAME}` placeholder may name. A
+/// source's definition is its caller's, while the environment is the
+/// server's: were any variable nameable, a caller could have the server send
+/// any secret of its own (its catalog's password, its cloud keys) as a
+/// source's password to a host of the caller's choosing. Only the variables
+/// the operator sets aside for sources, by this prefix, can be named.
+pub const SOURCE_VARIABLE_PREFIX: &str = "JAMMI_SOURCE_";
+
+/// Whether `text` is nothing but `${NAME}` placeholders: a secret it names,
+/// read where it is used, rather than one it holds (#756).
+pub(crate) fn names_only(text: &str) -> bool {
+    crate::config::interpolate_env_vars(text, |_| Some(String::new()))
+        .is_ok_and(|rest| rest.is_empty())
+}
+
+/// The first variable a `${NAME}` placeholder in `text` names outside
+/// [`SOURCE_VARIABLE_PREFIX`]. A placeholder that does not close names
+/// nothing; reading the text refuses it.
+pub(crate) fn unnamable_variable(text: &str) -> Option<String> {
+    let outside = std::cell::RefCell::new(None);
+    let read = crate::config::interpolate_env_vars(text, |name| {
+        if !name.starts_with(SOURCE_VARIABLE_PREFIX) {
+            outside.borrow_mut().get_or_insert_with(|| name.to_string());
+        }
+        Some(String::new())
+    });
+    read.ok().and(outside.into_inner())
+}
+
+/// `text` with each `${NAME}` in it read from this process's environment,
+/// under the config file's rules (`$$` is one `$`), or why it could not be:
+/// a variable outside [`SOURCE_VARIABLE_PREFIX`] or not set, named, or
+/// placeholders that are not `${NAME}`, never the text itself. Text holding
+/// no `${` is returned as it is, `$$` and all, so a secret written before
+/// placeholders existed reads as it always did.
+pub(crate) fn read_placeholders(text: &str) -> std::result::Result<String, String> {
+    if !text.contains("${") {
+        return Ok(text.to_string());
+    }
+    if let Some(name) = unnamable_variable(text) {
+        return Err(format!(
+            "`${{{name}}}` names a variable outside `{SOURCE_VARIABLE_PREFIX}*`, the only \
+             variables a source may name"
+        ));
+    }
+    let unset = std::cell::RefCell::new(None);
+    crate::config::interpolate_env_vars(text, |name| {
+        let value = std::env::var(name).ok();
+        if value.is_none() {
+            unset.replace(Some(name.to_string()));
+        }
+        value
+    })
+    .map_err(|_| match unset.into_inner() {
+        Some(name) => format!("`${{{name}}}` is not set in this process's environment"),
+        None => "a `${` that does not close a `${NAME}` placeholder, its NAME matching \
+                 [A-Za-z_][A-Za-z0-9_]*"
+            .to_string(),
+    })
+}
+
 /// Does this string parse as a TOML inline table whose only key is `file`?
 ///
 /// That is the text an operator produces by quoting the file form

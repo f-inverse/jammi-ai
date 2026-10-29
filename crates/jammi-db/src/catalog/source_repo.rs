@@ -72,6 +72,8 @@ impl Catalog {
         source_type: SourceType,
         connection: &SourceConnection,
     ) -> Result<()> {
+        // The catalog never holds a source's secret (#756).
+        connection.refuse_a_written_secret(&source_type)?;
         let type_str =
             serde_json::to_string(&source_type).map_err(|e| JammiError::Catalog(e.to_string()))?;
         let uri = connection.url.as_deref().unwrap_or("").to_string();

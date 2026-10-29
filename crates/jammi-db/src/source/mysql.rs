@@ -47,7 +47,7 @@ pub async fn create_mysql_tables(
         None => None,
     };
     let (params, schema) =
-        pool_params(database::url(source_id, connection)?, ca.as_deref()).map_err(failed)?;
+        pool_params(&database::url(source_id, connection)?, ca.as_deref()).map_err(failed)?;
     let pool = MySQLConnectionPool::new(params)
         .await
         .map_err(|e| failed(format!("Failed to connect to MySQL: {e}")))?;

@@ -119,7 +119,7 @@ let conn = SourceConnection {
     format: Some(FileFormat::Parquet),
     cloud: Some(CloudConfig::Azure(AzureConfig {
         account_name: Some("mystorage".into()),
-        sas_token: Some(std::env::var("AZURE_SAS_TOKEN")?.into()),
+        sas_token: Some("${JAMMI_SOURCE_AZURE_SAS_TOKEN}".into()),
         ..Default::default()
     })),
     ..Default::default()
@@ -143,7 +143,7 @@ let conn = SourceConnection {
     cloud: Some(CloudConfig::R2(R2Config {
         account_id: Some(std::env::var("R2_ACCOUNT_ID")?),
         access_key_id: Some(std::env::var("R2_ACCESS_KEY_ID")?),
-        secret_access_key: Some(std::env::var("R2_SECRET_ACCESS_KEY")?.into()),
+        secret_access_key: Some("${JAMMI_SOURCE_R2_SECRET_ACCESS_KEY}".into()),
         ..Default::default()
     })),
     ..Default::default()
@@ -152,6 +152,20 @@ let conn = SourceConnection {
 ```
 
 Set `endpoint` instead of `account_id` to point at an R2 custom domain. Result tables and their sidecar ANN indexes persist to `r2://` exactly as to any other cloud backend.
+
+### A source's secrets are named, never written
+
+A source's `cloud` credentials are kept in the catalog with the source, so that every later
+build reads it the same way, so each secret field (`secret_access_key`, `session_token`,
+`service_account_json`, `account_key`, `sas_token`, `client_secret`) holds a `${NAME}`
+placeholder, as in the examples above, naming a variable whose name starts `JAMMI_SOURCE_`.
+It is read from the environment of the process that reads the source, each time it builds
+it; a variable that is not set fails the build, naming it. A secret written into the field
+itself, or a placeholder naming any other variable, is refused with an `InvalidArgument` on
+`cloud` that names the field and never repeats the secret. A source registered before placeholders,
+whose credentials hold a secret, still reads, and logs a warning to register it again. The
+session's own `[storage.cloud]` is config, read when the config loads, and takes a secret as
+the config file does: inline, `${NAME}`, or `{ file = "…" }`.
 
 ## Persist result tables to the cloud
 

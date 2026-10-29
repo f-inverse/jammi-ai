@@ -112,6 +112,35 @@ pub async fn postgres_database_holding(dir: &Path, script: &str) -> String {
     url
 }
 
+/// The environment variable [`source_url`] puts a test database's password
+/// in.
+pub const SOURCE_PASSWORD_VAR: &str = "JAMMI_SOURCE_TEST_PASSWORD";
+
+/// `url`, a test database's URL, as a database source is registered with it:
+/// its password, if it has one, replaced by `${JAMMI_SOURCE_TEST_PASSWORD}`,
+/// which this sets to the password as `url` spells it. A source refuses a
+/// password written into its URL, so that the catalog never holds one
+/// (#756); the engine reads the variable when it connects. Every test
+/// database on one server shares its password, so tests setting it at once
+/// set the same value, and a server a test spawns afterwards inherits it.
+pub fn source_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return url.to_string();
+    };
+    match userinfo.split_once(':') {
+        Some((user, password)) if !password.is_empty() => {
+            std::env::set_var(SOURCE_PASSWORD_VAR, password);
+            format!("{scheme}://{user}:${{{SOURCE_PASSWORD_VAR}}}@{host}{tail}")
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// The database name recorded in `<dir>/catalog.postgres`, minting and
 /// recording one when the file is absent. The name is written whole to a
 /// scratch file and linked into place, so a concurrent reader sees either no

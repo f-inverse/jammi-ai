@@ -1285,7 +1285,7 @@ async fn a_postgres_database_registered_by_its_url_joins_a_file() {
         )
         .await
         .unwrap();
-    let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
+    let definition = SourceDefinition::from_url(&jammi_test_utils::source_url(&url), None).unwrap();
     assert_eq!(definition.source_type, SourceType::Postgres);
     session
         .add_source(&ratings_id, definition.source_type, definition.connection)

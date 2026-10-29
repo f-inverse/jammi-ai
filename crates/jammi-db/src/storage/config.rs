@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::error::StorageError;
 use super::url::Scheme;
-use crate::config::secret::{deserialize_inline, serialize_exposed};
+use crate::config::secret::{
+    deserialize_inline, names_only, read_placeholders, serialize_exposed, unnamable_variable,
+};
 use crate::config::Secret;
 
 /// AWS S3 (or any S3-compatible) connection details.
@@ -172,6 +174,80 @@ pub enum CloudConfig {
 }
 
 impl CloudConfig {
+    /// Each secret this holds, by the field that holds it.
+    fn secrets(&self) -> Vec<(&'static str, &Option<Secret>)> {
+        match self {
+            Self::S3(c) => vec![
+                ("secret_access_key", &c.secret_access_key),
+                ("session_token", &c.session_token),
+            ],
+            Self::Gcs(c) => vec![("service_account_json", &c.service_account_json)],
+            Self::Azure(c) => vec![
+                ("account_key", &c.account_key),
+                ("sas_token", &c.sas_token),
+                ("client_secret", &c.client_secret),
+            ],
+            Self::R2(c) => vec![("secret_access_key", &c.secret_access_key)],
+        }
+    }
+
+    /// [`Self::secrets`], to change.
+    fn secrets_mut(&mut self) -> Vec<(&'static str, &mut Option<Secret>)> {
+        match self {
+            Self::S3(c) => vec![
+                ("secret_access_key", &mut c.secret_access_key),
+                ("session_token", &mut c.session_token),
+            ],
+            Self::Gcs(c) => vec![("service_account_json", &mut c.service_account_json)],
+            Self::Azure(c) => vec![
+                ("account_key", &mut c.account_key),
+                ("sas_token", &mut c.sas_token),
+                ("client_secret", &mut c.client_secret),
+            ],
+            Self::R2(c) => vec![("secret_access_key", &mut c.secret_access_key)],
+        }
+    }
+
+    /// The first field holding a secret written itself rather than named by
+    /// `${NAME}` placeholders alone (#756). A source's credentials are kept in
+    /// the catalog, so a source's secret is named, never written; the
+    /// session's own `[storage.cloud]` is config, read at load, and holds
+    /// either.
+    pub(crate) fn written_secret(&self) -> Option<&'static str> {
+        self.secrets()
+            .into_iter()
+            .find(|(_, secret)| {
+                secret
+                    .as_ref()
+                    .is_some_and(|secret| !names_only(secret.expose()))
+            })
+            .map(|(field, _)| field)
+    }
+
+    /// The first secret's field whose placeholder names a variable no source
+    /// may name, with that variable
+    /// ([`SOURCE_VARIABLE_PREFIX`](crate::config::secret::SOURCE_VARIABLE_PREFIX)).
+    pub(crate) fn unnamable_variable(&self) -> Option<(&'static str, String)> {
+        self.secrets().into_iter().find_map(|(field, secret)| {
+            let named = unnamable_variable(secret.as_ref()?.expose())?;
+            Some((field, named))
+        })
+    }
+
+    /// This with each secret's `${NAME}` placeholders read from this
+    /// process's environment, now, or why one could not be, naming its field.
+    pub(crate) fn with_secrets_read(&self) -> std::result::Result<Self, String> {
+        let mut read = self.clone();
+        for (field, secret) in read.secrets_mut() {
+            if let Some(held) = secret {
+                let value =
+                    read_placeholders(held.expose()).map_err(|why| format!("`{field}`: {why}"))?;
+                *held = Secret::new(value);
+            }
+        }
+        Ok(read)
+    }
+
     /// Validate the variant's credential set at config-load time. Catches
     /// partial-credential mistakes (e.g. an `access_key_id` without its
     /// `secret_access_key`) before the SDK surfaces the same problem deep

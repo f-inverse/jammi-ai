@@ -275,6 +275,22 @@ does, and a database source reads, lists and verifies what it holds.
   sites are propagated, matched with each outcome named, or not produced. Three tests that passed
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
+- **A database source's password is never written down** (#756). The catalog kept a source's
+  URL, password included, in clear text, twice (`sources.uri` and `sources.options`), so the
+  catalog file, its WAL and every backup held every database's password. A source's URL now
+  names its password with a `${NAME}` placeholder, read from the environment of the process
+  that connects each time it connects:
+  `postgresql://reader:${JAMMI_SOURCE_PG_PASSWORD}@db/sales`. A placeholder names only a
+  `JAMMI_SOURCE_` variable, so a client cannot have the server send its own secrets as a
+  source's password to a host the client chose.
+  **BREAKING** (every client): a URL that writes its password, in its user info or as a
+  Postgres `password` parameter, is refused with an `InvalidArgument` on `url` that shows the
+  placeholder form, before anything connects or is stored; a remote session's placeholder is
+  read from the server's environment. A source's own `cloud` credentials, set through the Rust
+  API, were kept in clear text the same way; each secret in them is now a `${NAME}`
+  placeholder too, and a written one is refused with an `InvalidArgument` on `cloud` naming
+  the field. A source registered before still connects, and logs a warning to register it
+  again.
 
 ## [0.55.0] - 2026-10-10
 

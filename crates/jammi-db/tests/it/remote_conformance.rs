@@ -238,7 +238,7 @@ async fn sources(database: Database) -> Sources {
     session.install_functions([QueryFunction::Scalar(is_even())]);
     let suffix = unique_suffix();
     let (database, file) = (format!("db_{suffix}"), format!("f_{suffix}"));
-    let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
+    let definition = SourceDefinition::from_url(&jammi_test_utils::source_url(&url), None).unwrap();
     session
         .add_source(&database, definition.source_type, definition.connection)
         .await

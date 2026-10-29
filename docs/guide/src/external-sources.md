@@ -20,8 +20,8 @@ a PostgreSQL database, a `mysql://` URL a MySQL or MariaDB database; neither tak
 remote session take the same call.
 
 ```python
-db.add_source("pg_data", url="postgresql://reader:secret@db.internal:5432/sales")
-db.add_source("mysql_data", url="mysql://reader:secret@mysql.internal:3306/registry")
+db.add_source("pg_data", url="postgresql://reader:${JAMMI_SOURCE_PG_PASSWORD}@db.internal:5432/sales")
+db.add_source("mysql_data", url="mysql://reader:${JAMMI_SOURCE_MYSQL_PASSWORD}@mysql.internal:3306/registry")
 db.add_source("papers", url="/data/papers.parquet", format="parquet")
 
 db.sql("SELECT id, title FROM pg_data.public.articles WHERE published LIMIT 10")
@@ -76,12 +76,12 @@ aggregate the database runs compares the converted value:
 use jammi_db::source::{SourceConnection, SourceType};
 
 session.add_source("pg_data", SourceType::Postgres, SourceConnection {
-    url: Some("postgresql://user:pass@localhost:5432/mydb".into()),
+    url: Some("postgresql://user:${JAMMI_SOURCE_PG_PASSWORD}@localhost:5432/mydb".into()),
     ..Default::default()
 }).await?;
 
 session.add_source("mysql_data", SourceType::Mysql, SourceConnection {
-    url: Some("mysql://user:pass@localhost:3306/mydb".into()),
+    url: Some("mysql://user:${JAMMI_SOURCE_MYSQL_PASSWORD}@localhost:3306/mydb".into()),
     ..Default::default()
 }).await?;
 
@@ -104,11 +104,47 @@ is a path names a Unix-socket directory, so a local server's socket URL works as
 out: `postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`,
 `prefer` (the default, as in libpq), `require`, `verify-ca` or `verify-full`.
 
-A MySQL URL is `mysql://user:password@host:port/database`, and must name its database.
+A MySQL URL is `mysql://user:${JAMMI_SOURCE_PASSWORD}@host:port/database`, and must name its database.
 Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`. `required`
 verifies the server's certificate and the host it names; `preferred` encrypts without
 verifying either; a server with no TLS — a local development instance — is reached with
 `sslmode=disabled`.
+
+### Passwords
+
+A source's URL names its password with a placeholder, never the password itself. The
+engine keeps a source's URL in its catalog, to connect again after a restart and from
+every server sharing the catalog, so a password written into the URL would be written
+into the catalog, its WAL and every backup of it. `${NAME}` in a URL is read from the
+environment of the process that connects, each time it connects, and names a variable
+whose name starts `JAMMI_SOURCE_` (and holds no `__`, which the config loader reads as a
+config section's path):
+
+```python
+import os
+
+os.environ["JAMMI_SOURCE_PG_PASSWORD"] = "…"  # or set it where the engine runs
+db.add_source("pg_data", url="postgresql://reader:${JAMMI_SOURCE_PG_PASSWORD}@db.internal:5432/sales")
+```
+
+- **Embedded**, the variable is read from your own process's environment. **Remote**, it
+  is read from the **server's**: whoever runs the server sets it there, and a client
+  names it.
+- Only a `JAMMI_SOURCE_` variable can be named. The environment is the server's and
+  the URL is the client's, so a URL naming any variable could have the server send its
+  own secrets (its catalog's password, its cloud keys) as the password to a host the
+  client chose. A placeholder naming any other variable is refused with an
+  `InvalidArgument` on `url`. Any client that may add a source may still name any
+  `JAMMI_SOURCE_` variable, so set there only the passwords those clients may use.
+- A URL that writes its password, in its user info or as a Postgres `password`
+  parameter, is refused with an `InvalidArgument` on `url` that shows the placeholder
+  form; the refusal never repeats the URL.
+- A variable that is not set fails the source's build, naming the variable.
+- The variable's value goes into the URL as written, so a password holding a character
+  a URL reserves (`@`, `:`, `/`, `?`, `#`, `%`) is percent-encoded in it. `$$` in a URL
+  is one `$`, as in the config file.
+- A source registered before placeholders, whose URL holds its password, still
+  connects, and logs a warning to register it again with a placeholder.
 
 ### A server certificate the engine's host does not trust
 
@@ -119,7 +155,7 @@ engine takes it.
 
 ```python
 ca = open("private-ca.pem").read()
-db.add_source("orders", url="mysql://reader:secret@orders.internal:3306/shop", ca_certificate=ca)
+db.add_source("orders", url="mysql://reader:${JAMMI_SOURCE_ORDERS_PASSWORD}@orders.internal:3306/shop", ca_certificate=ca)
 ```
 
 A source holding a CA connects with a mode that verifies the server: `required` for

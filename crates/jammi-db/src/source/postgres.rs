@@ -43,8 +43,8 @@ pub async fn create_postgres_tables(
         Some(ca) => Some(database::ca_file(source_id, ca).await?),
         None => None,
     };
-    let params = pool_params(url, ca.as_deref()).map_err(failed)?;
-    let address = address(url).map_err(failed)?;
+    let params = pool_params(&url, ca.as_deref()).map_err(failed)?;
+    let address = address(&url).map_err(failed)?;
     let pool = PostgresConnectionPool::new(params)
         .await
         .map_err(|e| failed(format!("Failed to connect to Postgres: {e}")))?;

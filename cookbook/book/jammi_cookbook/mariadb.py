@@ -23,6 +23,8 @@ from pathlib import Path
 
 USER = "jammi"
 PASSWORD = "jammi"
+# The environment variable a source URL names the password by.
+PASSWORD_VAR = "JAMMI_SOURCE_MARIADB_PASSWORD"
 # RHEL-family packages install the daemon under /usr/libexec, off root's PATH.
 _DAEMON_PATH = os.pathsep.join([os.environ.get("PATH", ""), "/usr/sbin", "/usr/libexec"])
 _STARTUP_SECONDS = 60
@@ -77,8 +79,17 @@ class MariaDB:
     socket: Path
 
     def url(self, database: str) -> str:
-        """The ``mysql://`` URL a source registers ``database`` by."""
-        return f"mysql://{USER}:{PASSWORD}@127.0.0.1:{self.port}/{database}?sslmode=disabled"
+        """The ``mysql://`` URL a source registers ``database`` by.
+
+        Its password is the ``${JAMMI_SOURCE_MARIADB_PASSWORD}`` placeholder, which this sets: a
+        source's URL never holds its password, and the engine reads the variable when
+        it connects. A server started afterwards inherits it.
+        """
+        os.environ[PASSWORD_VAR] = PASSWORD
+        return (
+            f"mysql://{USER}:${{{PASSWORD_VAR}}}@127.0.0.1:{self.port}/{database}"
+            "?sslmode=disabled"
+        )
 
     def execute(self, sql: str) -> None:
         """Run ``sql`` as root."""

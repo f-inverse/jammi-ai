@@ -509,6 +509,12 @@ impl JammiSession {
             source_type,
             connection,
         };
+        // Nor is a source that writes a secret, in a database URL or its
+        // cloud credentials: both are persisted, so each names it by a
+        // placeholder.
+        definition
+            .connection
+            .refuse_a_written_secret(&definition.source_type)?;
         let built = self.sources.build(source_id, &definition).await?;
 
         // A declared tenant column is what every tenant's scan of the source

@@ -1786,7 +1786,9 @@ class RemoteDatabase:
         the text `columns` joined in order by a space. :meth:`lexical_search`
         ranks it by BM25. `analyzer` is how the text and every query are
         tokenised — ``"english"`` (lowercase, Porter stemming; the default) or
-        ``"raw"`` (lowercase, no stemming, for codes and identifiers). The
+        ``"raw"`` (lowercase, no stemming, for codes and identifiers), each also
+        as ``"english_folded"`` or ``"raw_folded"``, which fold accents to their
+        ASCII letters so ``"Florianópolis"`` finds ``"florianopolis"``. The
         index's only input is a registered source, which has no version to
         pin, so a build always recomputes. Maps to `PipelineService.BuildLexicalIndex`.
         """

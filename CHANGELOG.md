@@ -291,6 +291,12 @@ does, and a database source reads, lists and verifies what it holds.
   placeholder too, and a written one is refused with an `InvalidArgument` on `cloud` naming
   the field. A source registered before still connects, and logs a warning to register it
   again.
+- **A lexical index can fold accents** (#758). The `english` and `raw` analyzers keep
+  diacritics, so `"Florianópolis"` found nothing indexed as `florianopolis`. Two analyzers fold
+  accented letters to their ASCII letters, in the text and in every query: `english_folded` and
+  `raw_folded` (Rust `LexicalAnalyzer::EnglishFolded`/`RawFolded`, wire
+  `LEXICAL_ANALYZER_ENGLISH_FOLDED`/`RAW_FOLDED`, Python and TypeScript `analyzer=`). Folding
+  is opt-in, so an existing index and the default are unchanged.
 
 ## [0.55.0] - 2026-10-10
 

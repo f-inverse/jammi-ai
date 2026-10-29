@@ -245,6 +245,88 @@ async fn a_lexical_index_records_its_definition_and_recomputes() {
     assert_eq!(replayed.definition_hash, manifest.definition_hash);
 }
 
+/// The ids a search of `table` returns for `text`.
+async fn ids_found(session: &Session, source_id: &str, table: &str, text: &str) -> Vec<i64> {
+    let found = session
+        .lexical_search(LexicalSearchRequest {
+            source_id: source_id.into(),
+            text: text.into(),
+            k: 5,
+            lexical_table: Some(table.into()),
+            filter: None,
+            select: Vec::new(),
+        })
+        .await
+        .unwrap();
+    int_column(&found, "id")
+}
+
+#[tokio::test]
+async fn a_folded_lexical_index_finds_a_place_whatever_its_accents() {
+    let dir = TempDir::new().unwrap();
+    let source_dir = TempDir::new().unwrap();
+    let places = source_dir.path().join("places.csv");
+    std::fs::write(
+        &places,
+        "id,name\n1,florianopolis\n2,brasilia\n3,São Paulo\n",
+    )
+    .unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    engine
+        .add_source(
+            "places",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", places.display())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = Session::new(Arc::clone(&engine));
+    let built = |analyzer| BuildLexicalIndex {
+        columns: vec!["name".into()],
+        key_column: "id".into(),
+        analyzer,
+    };
+
+    let folded = session
+        .build_lexical_index("places", &built(LexicalAnalyzer::EnglishFolded))
+        .await
+        .unwrap()
+        .table_name;
+    let found = |text| ids_found(&session, "places", &folded, text);
+    assert_eq!(found("Florianópolis").await, [1]);
+    assert_eq!(found("Brasília").await, [2]);
+    assert_eq!(found("sao paulo").await, [3]);
+    assert!(matches!(
+        session.describe_table(&folded).await.unwrap().descriptor,
+        ProducingDescriptor::LexicalIndex {
+            analyzer: LexicalAnalyzer::EnglishFolded,
+            ..
+        }
+    ));
+
+    // The default keeps accents: an accented query finds only accented text.
+    let unfolded = session
+        .build_lexical_index("places", &built(LexicalAnalyzer::English))
+        .await
+        .unwrap()
+        .table_name;
+    assert!(ids_found(&session, "places", &unfolded, "Florianópolis")
+        .await
+        .is_empty());
+    assert_eq!(
+        ids_found(&session, "places", &unfolded, "são paulo").await,
+        [3]
+    );
+}
+
 #[tokio::test]
 async fn a_named_table_must_be_a_lexical_index() {
     let dir = TempDir::new().unwrap();

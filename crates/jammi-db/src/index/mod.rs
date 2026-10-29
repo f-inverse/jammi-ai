@@ -31,6 +31,12 @@ pub enum LexicalAnalyzer {
     /// Lowercase and over-long tokens dropped, no stemming: for text a
     /// stemmer would corrupt (codes, identifiers, other languages).
     Raw,
+    /// [`English`](Self::English), with accents folded to their ASCII
+    /// letters (`Florianópolis` → `florianopolis`), so a query and a row that
+    /// differ only in accents match.
+    EnglishFolded,
+    /// [`Raw`](Self::Raw), with accents folded to their ASCII letters.
+    RawFolded,
 }
 
 /// How a search ranks a table's vectors.

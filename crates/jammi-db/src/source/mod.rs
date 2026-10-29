@@ -447,6 +447,27 @@ impl std::fmt::Display for SourceTable {
     }
 }
 
+/// The relation a verb reads its rows from: a source's table, or a table the
+/// engine holds — a result table or a mutable table — under the name SQL
+/// reads it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputRelation {
+    /// A source's table, or a mutable table (`mutable.public.<name>`).
+    Table(SourceTable),
+    /// A result table (`"jammi.<name>"`).
+    Result(crate::store::RelationKey),
+}
+
+/// The relation as SQL names it.
+impl std::fmt::Display for InputRelation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table(table) => table.fmt(f),
+            Self::Result(relation) => relation.fmt(f),
+        }
+    }
+}
+
 /// Derive a DataFusion table name from a URL by extracting the file stem.
 ///
 /// Handles both Unix forward-slash paths and Windows backslash paths so that

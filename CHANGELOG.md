@@ -297,6 +297,13 @@ does, and a database source reads, lists and verifies what it holds.
   `raw_folded` (Rust `LexicalAnalyzer::EnglishFolded`/`RawFolded`, wire
   `LEXICAL_ANALYZER_ENGLISH_FOLDED`/`RAW_FOLDED`, Python and TypeScript `analyzer=`). Folding
   is opt-in, so an existing index and the default are unchanged.
+- **A table made with SQL is a verb's input** (#762). `generate_embeddings`,
+  `build_lexical_index` and `infer` read only a registered source, so a query's rows had to leave
+  the engine as a file and come back as a source. Each now also reads a result table, named
+  `jammi.<name>` as SQL reads it (a `CREATE TABLE … AS` table among them), and a mutable table,
+  `mutable.public.<name>`, as the caller's tenant sees it; `search` and `lexical_search` hydrate
+  their rows from it. A source registered under the same name is read first. `COPY … TO`, which
+  SQL refuses, is documented as refused, with the way to a file.
 
 ## [0.55.0] - 2026-10-10
 

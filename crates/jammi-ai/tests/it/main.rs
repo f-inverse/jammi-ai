@@ -75,3 +75,4 @@ mod training_set;
 mod training_set_stream;
 mod uat_workflows;
 mod utf8view_columns;
+mod verb_inputs;

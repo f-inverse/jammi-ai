@@ -155,7 +155,7 @@ impl QueryBuilder {
         channel: &str,
     ) -> Result<Self> {
         if let Some(ref key_col) = table.key_column {
-            let relation = session.first_table(&table.source_id).await?;
+            let relation = session.input_relation(&table.source_id).await?;
             let source_cols =
                 build_hydration_select(session.context(), &relation, key_col, &plan.schema())
                     .await?;
@@ -506,7 +506,7 @@ async fn admitted_rows(
                 .to_string(),
             actual: "none".to_string(),
         })?;
-    let relation = session.first_table(&table.source_id).await?;
+    let relation = session.input_relation(&table.source_id).await?;
     let batches = session
         .context()
         .sql(&format!(
@@ -525,7 +525,7 @@ async fn admitted_rows(
 
 async fn build_hydration_select(
     ctx: &QueryContext,
-    table: &jammi_db::source::SourceTable,
+    table: &jammi_db::source::InputRelation,
     key_col: &str,
     result: &arrow::datatypes::Schema,
 ) -> Result<String> {

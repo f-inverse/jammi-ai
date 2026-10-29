@@ -126,6 +126,32 @@ table is named by one identifier. So is a query the engine cannot render back to
 `WITH RECURSIVE` query, a `VALUES` list — since the table could never replay; the refusal
 names the node.
 
+### A table as a verb's input
+
+`generate_embeddings`, `build_lexical_index` and `infer` read a result table or a mutable table
+as they read a source, named as SQL reads it: `jammi.<name>` for a result table,
+`mutable.public.<name>` for a mutable table. A query's rows are embedded, indexed or inferred
+over without leaving the engine: make them a table, and name the table as the verb's source.
+
+```python
+db.sql("CREATE TABLE recent AS SELECT id, title, abstract FROM patents.public.patents WHERE year >= 2022")
+db.build_lexical_index("jammi.recent", columns=["title", "abstract"], key="id")
+db.lexical_search("jammi.recent", text="quantum", k=5)
+db.generate_embeddings(source="jammi.recent", model="sentence-transformers/all-MiniLM-L6-v2",
+                       columns=["abstract"], key="id")
+```
+
+`search` and `lexical_search` hydrate the rows they return from the same table. A table another
+tenant owns is not found, as its source would not be, and a source registered under the same
+name is read first. The table is anchored as a source is, at the instant it was read, so
+`recompute` replays the verb over the table's rows as they are then.
+
+### SQL writes no files
+
+`COPY … TO` is refused: the engine's SQL reads the object store and never writes to it. To make
+a query's rows a verb's input, make them a table, as above. To get them as a file, read them
+into the client (`db.sql(...)` returns Arrow) and write the file there.
+
 ## Aggregations
 
 ```sql

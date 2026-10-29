@@ -57,7 +57,7 @@ pub async fn run(
             reason: "names no text column to index".into(),
         });
     }
-    let relation = session.first_table(source_id).await?;
+    let relation = session.input_relation(source_id).await?;
     let text = params
         .columns
         .iter()

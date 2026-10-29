@@ -480,6 +480,11 @@ internet; network policy or a firewall; or an authenticating reverse proxy) —
 or wire an authenticating `TenantResolver` in front — before exposing it
 beyond a trusted caller.
 
+A client that registers a source reads with the server's own access: its files,
+its cloud identity, its network. Scope that access to what your clients may read;
+see [A source reads with the server's
+access](./security.md#a-source-reads-with-the-servers-access).
+
 **The peer listener (I-PEER / I-GANG).** `[server] peer_bind` — unset by
 default — opens a THIRD listener that serves `jammi.v1.peer.PeerService` to
 other replicas of the same deployment (segment search for the segments this

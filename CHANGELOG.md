@@ -304,6 +304,12 @@ does, and a database source reads, lists and verifies what it holds.
   `mutable.public.<name>`, as the caller's tenant sees it; `search` and `lexical_search` hydrate
   their rows from it. A source registered under the same name is read first. `COPY … TO`, which
   SQL refuses, is documented as refused, with the way to a file.
+- **The guide says what a source can make the server read** (#752). A source reads with the
+  server's own access, its files, cloud identity and network, so a client that may register
+  one reads whatever the server can. The security page says so, and how a deployment scopes
+  that access: a server identity that reads only what clients may, `AddSource` gated in front
+  of the server, and a user's own bucket copied with the user's credentials rather than
+  registered by URL.
 
 ## [0.55.0] - 2026-10-10
 

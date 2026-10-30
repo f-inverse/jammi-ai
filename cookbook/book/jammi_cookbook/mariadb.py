@@ -81,8 +81,8 @@ class MariaDB:
     def url(self, database: str) -> str:
         """The ``mysql://`` URL a source registers ``database`` by.
 
-        Its password is the ``${JAMMI_SOURCE_MARIADB_PASSWORD}`` placeholder, which this sets: a
-        source's URL never holds its password, and the engine reads the variable when
+        Its password is named by ``${JAMMI_SOURCE_MARIADB_PASSWORD}``, the variable this sets:
+        a source's URL never holds its password, and the engine reads the variable when
         it connects. A server started afterwards inherits it.
         """
         os.environ[PASSWORD_VAR] = PASSWORD

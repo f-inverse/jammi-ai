@@ -102,8 +102,8 @@ MariaDB instance has no TLS, and its URL says so with `sslmode=disabled`; a data
 reached over a network would carry `sslmode=required` (the default) instead.
 
 A URL never writes its password. The engine keeps a source's URL in its catalog, so the
-MariaDB URL names its password with a placeholder, `${JAMMI_SOURCE_MARIADB_PASSWORD}`, which the
-engine reads from its environment each time it connects; a URL that writes the
+MariaDB URL names its password by an environment variable, `${JAMMI_SOURCE_MARIADB_PASSWORD}`,
+which the engine reads each time it connects; a URL that writes the
 password itself is refused.
 
 ```{python}

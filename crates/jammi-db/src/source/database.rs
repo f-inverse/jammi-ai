@@ -4,14 +4,38 @@
 
 use std::path::PathBuf;
 
+use crate::config::secret::read_placeholders;
 use crate::error::{JammiError, Result};
-use crate::source::{CaCertificate, SourceConnection};
+use crate::source::{url_writes_its_password, CaCertificate, SourceConnection};
 
-/// The connection URL of a database source, which it cannot connect without.
-pub(crate) fn url<'a>(source_id: &str, connection: &'a SourceConnection) -> Result<&'a str> {
-    connection.url.as_deref().ok_or_else(|| JammiError::Source {
+/// The connection URL of a database source, which it cannot connect without:
+/// the URL as registered, each `${NAME}` in it, a `JAMMI_SOURCE_` variable,
+/// replaced by that variable of this process's environment, read now, at
+/// every connection (#756). The catalog keeps the URL as registered, so it
+/// never holds a password a placeholder names.
+///
+/// A URL registered before placeholders existed, whose password may hold
+/// `$$`, connects as it always did; one that writes its password is the
+/// catalog holding that password, so it still connects, and says so.
+pub(crate) fn url(source_id: &str, connection: &SourceConnection) -> Result<String> {
+    let url = connection
+        .url
+        .as_deref()
+        .ok_or_else(|| JammiError::Source {
+            source_id: source_id.into(),
+            message: "a database source requires a connection URL".into(),
+        })?;
+    if url_writes_its_password(url) {
+        tracing::warn!(
+            source_id,
+            "the catalog holds this source's password in its URL; register the source again \
+             with the password named by a ${{JAMMI_SOURCE_<NAME>}} placeholder, and the \
+             catalog will not"
+        );
+    }
+    read_placeholders(url).map_err(|why| JammiError::Source {
         source_id: source_id.into(),
-        message: "a database source requires a connection URL".into(),
+        message: format!("its URL's placeholder: {why}"),
     })
 }
 
@@ -91,5 +115,44 @@ mod tests {
         assert_eq!(MODES.mode(Some("require"), false).unwrap(), "require");
         let refused = MODES.mode(Some("require"), true).unwrap_err();
         assert!(refused.contains("`sslmode=require`"), "{refused}");
+    }
+
+    fn connection(url: &str) -> SourceConnection {
+        SourceConnection {
+            url: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_placeholder_is_read_from_the_environment_and_an_unset_one_is_named() {
+        let var = format!("JAMMI_SOURCE_DATABASE_URL_TEST_{}", std::process::id());
+        std::env::set_var(&var, "s3cr%40t");
+        let named = connection(&format!("postgresql://ada:${{{var}}}@db/sales"));
+        assert_eq!(
+            url("pg", &named).unwrap(),
+            "postgresql://ada:s3cr%40t@db/sales"
+        );
+        // A URL with no placeholder is the URL, `$$` and all.
+        assert_eq!(
+            url("pg", &connection("postgresql://ada:pa$$word@db/sales")).unwrap(),
+            "postgresql://ada:pa$$word@db/sales"
+        );
+
+        std::env::remove_var(&var);
+        let unset = url("pg", &named).unwrap_err().to_string();
+        assert!(unset.contains(&format!("`${{{var}}}`")), "{unset}");
+        assert!(unset.contains("not set"), "{unset}");
+    }
+
+    #[test]
+    fn a_variable_set_aside_for_no_source_is_never_read() {
+        let var = format!("JAMMI_DATABASE_URL_TEST_{}", std::process::id());
+        std::env::set_var(&var, "the-servers-own-secret");
+        let named = connection(&format!("postgresql://ada:${{{var}}}@db/sales"));
+        let refused = url("pg", &named).unwrap_err().to_string();
+        std::env::remove_var(&var);
+        assert!(refused.contains("JAMMI_SOURCE_"), "{refused}");
+        assert!(!refused.contains("the-servers-own-secret"), "{refused}");
     }
 }

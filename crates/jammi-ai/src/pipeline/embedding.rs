@@ -103,7 +103,7 @@ pub async fn build_embedding_plan(
     key_column: &str,
     embedding_dim: usize,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let table = session.first_table(source_id).await?;
+    let table = session.input_relation(source_id).await?;
     let query = session.build_source_query(&table, key_column, columns);
     let input_plan = session.plan_source_query(&query).await?;
     // The source scan's `_content_hash` projection rides through to the sink

@@ -65,7 +65,7 @@ use super::{
 };
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Missing, Result};
-use crate::storage::{StorageRegistry, StorageUrl};
+use crate::storage::{CloudConfig, StorageRegistry, StorageUrl};
 use crate::tenant::TenantId;
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding};
 
@@ -86,6 +86,25 @@ fn ordered(mut tables: SourceTables) -> SourceTables {
 pub(crate) struct BuiltSource {
     pub(crate) tables: SourceTables,
     pub(crate) resolved_extension: Option<String>,
+}
+
+/// A source's own cloud credentials, each secret's `${NAME}` placeholders
+/// read from this process's environment now (#756). A source registered
+/// before placeholders existed, whose credentials hold a secret itself, is the
+/// catalog holding that secret: it still reads, and says so.
+fn source_credentials(source_id: &str, cloud: &CloudConfig) -> Result<CloudConfig> {
+    if let Some(field) = cloud.written_secret() {
+        tracing::warn!(
+            source_id,
+            field,
+            "the catalog holds this source's cloud secret; register the source again with the \
+             secret named by a ${{NAME}} placeholder, and the catalog will not"
+        );
+    }
+    cloud.with_secrets_read().map_err(|why| JammiError::Source {
+        source_id: source_id.into(),
+        message: format!("its cloud credentials' placeholder: {why}"),
+    })
 }
 
 /// The providers this process holds for one source, with the definition
@@ -279,12 +298,17 @@ impl SourceRegistry {
                             reason: format!("File source '{source_id}' requires a URL"),
                         })?;
                 let url = StorageUrl::parse(raw_url)?;
+                let cloud = connection
+                    .cloud
+                    .as_ref()
+                    .map(|cloud| source_credentials(source_id, cloud))
+                    .transpose()?;
                 let (table, resolved_extension) = file_format::create_listing_table(
                     &self.storage,
                     &url,
                     format,
                     connection.file_extension.as_deref(),
-                    connection.cloud.as_ref(),
+                    cloud.as_ref(),
                     &self.session,
                 )
                 .await?;

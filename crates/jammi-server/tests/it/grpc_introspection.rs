@@ -498,6 +498,7 @@ async fn remote_describe_source_lists_a_postgres_databases_tables_and_columns() 
          CREATE VIEW sales.recent AS SELECT id, placed FROM sales.orders;",
     )
     .await;
+    let url = jammi_test_utils::source_url(&url);
     let server = start_engine_server().await;
     let remote = remote(&server).await;
     let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();

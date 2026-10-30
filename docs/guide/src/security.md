@@ -71,6 +71,10 @@ them supplies them above the engine.
   rotation, and cloud IAM are the consumer's runtime, not the engine's — the same
   line the [Design Philosophy](./philosophy.md) draws around load balancing,
   ingress, and orchestration.
+- **It does not limit what a source may name.** A source reads with the server's
+  own access, so a caller who may add one reads whatever the server can — see
+  [A source reads with the server's access](#a-source-reads-with-the-servers-access)
+  below.
 - **The peer listener authenticates nothing either (I-PEER).** `[server]
   peer_bind` (unset by default) serves the engine-internal segment-search
   seam to other replicas and trusts the channel — see
@@ -348,6 +352,36 @@ prevents an unauthenticated caller from asserting any tenant it likes via
 caller may act as the tenant it claims — is exactly what the BYO-auth seam adds
 *in front of* the scope mechanism. Treating tenant scope as if it were
 authorization is the misuse this page exists to forestall.
+
+## A source reads with the server's access
+
+`add_source` reads what its URL names with the access of the process that builds the
+source, which for a server is the server's. A caller who may add a source therefore reads
+whatever the server can, by naming it:
+
+- a path or `file://` URL: any file the server process may read;
+- an `s3://`, `gs://`, `azure://` or `r2://` URL: any object the server's `[storage.cloud]`
+  credentials may read, or, where those name none, the credentials the cloud SDK finds in
+  the server's environment or its instance or task role;
+- a database URL: any host the server's network reaches, with any password the server
+  holds for sources (a `JAMMI_SOURCE_` variable; see
+  [Passwords](./external-sources.md#passwords)).
+
+The engine does not limit which paths, buckets or hosts a source may name. What a source
+can read is the deployment's decision, made with the tools that already decide what the
+server's identity can reach:
+
+- **Give the server only the access its clients may use.** Run it under a cloud identity
+  that reads only the buckets or prefixes your clients may register, in a container whose
+  filesystem holds only the data it serves, on a network that reaches only the databases
+  it serves.
+- **Gate source registration in front of the server.** Registering a source is one gRPC
+  method, `/jammi.v1.catalog.CatalogService/AddSource`. A proxy in front of the server can
+  refuse it to every caller except the ones you trust to name anything the server can read.
+- **Read a user's data with the user's credentials, outside the engine.** An application
+  whose users bring their own buckets copies each user's objects, with that user's
+  credentials, into storage the server reads, and registers the copy. Passing a user's URL
+  to `add_source` would read it with the server's access instead: a confused deputy.
 
 ## The consumer's responsibilities
 

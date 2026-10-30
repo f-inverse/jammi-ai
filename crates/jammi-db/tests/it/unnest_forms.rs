@@ -99,7 +99,9 @@ async fn a_file_column_breaks_down_by_item_in_every_form() {
 async fn database_session(url: &str) -> (JammiSession, TempDir) {
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
-    let definition = jammi_db::source::SourceDefinition::from_url(url, None).unwrap();
+    let definition =
+        jammi_db::source::SourceDefinition::from_url(&jammi_test_utils::source_url(url), None)
+            .unwrap();
     session
         .add_source("db", definition.source_type, definition.connection)
         .await

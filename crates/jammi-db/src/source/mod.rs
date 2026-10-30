@@ -224,6 +224,73 @@ pub struct SourceDefinition {
 }
 
 impl SourceConnection {
+    /// Refuse the connection of a `source_type` source that writes a secret
+    /// (#756): a database source's URL writing its password, or a source's
+    /// cloud credentials writing one of theirs. The catalog keeps both, for
+    /// every later build to connect with, so a secret in either would be
+    /// written down with it; each names its secret with a `${NAME}`
+    /// placeholder instead, read from the environment of the process that
+    /// builds the source. That environment is the server's while the source
+    /// is its caller's, so a placeholder naming a variable outside
+    /// [`SOURCE_VARIABLE_PREFIX`](crate::config::secret::SOURCE_VARIABLE_PREFIX)
+    /// is refused too. The refusal never repeats the URL or the secret.
+    pub(crate) fn refuse_a_written_secret(
+        &self,
+        source_type: &SourceType,
+    ) -> crate::error::Result<()> {
+        use crate::config::secret::{unnamable_variable, SOURCE_VARIABLE_PREFIX as PREFIX};
+        let refused = |argument: &str, reason: String| crate::error::JammiError::InvalidArgument {
+            argument: argument.into(),
+            reason,
+        };
+        let outside = |named: &str| {
+            format!(
+                "`${{{named}}}` names a variable no source may name, so that a source never \
+                 reads the server's other secrets: a source's placeholder names a `{PREFIX}` \
+                 variable"
+            )
+        };
+        if let Some(cloud) = &self.cloud {
+            if let Some(field) = cloud.written_secret() {
+                return Err(refused(
+                    "cloud",
+                    format!(
+                        "a source's cloud credentials name each secret with a \
+                         `${{{PREFIX}<NAME>}}` placeholder, never the secret itself, so that the \
+                         catalog never holds it: `{field}` holds one; set it to \
+                         `${{{PREFIX}<NAME>}}`, and set that variable where the engine reads the \
+                         source"
+                    ),
+                ));
+            }
+            if let Some((field, named)) = cloud.unnamable_variable() {
+                return Err(refused("cloud", format!("`{field}`: {}", outside(&named))));
+            }
+        }
+        let example = match source_type {
+            SourceType::Postgres => "postgresql://user:${JAMMI_SOURCE_DB_PASSWORD}@host/database",
+            SourceType::Mysql => "mysql://user:${JAMMI_SOURCE_DB_PASSWORD}@host/database",
+            SourceType::File => return Ok(()),
+        };
+        let Some(url) = self.url.as_deref() else {
+            return Ok(());
+        };
+        if url_writes_its_password(url) {
+            return Err(refused(
+                "url",
+                format!(
+                    "a database source's URL names its password with a `${{{PREFIX}<NAME>}}` \
+                     placeholder, never the password itself, so that the catalog never holds it: \
+                     write `{example}`, and set JAMMI_SOURCE_DB_PASSWORD where the engine connects"
+                ),
+            ));
+        }
+        match unnamable_variable(url) {
+            Some(named) => Err(refused("url", outside(&named))),
+            None => Ok(()),
+        }
+    }
+
     /// Build a connection from a [`StorageUrl`] + file format.
     ///
     /// Used by file-shaped sources regardless of scheme — local paths
@@ -249,6 +316,33 @@ impl SourceConnection {
         let url = StorageUrl::parse(path_or_url)?;
         Ok(Self::from_url(url, format))
     }
+}
+
+/// Whether `url`, a database source's URL, writes a password itself, in its
+/// user info or as a Postgres `password` parameter, rather than naming it with
+/// `${NAME}` placeholders alone (#756).
+pub(crate) fn url_writes_its_password(url: &str) -> bool {
+    password_of(url).is_some_and(|password| !crate::config::secret::names_only(&password))
+}
+
+/// The password `url` carries, decoded: as libpq reads a Postgres URL, else
+/// the user info of any other.
+fn password_of(url: &str) -> Option<String> {
+    use crate::pg_uri::{Keyword, PgUri};
+
+    if let Ok(uri) = PgUri::parse(url) {
+        return uri
+            .params()
+            .find(|(keyword, _)| *keyword == Keyword::Password)
+            .map(|(_, password)| password.to_string());
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    let password = parsed.password()?;
+    Some(
+        percent_encoding::percent_decode_str(password)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 impl SourceDefinition {
@@ -353,6 +447,27 @@ impl std::fmt::Display for SourceTable {
     }
 }
 
+/// The relation a verb reads its rows from: a source's table, or a table the
+/// engine holds — a result table or a mutable table — under the name SQL
+/// reads it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputRelation {
+    /// A source's table, or a mutable table (`mutable.public.<name>`).
+    Table(SourceTable),
+    /// A result table (`"jammi.<name>"`).
+    Result(crate::store::RelationKey),
+}
+
+/// The relation as SQL names it.
+impl std::fmt::Display for InputRelation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table(table) => table.fmt(f),
+            Self::Result(relation) => relation.fmt(f),
+        }
+    }
+}
+
 /// Derive a DataFusion table name from a URL by extracting the file stem.
 ///
 /// Handles both Unix forward-slash paths and Windows backslash paths so that
@@ -367,6 +482,32 @@ pub(crate) fn table_name_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_writes_its_password_unless_placeholders_alone_name_it() {
+        for written in [
+            "postgresql://ada:hunter2@db/sales",
+            "postgres://ada@db/sales?password=hunter2",
+            "mysql://ada:hunter2@db/sales",
+            "postgresql://ada:${PG}x@db/sales",
+            "postgresql://ada:pa$$word@db/sales",
+            "postgresql://ada:p%40ss@db/sales",
+        ] {
+            assert!(url_writes_its_password(written), "{written}");
+        }
+        for named in [
+            "postgresql://ada:${PG_PASSWORD}@db/sales",
+            "postgresql://ada:${A}${B}@db/sales",
+            "postgres://ada@db/sales?password=${PG_PASSWORD}",
+            "mysql://ada:${MYSQL_PASSWORD}@db/sales",
+            "postgresql://ada@db/sales",
+            "postgresql://postgres:@/postgres?host=/tmp/pgdata",
+            "${DATABASE_URL}",
+        ] {
+            assert!(!url_writes_its_password(named), "{named}");
+        }
+    }
+
     use std::str::FromStr;
 
     #[test]

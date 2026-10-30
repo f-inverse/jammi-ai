@@ -4,10 +4,10 @@ use arrow::array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::{Producer, ResultTableRecord};
 use jammi_db::config::JammiConfig;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Missing, Result};
 use jammi_db::index::{FiniteQuery, SearchMethod};
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
-use jammi_db::source::SourceTable;
+use jammi_db::source::{InputRelation, SourceTable};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::quote_ident;
 use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
@@ -1580,7 +1580,7 @@ impl InferenceSession {
             });
         }
 
-        let table = self.first_table(source_id).await?;
+        let table = self.input_relation(source_id).await?;
         let query = self.build_source_query(&table, key_column, content_columns);
         let input_plan = self.plan_source_query(&query).await?;
         // Describe the model for the schema and the definition: its width,
@@ -1733,7 +1733,7 @@ impl InferenceSession {
     /// plan reads by name in both roles.
     pub(crate) fn build_source_query(
         &self,
-        table: &SourceTable,
+        table: &impl std::fmt::Display,
         key_column: &str,
         content_columns: &[String],
     ) -> String {
@@ -1804,6 +1804,21 @@ impl InferenceSession {
                 argument: "source".into(),
                 reason: format!("No tables found in source '{source_id}'"),
             })
+    }
+
+    /// The relation a verb that reads rows by key reads under `name`: the
+    /// source's [`Self::first_table`], or, when no source is registered under
+    /// it, the table the engine holds that SQL reads as `name`
+    /// ([`JammiSession::held_table`]) — a result table `jammi.<table>`, a
+    /// mutable table `mutable.public.<table>`. A missing name is the
+    /// source's [`JammiError::NotFound`].
+    pub(crate) async fn input_relation(&self, name: &str) -> Result<InputRelation> {
+        match self.first_table(name).await {
+            Err(missing @ JammiError::NotFound(Missing::Source { .. })) => {
+                self.inner.held_table(name).await?.ok_or(missing)
+            }
+            found => found.map(InputRelation::Table),
+        }
     }
 
     /// Materialize the k-nearest-neighbour graph of a source's embedding table

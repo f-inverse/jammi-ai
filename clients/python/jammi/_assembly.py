@@ -1599,6 +1599,8 @@ def _set_search_method(
 _LEXICAL_ANALYZER = {
     "english": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH,
     "raw": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW,
+    "english_folded": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH_FOLDED,
+    "raw_folded": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW_FOLDED,
 }
 
 
@@ -1613,8 +1615,9 @@ def build_lexical_index_request(
     source's text: one `(_row_id, text)` row per source row, keyed by `key`,
     with its text `columns` joined in order by a space. `analyzer` is how the
     text and every query are tokenised: ``"english"`` (lowercase, Porter
-    stemming) or ``"raw"`` (lowercase, no stemming). The same request the
-    embed binding submits in-process.
+    stemming) or ``"raw"`` (lowercase, no stemming), each also as
+    ``"english_folded"`` or ``"raw_folded"``, which fold accents to their
+    ASCII letters. The same request the embed binding submits in-process.
     """
     wire_analyzer = _choice("analyzer", _LEXICAL_ANALYZER, analyzer)
     return pipeline_pb2.BuildLexicalIndexRequest(

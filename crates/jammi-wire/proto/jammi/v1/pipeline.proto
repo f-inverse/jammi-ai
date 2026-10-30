@@ -231,6 +231,10 @@ enum LexicalAnalyzer {
   LEXICAL_ANALYZER_ENGLISH = 1;
   // Lowercase and over-long tokens dropped, no stemming.
   LEXICAL_ANALYZER_RAW = 2;
+  // ENGLISH, with accents folded to their ASCII letters.
+  LEXICAL_ANALYZER_ENGLISH_FOLDED = 3;
+  // RAW, with accents folded to their ASCII letters.
+  LEXICAL_ANALYZER_RAW_FOLDED = 4;
 }
 
 message BuildLexicalIndexRequest {

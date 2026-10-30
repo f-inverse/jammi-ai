@@ -7,7 +7,9 @@
 //!
 //! Each test reads its bucket from the environment and fails naming the
 //! variable when it is unset:
-//!   - `JAMMI_TEST_S3_BUCKET`     — `s3://bucket/prefix`
+//!   - `JAMMI_TEST_S3_BUCKET`     — `s3://bucket/prefix`, or the bare bucket
+//!     the local test store (`ci/dev.sh --with s3`) exports beside
+//!     `JAMMI_TEST_S3_ENDPOINT`
 //!   - `JAMMI_TEST_GCS_BUCKET`    — `gs://bucket/prefix`
 //!   - `JAMMI_TEST_AZURE_BUCKET`  — `azure://container/prefix`
 //!
@@ -27,7 +29,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
-    ObjectParquetWriter, StorageRegistry, StorageUrl,
+    CloudConfig, ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 
 fn three_col_batch() -> RecordBatch {
@@ -45,9 +47,9 @@ fn three_col_batch() -> RecordBatch {
     .unwrap()
 }
 
-async fn round_trip_under(url: StorageUrl) {
+async fn round_trip_under(url: StorageUrl, cloud: Option<&CloudConfig>) {
     let registry = StorageRegistry::new();
-    let handle = registry.handle_for(&url, None).unwrap();
+    let handle = registry.handle_for(&url, cloud).unwrap();
     let batch = three_col_batch();
     let schema = batch.schema();
     let mut w = ObjectParquetWriter::open(&handle, schema).await.unwrap();
@@ -65,14 +67,31 @@ async fn round_trip_under(url: StorageUrl) {
 #[cfg(feature = "live-s3-tests")]
 #[tokio::test]
 async fn s3_parquet_round_trip() {
-    let base = jammi_test_resources::env("JAMMI_TEST_S3_BUCKET");
+    let bucket = jammi_test_resources::env("JAMMI_TEST_S3_BUCKET");
+    let base = match bucket.contains("://") {
+        true => bucket,
+        false => format!("s3://{bucket}"),
+    };
     let key = format!(
         "{}/jammi-storage-test-{}.parquet",
         base.trim_end_matches('/'),
         uuid::Uuid::new_v4().simple()
     );
     let url = StorageUrl::parse(&key).expect("S3 URL parses");
-    round_trip_under(url).await;
+    // The local test store names its endpoint; S3 itself is found from the
+    // SDK environment. Either way the credentials come from `AWS_*`.
+    let cloud = std::env::var("JAMMI_TEST_S3_ENDPOINT")
+        .ok()
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(|endpoint| {
+            CloudConfig::S3(jammi_db::storage::S3Config {
+                allow_http: endpoint.starts_with("http://"),
+                endpoint: Some(endpoint),
+                region: std::env::var("AWS_REGION").ok(),
+                ..Default::default()
+            })
+        });
+    round_trip_under(url, cloud.as_ref()).await;
 }
 
 #[cfg(feature = "live-gcs-tests")]
@@ -85,7 +104,7 @@ async fn gcs_parquet_round_trip() {
         uuid::Uuid::new_v4().simple()
     );
     let url = StorageUrl::parse(&key).expect("GCS URL parses");
-    round_trip_under(url).await;
+    round_trip_under(url, None).await;
 }
 
 #[cfg(feature = "live-azure-tests")]
@@ -98,5 +117,5 @@ async fn azure_parquet_round_trip() {
         uuid::Uuid::new_v4().simple()
     );
     let url = StorageUrl::parse(&key).expect("Azure URL parses");
-    round_trip_under(url).await;
+    round_trip_under(url, None).await;
 }

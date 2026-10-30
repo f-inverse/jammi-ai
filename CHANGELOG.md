@@ -275,6 +275,41 @@ does, and a database source reads, lists and verifies what it holds.
   sites are propagated, matched with each outcome named, or not produced. Three tests that passed
   by discarding a failure now assert it, a fixture's `Drop` reaps its child without panicking
   while unwinding, and a guard keeps the pattern out.
+- **A database source's password is never written down** (#756). The catalog kept a source's
+  URL, password included, in clear text, twice (`sources.uri` and `sources.options`), so the
+  catalog file, its WAL and every backup held every database's password. A source's URL now
+  names its password with a `${NAME}` placeholder, read from the environment of the process
+  that connects each time it connects:
+  `postgresql://reader:${JAMMI_SOURCE_PG_PASSWORD}@db/sales`. A placeholder names only a
+  `JAMMI_SOURCE_` variable, so a client cannot have the server send its own secrets as a
+  source's password to a host the client chose.
+  **BREAKING** (every client): a URL that writes its password, in its user info or as a
+  Postgres `password` parameter, is refused with an `InvalidArgument` on `url` that shows the
+  placeholder form, before anything connects or is stored; a remote session's placeholder is
+  read from the server's environment. A source's own `cloud` credentials, set through the Rust
+  API, were kept in clear text the same way; each secret in them is now a `${NAME}`
+  placeholder too, and a written one is refused with an `InvalidArgument` on `cloud` naming
+  the field. A source registered before still connects, and logs a warning to register it
+  again.
+- **A lexical index can fold accents** (#758). The `english` and `raw` analyzers keep
+  diacritics, so `"Florianópolis"` found nothing indexed as `florianopolis`. Two analyzers fold
+  accented letters to their ASCII letters, in the text and in every query: `english_folded` and
+  `raw_folded` (Rust `LexicalAnalyzer::EnglishFolded`/`RawFolded`, wire
+  `LEXICAL_ANALYZER_ENGLISH_FOLDED`/`RAW_FOLDED`, Python and TypeScript `analyzer=`). Folding
+  is opt-in, so an existing index and the default are unchanged.
+- **A table made with SQL is a verb's input** (#762). `generate_embeddings`,
+  `build_lexical_index` and `infer` read only a registered source, so a query's rows had to leave
+  the engine as a file and come back as a source. Each now also reads a result table, named
+  `jammi.<name>` as SQL reads it (a `CREATE TABLE … AS` table among them), and a mutable table,
+  `mutable.public.<name>`, as the caller's tenant sees it; `search` and `lexical_search` hydrate
+  their rows from it. A source registered under the same name is read first. `COPY … TO`, which
+  SQL refuses, is documented as refused, with the way to a file.
+- **The guide says what a source can make the server read** (#752). A source reads with the
+  server's own access, its files, cloud identity and network, so a client that may register
+  one reads whatever the server can. The security page says so, and how a deployment scopes
+  that access: a server identity that reads only what clients may, `AddSource` gated in front
+  of the server, and a user's own bucket copied with the user's credentials rather than
+  registered by URL.
 
 ## [0.55.0] - 2026-10-10
 

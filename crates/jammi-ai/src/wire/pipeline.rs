@@ -125,6 +125,8 @@ pub fn build_lexical_index_from_proto(
         Ok(pb::LexicalAnalyzer::Unspecified) => jammi_db::index::LexicalAnalyzer::default(),
         Ok(pb::LexicalAnalyzer::English) => jammi_db::index::LexicalAnalyzer::English,
         Ok(pb::LexicalAnalyzer::Raw) => jammi_db::index::LexicalAnalyzer::Raw,
+        Ok(pb::LexicalAnalyzer::EnglishFolded) => jammi_db::index::LexicalAnalyzer::EnglishFolded,
+        Ok(pb::LexicalAnalyzer::RawFolded) => jammi_db::index::LexicalAnalyzer::RawFolded,
         Err(_) => return Err(Status::invalid_argument("unknown lexical analyzer")),
     };
     Ok((

@@ -24,6 +24,12 @@ def test_the_build_request_names_the_analyzer_and_refuses_an_unknown_one() -> No
     assert request.analyzer == pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH
     raw = build_lexical_index_request("patents", columns=["title"], key="id", analyzer="raw")
     assert raw.analyzer == pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW
+    for name, wire in [
+        ("english_folded", pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH_FOLDED),
+        ("raw_folded", pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW_FOLDED),
+    ]:
+        folded = build_lexical_index_request("patents", columns=["title"], key="id", analyzer=name)
+        assert folded.analyzer == wire
     with pytest.raises(ValueError, match="analyzer"):
         build_lexical_index_request("patents", columns=["title"], key="id", analyzer="french")
 
@@ -85,5 +91,44 @@ def test_remote_and_embedded_lexical_search_agree(tmp_path, live_server_on) -> N
             for local, over_the_wire in zip(embedded, _searches(remote)):
                 assert over_the_wire.schema == local.schema
                 assert over_the_wire.to_pylist() == local.to_pylist()
+        finally:
+            remote.close()
+
+
+@pytest.mark.live_server
+@pytest.mark.embedded
+def test_a_folded_analyzer_finds_a_place_whatever_its_accents(tmp_path, live_server_on) -> None:
+    places = tmp_path / "places.csv"
+    places.write_text("id,name\n1,florianopolis\n2,brasilia\n", encoding="utf-8")
+    artifact_dir = tmp_path / "engine"
+    artifact_dir.mkdir()
+
+    def found(db, table):
+        # A search that finds nothing can return a table with no columns
+        # (#759), so its ids are read only when it has rows.
+        results = [
+            db.lexical_search("places", text=text, k=5, lexical_table=table)
+            for text in ("Florianópolis", "Brasília")
+        ]
+        return [r.column("id").to_pylist() if r.num_rows else [] for r in results]
+
+    db = jammi.connect(f"file://{artifact_dir}")
+    try:
+        db.add_source("places", url=f"file://{places}", format="csv")
+        embedded = db.build_lexical_index("places", columns=["name"], key="id",
+                                          analyzer="english_folded")
+        unfolded = db.build_lexical_index("places", columns=["name"], key="id")
+        assert found(db, embedded) == [[1], [2]]
+        assert found(db, unfolded) == [[], []]
+    finally:
+        db.close()
+
+    with live_server_on(artifact_dir) as endpoint:
+        remote = jammi.connect(endpoint)
+        try:
+            table = remote.build_lexical_index("places", columns=["name"], key="id",
+                                               analyzer="raw_folded")
+            assert found(remote, table) == [[1], [2]]
+            assert found(remote, embedded) == [[1], [2]]
         finally:
             remote.close()

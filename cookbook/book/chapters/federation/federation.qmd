@@ -101,6 +101,11 @@ hands out — the libpq form that reaches the server over its Unix socket. The
 MariaDB instance has no TLS, and its URL says so with `sslmode=disabled`; a database
 reached over a network would carry `sslmode=required` (the default) instead.
 
+A URL never writes its password. The engine keeps a source's URL in its catalog, so the
+MariaDB URL names its password by an environment variable, `${JAMMI_SOURCE_MARIADB_PASSWORD}`,
+which the engine reads each time it connects; a URL that writes the
+password itself is refused.
+
 ```{python}
 URLS = {"docs": postgres.get_uri(), "registry": maria.url("registry")}
 for name, url in URLS.items():
@@ -193,7 +198,7 @@ db.close()
 A server takes the same URLs. The client sends the source's kind — Postgres, MySQL
 or file — on the wire, chosen from the URL exactly as the embedded engine chooses
 it, and the server opens the connection itself; here it reaches the same two local
-databases.
+databases, reading `${JAMMI_SOURCE_MARIADB_PASSWORD}` from its own environment.
 
 ```{python}
 server = stack.enter_context(LiveServer(work / "server"))

@@ -109,7 +109,7 @@ async fn sources() -> Sources {
         format!("cf_{suffix}"),
         format!("rf_{suffix}"),
     );
-    let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
+    let definition = SourceDefinition::from_url(&jammi_test_utils::source_url(&url), None).unwrap();
     session
         .add_source(&pg, definition.source_type, definition.connection)
         .await

@@ -31,6 +31,14 @@ The analyzer decides how that text — and every query — is tokenised:
 (lowercase, no stemming) is for text a stemmer would mangle (codes, identifiers,
 other languages).
 
+Each also comes folded, as `"english_folded"` and `"raw_folded"`: accented
+letters fold to their ASCII letters in the text and in every query, so
+`"Florianópolis"` finds a row that says `florianopolis`, and `"sao paulo"` finds
+`São Paulo`. Folding is opt-in because it makes words that differ only by an
+accent one word, such as Portuguese `avó` (grandmother) and `avô` (grandfather).
+The analyzer is part of an index's definition, so an index keeps the one it was
+built with, and building with another makes a new index.
+
 ### Python
 
 ```python

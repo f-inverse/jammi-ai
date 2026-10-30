@@ -827,7 +827,7 @@ impl InferenceSession {
     }
 
     async fn source_query_for(&self, params: &EmbeddingParams) -> Result<String> {
-        let table = self.first_table(&params.source_id).await?;
+        let table = self.input_relation(&params.source_id).await?;
         Ok(self.build_source_query(&table, &params.key_column, &params.columns))
     }
 

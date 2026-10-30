@@ -27,7 +27,7 @@ use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
 use crate::source::{
-    SourceConnection, SourceDefinition, SourceDescription, SourceTable, SourceType,
+    InputRelation, SourceConnection, SourceDefinition, SourceDescription, SourceTable, SourceType,
 };
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
@@ -509,6 +509,12 @@ impl JammiSession {
             source_type,
             connection,
         };
+        // Nor is a source that writes a secret, in a database URL or its
+        // cloud credentials: both are persisted, so each names it by a
+        // placeholder.
+        definition
+            .connection
+            .refuse_a_written_secret(&definition.source_type)?;
         let built = self.sources.build(source_id, &definition).await?;
 
         // A declared tenant column is what every tenant's scan of the source
@@ -589,6 +595,38 @@ impl JammiSession {
     /// here and a source removed there is [`JammiError::NotFound`] here.
     pub async fn source_tables(&self, source_id: &str) -> Result<Vec<SourceTable>> {
         Ok(self.sources.resolve(source_id).await?.tables())
+    }
+
+    /// The table the engine holds that SQL reads as `name`, as the caller's
+    /// scope sees it: a ready result table, `jammi.<table>`, or a mutable
+    /// table, `mutable.public.<table>`. `None` for any other name, and for a
+    /// table the caller's scope does not see.
+    pub async fn held_table(&self, name: &str) -> Result<Option<InputRelation>> {
+        if let Some(table) = crate::store::RelationKey::table_name_of(name) {
+            let ready = self
+                .catalog
+                .get_result_table(table)
+                .await?
+                .filter(|record| {
+                    record.status == crate::catalog::status::ResultTableStatus::Ready.to_string()
+                });
+            return Ok(ready.map(|record| {
+                InputRelation::Result(crate::store::result_table_relation(&record.table_name))
+            }));
+        }
+        let mutable = name
+            .strip_prefix("mutable.public.")
+            .and_then(|table| MutableTableId::new(table).ok());
+        let Some(id) = mutable else {
+            return Ok(None);
+        };
+        Ok(self.catalog.get_mutable_table(&id).await?.map(|_| {
+            InputRelation::Table(SourceTable::new(
+                "mutable",
+                SourceTable::PUBLIC,
+                id.as_str(),
+            ))
+        }))
     }
 
     /// Remove a source and all associated state: catalog entries, result tables,

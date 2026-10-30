@@ -59,7 +59,8 @@ async fn a_query_over_a_stopped_database_fails_at_once_naming_it() {
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
     let source = format!("pg_{}", unique_suffix());
-    let definition = SourceDefinition::from_url(through.as_str(), None).unwrap();
+    let definition =
+        SourceDefinition::from_url(&jammi_test_utils::source_url(through.as_str()), None).unwrap();
     session
         .add_source(&source, definition.source_type, definition.connection)
         .await

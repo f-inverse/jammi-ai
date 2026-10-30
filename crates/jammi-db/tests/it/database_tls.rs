@@ -38,7 +38,7 @@ async fn register(
 ) -> (JammiSession, TempDir, jammi_db::error::Result<()>) {
     let dir = tempdir().unwrap();
     let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
-    let definition = SourceDefinition::from_url(url, None).unwrap();
+    let definition = SourceDefinition::from_url(&jammi_test_utils::source_url(url), None).unwrap();
     let mut connection = definition.connection;
     connection.ca_certificate = ca;
     let registered = session

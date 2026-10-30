@@ -34,7 +34,9 @@ use jammi_db::store::manifest::InputAnchor;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermSetQuery};
 use tantivy::schema::{IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
-use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer};
+use tantivy::tokenizer::{
+    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
+};
 use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 
 /// Heap budget for the in-memory index writer (tantivy's minimum is 3 MiB; a
@@ -48,6 +50,8 @@ fn registry_name(analyzer: LexicalAnalyzer) -> &'static str {
     match analyzer {
         LexicalAnalyzer::English => "jammi_english",
         LexicalAnalyzer::Raw => "jammi_raw",
+        LexicalAnalyzer::EnglishFolded => "jammi_english_folded",
+        LexicalAnalyzer::RawFolded => "jammi_raw_folded",
     }
 }
 
@@ -55,15 +59,18 @@ fn registry_name(analyzer: LexicalAnalyzer) -> &'static str {
 ///
 /// Each `.filter(..)` returns a distinctly-typed builder, so the stemmed and
 /// unstemmed pipelines `.build()` in their own arms rather than sharing a tail.
+/// Accents fold after lowercasing and before stemming, so the stemmer sees the
+/// same word whatever its accents.
 fn text_analyzer(analyzer: LexicalAnalyzer) -> TextAnalyzer {
     let base = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser);
+    let english = || Stemmer::new(tantivy::tokenizer::Language::English);
     match analyzer {
-        LexicalAnalyzer::English => base
-            .filter(Stemmer::new(tantivy::tokenizer::Language::English))
-            .build(),
+        LexicalAnalyzer::English => base.filter(english()).build(),
         LexicalAnalyzer::Raw => base.build(),
+        LexicalAnalyzer::EnglishFolded => base.filter(AsciiFoldingFilter).filter(english()).build(),
+        LexicalAnalyzer::RawFolded => base.filter(AsciiFoldingFilter).build(),
     }
 }
 
@@ -457,5 +464,40 @@ mod tests {
             .search("turbine", 5, &Admission::Every)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_folded_analyzer_matches_a_word_whatever_its_accents() {
+        let rows = || {
+            vec![
+                ("fln", "florianopolis"),
+                ("bsb", "Brasília"),
+                ("t", "vibrating turbines"),
+            ]
+        };
+        let found = |idx: &LexicalIndex, query: &str| {
+            idx.search(query, 5, &Admission::Every)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.row_id)
+                .collect::<Vec<_>>()
+        };
+        let english = LexicalIndex::build(rows(), LexicalAnalyzer::EnglishFolded).unwrap();
+        let raw = LexicalIndex::build(rows(), LexicalAnalyzer::RawFolded).unwrap();
+        for idx in [&english, &raw] {
+            // Folded both ways: the query's accents and the row's.
+            assert_eq!(found(idx, "Florianópolis"), ["fln"]);
+            assert_eq!(found(idx, "brasilia"), ["bsb"]);
+        }
+        // Folding leaves stemming as it was.
+        assert_eq!(found(&english, "turbine"), ["t"]);
+        assert!(found(&raw, "turbine").is_empty());
+
+        // Unfolded, an accent still tells two words apart.
+        for analyzer in [LexicalAnalyzer::English, LexicalAnalyzer::Raw] {
+            let idx = LexicalIndex::build(rows(), analyzer).unwrap();
+            assert!(found(&idx, "Florianópolis").is_empty(), "{analyzer:?}");
+            assert!(found(&idx, "brasilia").is_empty(), "{analyzer:?}");
+        }
     }
 }
